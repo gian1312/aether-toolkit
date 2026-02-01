@@ -1,0 +1,12 @@
+[package]
+name = "aether_converter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# For command line arguments
+clap = { version = "4.4", features = ["derive"] }
+# For writing specific binary formats
+byteorder = "1.5"
+# For reading GeoTIFFs (Pure Rust implementation)
+tiff = "0.9"
