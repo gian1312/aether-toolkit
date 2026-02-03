@@ -21,6 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(&args.input).map_err(|e| format!("Failed to open input: {}", e))?;
     let mut decoder = Decoder::new(file).map_err(|e| format!("Bad TIFF format: {}", e))?;
 
+    decoder = decoder.with_limits(tiff::decoder::Limits::unlimited());
+
     let (width, height) = decoder.dimensions().map_err(|e| format!("No dims: {}", e))?;
 
     // Read Tiepoints/Scale
