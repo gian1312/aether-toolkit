@@ -89,13 +89,8 @@ fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
 
     let (e, n) = parse_swiss_filename(path).unwrap_or((0.0, 0.0));
 
-    // Swisstopo Filename is Bottom-Left Corner (e.g. 2600-1120)
+    // Swisstopo Filename is Bottom-Left Corner
     // Image Data is Top-Left to Bottom-Right
-    // So:
-    // origin_n (Bottom) = n
-    // max_n (Top) = n + height * scale
-    // origin_e (Left) = e
-    // max_e (Right) = e + width * scale
     let scale = 0.5;
 
     Ok(Arc::new(LoadedImage {
@@ -144,7 +139,7 @@ pub fn process_tile_with_cache(
         }
     }
 
-    // Aggressive Pruning for safety
+    // Aggressive Pruning for safety (keep low to prevent RAM saturation)
     if cache.len() > 20 {
         cache.clear();
     }
@@ -162,43 +157,39 @@ pub fn process_tile_with_cache(
     buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg_y);
 
-        // --- OPTIMIZATION: Row-Level Filtering ---
-        // 1. Calculate the geographic extent of this specific row (scanline)
-        // Left Edge
+        // --- OPTIMIZATION: Linear Coordinate Interpolation ---
+        // Calculate Row Endpoints ONCE
         let (e_start, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
-        // Right Edge
         let (e_end, n_end) = wgs84_to_lv95_fast(row_lat, job.ul_lon + (out_size as f64 * pixel_deg_x));
 
-        // Create a loose bounding box for the row
-        // Add 50m buffer to account for projection rotation/curvature
+        // Calculate slopes per pixel for this row
+        let step_e = (e_end - e_start) / (out_size as f64);
+        let step_n = (n_end - n_start) / (out_size as f64);
+
+        // --- OPTIMIZATION: Row-Level Filtering ---
         let row_min_n = n_start.min(n_end) - 50.0;
         let row_max_n = n_start.max(n_end) + 50.0;
         let row_min_e = e_start.min(e_end) - 50.0;
         let row_max_e = e_start.max(e_end) + 50.0;
 
-        // 2. Build a small subset of images that overlap this row
-        // This reduces checks from ~100 to ~2-3 per pixel
+        // Build subset of images that overlap this row
         let mut row_images: Vec<&LoadedImage> = Vec::with_capacity(5);
 
         for img in &swiss_images {
-            // Check Latitude/Northing Intersection
-            let overlaps_n = img.max_n >= row_min_n && img.origin_n <= row_max_n;
-            // Check Longitude/Easting Intersection
-            let overlaps_e = img.max_e >= row_min_e && img.origin_e <= row_max_e;
-
-            if overlaps_n && overlaps_e {
+            if img.max_n >= row_min_n && img.origin_n <= row_max_n &&
+                img.max_e >= row_min_e && img.origin_e <= row_max_e {
                 row_images.push(img.as_ref());
             }
         }
 
         // Inner Loop: Pixels in Row
         for (x, out_pixel) in row_buffer.iter_mut().enumerate() {
-            let lon = job.ul_lon + (x as f64 * pixel_deg_x);
-            let (e, n) = wgs84_to_lv95_fast(row_lat, lon);
+            // Replaced polynomial math with linear addition
+            let e = e_start + (step_e * x as f64);
+            let n = n_start + (step_n * x as f64);
 
             let mut found = false;
 
-            // Iterate ONLY the filtered images
             for img in &row_images {
                 // Precise Point Check
                 if e >= img.origin_e && e < img.max_e && n >= img.origin_n && n < img.max_n {
@@ -211,13 +202,13 @@ pub fn process_tile_with_cache(
 
                     if px < img.width && py < img.height {
                         let idx = (py * img.width + px) as usize;
-                        // Unchecked is safe here because of logic above,
-                        // but get() is safer for production
-                        if let Some(&val) = img.data.get(idx) {
-                            *out_pixel = val;
-                            found = true;
-                            break;
+                        // Use unsafe because we already checked bounds above
+                        // This removes the panic check overhead
+                        unsafe {
+                            *out_pixel = *img.data.get_unchecked(idx);
                         }
+                        found = true;
+                        break;
                     }
                 }
             }
