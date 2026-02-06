@@ -9,7 +9,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use tiff::decoder::{Decoder, DecodingResult};
 use anyhow::{Context, Result};
 
-#[derive(Deserialize, Debug, Clone)] // Added Clone for parallel logic if needed
+#[derive(Deserialize, Debug, Clone)]
 pub struct IngestJob {
     pub output_path: PathBuf,
     pub ul_lat: f64,
@@ -24,14 +24,13 @@ pub struct LoadedImage {
     pub width: u32,
     pub height: u32,
     pub data: Vec<i16>,
-    pub origin_e: f64,
-    pub origin_n: f64,
-    pub max_e: f64, // Pre-calculated for fast bounds check
-    pub max_n: f64,
+    pub origin_e: f64, // Bottom-Left Easting
+    pub origin_n: f64, // Bottom-Left Northing
+    pub max_e: f64,    // Top-Right Easting
+    pub max_n: f64,    // Top-Right Northing
     pub scale: f64,
 }
 
-// --- OPTIMIZED MATH: Explicit multiplication is faster than pow() ---
 #[inline(always)]
 fn wgs84_to_lv95_fast(lat: f64, lon: f64) -> (f64, f64) {
     let phi = (lat * 3600.0 - 169028.66) / 10000.0;
@@ -76,7 +75,6 @@ fn parse_swiss_filename(p: &Path) -> Option<(f64, f64)> {
 
 fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
     let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
-    // Buffered Reader for slightly better SSD read performance
     let reader = BufReader::with_capacity(1024 * 1024, file);
     let mut decoder = Decoder::new(reader)?;
     let (w, h) = decoder.dimensions()?;
@@ -91,19 +89,24 @@ fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
 
     let (e, n) = parse_swiss_filename(path).unwrap_or((0.0, 0.0));
 
+    // Swisstopo Filename is Bottom-Left Corner (e.g. 2600-1120)
+    // Image Data is Top-Left to Bottom-Right
+    // So:
+    // origin_n (Bottom) = n
+    // max_n (Top) = n + height * scale
+    // origin_e (Left) = e
+    // max_e (Right) = e + width * scale
+    let scale = 0.5;
+
     Ok(Arc::new(LoadedImage {
         width: w,
         height: h,
         data,
         origin_e: e,
         origin_n: n,
-        max_e: e + (w as f64 * 0.5), // Assuming 0.5m scale
-        max_n: n + (h as f64 * 0.5), // Correct logic: N is bottom-left in filename, but image is Top-Left?
-        // Wait: Swisstopo filenames are Lower-Left corner.
-        // Tiff pixels are usually Top-Left.
-        // So: Image Top Edge = n + height*scale. Image Bottom Edge = n.
-        // Let's ensure this matches the lookup logic below.
-        scale: 0.5,
+        max_e: e + (w as f64 * scale),
+        max_n: n + (h as f64 * scale),
+        scale,
     }))
 }
 
@@ -112,17 +115,13 @@ pub fn process_tile_with_cache(
     cache: &mut HashMap<PathBuf, Arc<LoadedImage>>
 ) -> Result<()> {
 
-    // --- STEP 1: Parallel Batch Loading (Fix 3) ---
-    // Identify what we are missing
+    // --- STEP 1: Parallel Loading ---
     let missing_paths: Vec<PathBuf> = job.swiss_tifs.iter()
         .filter(|p| !cache.contains_key(*p))
         .cloned()
         .collect();
 
     if !missing_paths.is_empty() {
-        // println!("[Cache] Parallel loading {} new files...", missing_paths.len());
-
-        // Load in parallel using all cores
         let results: Vec<Result<(PathBuf, Arc<LoadedImage>)>> = missing_paths
             .par_iter()
             .map(|path| {
@@ -131,7 +130,6 @@ pub fn process_tile_with_cache(
             })
             .collect();
 
-        // Insert into cache (Serial part, but fast)
         for res in results {
             if let Ok((path, img)) = res {
                 cache.insert(path, img);
@@ -139,7 +137,6 @@ pub fn process_tile_with_cache(
         }
     }
 
-    // Collect references for the compute phase
     let mut swiss_images: Vec<Arc<LoadedImage>> = Vec::with_capacity(job.swiss_tifs.len());
     for path in &job.swiss_tifs {
         if let Some(img) = cache.get(path) {
@@ -147,12 +144,12 @@ pub fn process_tile_with_cache(
         }
     }
 
-    // Pruning: Keep cache reasonable (e.g., 50 tiles ~ 10GB)
-    if cache.len() > 50 {
+    // Aggressive Pruning for safety
+    if cache.len() > 20 {
         cache.clear();
     }
 
-    // --- STEP 2: Spatial Partitioning & Processing (Fix 2) ---
+    // --- STEP 2: Partitioned Processing ---
     let out_size = job.size_px as usize;
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
@@ -162,57 +159,64 @@ pub fn process_tile_with_cache(
     let pixel_deg_y = job.resolution_m / deg_lat_m;
     let pixel_deg_x = job.resolution_m / deg_lon_m;
 
-    // We iterate by ROWS (Chunks of width).
-    // This allows us to pre-filter which images are relevant for this latitude strip.
     buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
-
-        // 1. Calculate Bounds for this Row
         let row_lat = job.ul_lat - (y as f64 * pixel_deg_y);
 
-        // Optimize: Find which images overlap this Row's Latitude?
-        // Convert Row Lat to Approx LV95 N
-        let (_, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
-        // This is an approximation, but Swiss images are 10km tall.
-        // For exactness, we just run the pixel loop, but we optimize the Inner Loop.
+        // --- OPTIMIZATION: Row-Level Filtering ---
+        // 1. Calculate the geographic extent of this specific row (scanline)
+        // Left Edge
+        let (e_start, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
+        // Right Edge
+        let (e_end, n_end) = wgs84_to_lv95_fast(row_lat, job.ul_lon + (out_size as f64 * pixel_deg_x));
+
+        // Create a loose bounding box for the row
+        // Add 50m buffer to account for projection rotation/curvature
+        let row_min_n = n_start.min(n_end) - 50.0;
+        let row_max_n = n_start.max(n_end) + 50.0;
+        let row_min_e = e_start.min(e_end) - 50.0;
+        let row_max_e = e_start.max(e_end) + 50.0;
+
+        // 2. Build a small subset of images that overlap this row
+        // This reduces checks from ~100 to ~2-3 per pixel
+        let mut row_images: Vec<&LoadedImage> = Vec::with_capacity(5);
+
+        for img in &swiss_images {
+            // Check Latitude/Northing Intersection
+            let overlaps_n = img.max_n >= row_min_n && img.origin_n <= row_max_n;
+            // Check Longitude/Easting Intersection
+            let overlaps_e = img.max_e >= row_min_e && img.origin_e <= row_max_e;
+
+            if overlaps_n && overlaps_e {
+                row_images.push(img.as_ref());
+            }
+        }
 
         // Inner Loop: Pixels in Row
         for (x, out_pixel) in row_buffer.iter_mut().enumerate() {
             let lon = job.ul_lon + (x as f64 * pixel_deg_x);
-
-            // 2. Optimized Math
             let (e, n) = wgs84_to_lv95_fast(row_lat, lon);
 
-            // 3. Optimized Search (Loop Inversion logic inside)
             let mut found = false;
 
-            // We iterate images. Since this is in L1 cache (the vector of Arcs), it's fast.
-            // But we add a Bounds Check before doing any index math.
-            for img in &swiss_images {
-                // Bounds Check (Coordinate Space) - Fast fail
-                // Swiss Filename (Lower Left): origin_e, origin_n.
-                // Image Extent: [origin_e, origin_e + 10km], [origin_n, origin_n + 10km]
-                let max_e = img.max_e;
-                let max_n = img.max_n;
+            // Iterate ONLY the filtered images
+            for img in &row_images {
+                // Precise Point Check
+                if e >= img.origin_e && e < img.max_e && n >= img.origin_n && n < img.max_n {
 
-                if e >= img.origin_e && e < max_e && n >= img.origin_n && n < max_n {
-                    // Hit! Calculate Index.
-                    // Image is Top-Left origin for pixels?
-                    // Standard GeoTIFF: Row 0 is Top.
-                    // World Y: Max N.
-                    // delta_n = Max_N - current_n
                     let local_e = e - img.origin_e;
-                    let local_n_from_top = max_n - n;
+                    let local_n_from_top = img.max_n - n;
 
                     let px = (local_e / img.scale) as u32;
                     let py = (local_n_from_top / img.scale) as u32;
 
                     if px < img.width && py < img.height {
-                        // Unchecked access is unsafe, but fast. Use get() for safety.
                         let idx = (py * img.width + px) as usize;
+                        // Unchecked is safe here because of logic above,
+                        // but get() is safer for production
                         if let Some(&val) = img.data.get(idx) {
                             *out_pixel = val;
                             found = true;
-                            break; // Stop looking once found (Layer Priority: First in list wins)
+                            break;
                         }
                     }
                 }
@@ -226,7 +230,6 @@ pub fn process_tile_with_cache(
 
     // --- STEP 3: Write Output ---
     let f = File::create(&job.output_path)?;
-    // Large buffer for SSD write coalescing
     let mut w = BufWriter::with_capacity(1024 * 1024, f);
 
     w.write_all(b"AETH")?;
@@ -239,7 +242,6 @@ pub fn process_tile_with_cache(
     w.write_i16::<LittleEndian>(0)?;
     w.write_u16::<LittleEndian>(0)?;
 
-    // Raw bytes write is faster than loop
     let bytes_ptr = buffer.as_ptr() as *const u8;
     let bytes_len = buffer.len() * 2;
     let bytes_slice = unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) };
