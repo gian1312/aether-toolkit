@@ -4,6 +4,7 @@ mod ingest;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::fs;
+use std::collections::HashMap; // Added
 
 #[derive(Parser)]
 #[command(name = "aether_converter")]
@@ -36,16 +37,21 @@ fn main() -> anyhow::Result<()> {
         },
         Commands::Ingest { job_file } => {
             let content = fs::read_to_string(&job_file)?;
+
+            // --- CACHE INITIALIZATION ---
+            // We use a simple HashMap. It is effectively "Global" for this process run.
+            let mut texture_cache = HashMap::new();
+
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
                 println!("[Rust] Processing single tile: {:?}", job.output_path);
-                ingest::process_tile(job)?;
+                ingest::process_tile_with_cache(job, &mut texture_cache)?;
             } else if let Ok(jobs) = serde_json::from_str::<Vec<ingest::IngestJob>>(&content) {
                 println!("[Rust] Batch processing {} tiles...", jobs.len());
                 let total = jobs.len();
                 for (i, job) in jobs.into_iter().enumerate() {
-                    // FIX: Added 'total' variable to match the 3 placeholders [{}/{}] {:?}
                     println!("[Rust] [{}/{}] Generating {:?}", i+1, total, job.output_path);
-                    ingest::process_tile(job)?;
+                    // Pass the cache mutably
+                    ingest::process_tile_with_cache(job, &mut texture_cache)?;
                 }
             }
             Ok(())
