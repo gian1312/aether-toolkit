@@ -1,12 +1,18 @@
 [package]
 name = "aether_converter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-# For command line arguments
+# CLI
 clap = { version = "4.4", features = ["derive"] }
-# For writing specific binary formats
+# JSON Handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Image IO
 byteorder = "1.5"
-# For reading GeoTIFFs (Pure Rust implementation)
 tiff = "0.9"
+# Parallel Processing
+rayon = "1.8"
+# Error Handling
+anyhow = "1.0"
