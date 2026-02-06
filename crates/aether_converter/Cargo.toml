@@ -16,3 +16,6 @@ tiff = "0.9"
 rayon = "1.8"
 # Error Handling
 anyhow = "1.0"
+# GIS / Geometry
+flatgeobuf = "3.0"
+geozero = "0.10"
