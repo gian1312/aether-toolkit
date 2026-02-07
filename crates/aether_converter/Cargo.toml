@@ -19,3 +19,6 @@ anyhow = "1.0"
 # GIS / Geometry
 flatgeobuf = "3.0"
 geozero = "0.10"
+# Logging
+log = "0.4"
+env_logger = "0.11"

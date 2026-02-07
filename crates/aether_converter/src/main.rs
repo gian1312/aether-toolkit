@@ -4,7 +4,8 @@ mod ingest;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::fs;
-use std::collections::HashMap; // Added
+use std::collections::HashMap;
+use env_logger::Env;
 
 #[derive(Parser)]
 #[command(name = "aether_converter")]
@@ -28,6 +29,12 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // FIX: Strictly configure logger to ignore dependencies like flatgeobuf
+    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+        .filter_module("flatgeobuf", log::LevelFilter::Off) // Silence the noise
+        .filter_module("wgpu", log::LevelFilter::Warn)
+        .init();
+
     let args = Cli::parse();
 
     match args.command {
@@ -38,8 +45,6 @@ fn main() -> anyhow::Result<()> {
         Commands::Ingest { job_file } => {
             let content = fs::read_to_string(&job_file)?;
 
-            // --- CACHE INITIALIZATION ---
-            // We use a simple HashMap. It is effectively "Global" for this process run.
             let mut texture_cache = HashMap::new();
 
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
@@ -50,7 +55,6 @@ fn main() -> anyhow::Result<()> {
                 let total = jobs.len();
                 for (i, job) in jobs.into_iter().enumerate() {
                     println!("[Rust] [{}/{}] Generating {:?}", i+1, total, job.output_path);
-                    // Pass the cache mutably
                     ingest::process_tile_with_cache(job, &mut texture_cache)?;
                 }
             }
