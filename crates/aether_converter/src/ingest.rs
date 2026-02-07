@@ -166,9 +166,6 @@ pub fn process_tile_with_cache(
 
         let mut row_images = Vec::with_capacity(5);
         for img in &swiss_images {
-            // Precise Intersection:
-            // Tile [limit_n, origin_n] must overlap Row [row_min_n, row_max_n]
-            // Overlap condition: Tile_Top >= Row_Bot AND Tile_Bot <= Row_Top
             if img.origin_n >= row_min_n && img.limit_n <= row_max_n &&
                 img.limit_e >= row_min_e && img.origin_e <= row_max_e {
                 row_images.push(img.as_ref());
@@ -233,6 +230,8 @@ pub fn process_tile_with_cache(
 }
 
 fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_deg: f64) -> Result<()> {
+    println!("[Build] searching for buildings in: {:?}", fgb_target);
+
     let mut files_to_process = Vec::new();
     if fgb_target.is_dir() {
         if let Ok(entries) = fs::read_dir(fgb_target) {
@@ -255,12 +254,19 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
     let max_e = ul_e.max(lr_e) + 20.0;
     let min_n = ul_n.min(lr_n) - 20.0;
     let max_n = ul_n.max(lr_n) + 20.0;
-    let tile_width_m = lr_e - ul_e;
-    let tile_height_m = ul_n - lr_n;
+
+    let tile_width_m = (lr_e - ul_e).abs();
+    let tile_height_m = (ul_n - lr_n).abs();
+
+    println!("[Build] Query Box (LV95): E {:.1}..{:.1}, N {:.1}..{:.1}", min_e, max_e, min_n, max_n);
+
+    let mut total_pixels_mod = 0;
+    let mut total_features = 0;
 
     for fgb_path in files_to_process {
         let file = File::open(&fgb_path)?;
         let fgb = FgbReader::open(BufReader::new(file))?;
+
         if let Some(env) = fgb.header().envelope() {
             if env.get(0) > max_e || env.get(2) < min_e || env.get(1) > max_n || env.get(3) < min_n {
                 continue;
@@ -271,45 +277,117 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         while let Some(feature) = features.next()? {
             if let Some(geo) = feature.geometry() {
                 let g_type = geo.type_();
+                // 3D MultiPolygons often store parts instead of flat buffers.
+                // We process recursively to handle both.
                 if g_type == GeometryType::MultiPolygon || g_type == GeometryType::Polygon {
-                    process_geometry_lv95(&geo, buffer, job.size_px, ul_e, ul_n, tile_width_m, tile_height_m);
+                    total_features += 1;
+
+                    let debug_trace = total_features <= 3;
+
+                    if debug_trace {
+                        println!("[Build-Trace] Processing Feature #{} (Type: {:?})", total_features, g_type);
+                    }
+
+                    let mod_count = process_geometry_lv95(
+                        &geo, buffer, job.size_px,
+                        ul_e, ul_n, tile_width_m, tile_height_m, debug_trace
+                    );
+                    total_pixels_mod += mod_count;
+                } else if total_features < 5 {
+                    println!("[Build-Warn] Skipped Feature type: {:?}", g_type);
                 }
             }
         }
     }
+
+    println!("[Build] Scanned {} features. Modified {} pixels.", total_features, total_pixels_mod);
     Ok(())
 }
 
 fn process_geometry_lv95(
     geo: &flatgeobuf::Geometry, buffer: &mut [i16], size: u32,
-    ul_e: f64, ul_n: f64, total_w_m: f64, total_h_m: f64
-) {
-    let xy = match geo.xy() { Some(v) => v, None => return };
-    let z_vals = match geo.z() { Some(v) => v, None => return };
+    ul_e: f64, ul_n: f64, total_w_m: f64, total_h_m: f64,
+    debug: bool
+) -> usize {
+    // 0. Handle Recursive Parts (Nested Geometry)
+    // This is required when MultiPolygon is stored as a list of Polygons
+    if let Some(parts) = geo.parts() {
+        if parts.len() > 0 {
+            if debug { println!("[Build-Trace] Found {} nested parts. Recursing...", parts.len()); }
+            let mut total_modified = 0;
+            for i in 0..parts.len() {
+                let part = parts.get(i);
+                total_modified += process_geometry_lv95(&part, buffer, size, ul_e, ul_n, total_w_m, total_h_m, debug);
+            }
+            return total_modified;
+        }
+    }
+
+    // 1. XY Check
+    let xy = match geo.xy() {
+        Some(v) => v,
+        None => {
+            if debug { println!("[Build-Err] Feature has NO XY data!"); }
+            return 0;
+        }
+    };
+
+    // 2. Z Check
+    let z_vals = match geo.z() {
+        Some(v) => v,
+        None => {
+            if debug { println!("[Build-Err] Feature has NO Z data (Expected 3D)!"); }
+            return 0;
+        }
+    };
+
+    // 3. Max Z Calculation
     let mut max_z: f64 = -1000.0;
-    // FIX 1: No dereference (*). Iterator yields `f64` values.
     for z in z_vals {
         if z > max_z { max_z = z; }
     }
+
+    if debug {
+        println!("[Build-Data] XY Length: {}, Z Length: {}, Max Z: {:.2}", xy.len(), z_vals.len(), max_z);
+    }
+
+    // 4. Conversion to Internal Units
     let roof_val = (max_z * 2.0) as i16;
-    if roof_val < 0 { return; }
+    if roof_val < 0 {
+        if debug { println!("[Build-Err] Roof Value Negative ({}), skipping.", roof_val); }
+        return 0;
+    }
 
     let px_per_m_x = size as f64 / total_w_m;
     let px_per_m_y = size as f64 / total_h_m;
 
+    let mut pixels_modified = 0;
+
     let mut rasterize_ring = |stop_idx: usize, start_idx: usize| {
         let count = (stop_idx - start_idx) / 2;
         if count < 3 { return; }
+
         let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(count);
         let mut min_x = size as f64; let mut max_x = 0.0;
         let mut min_y = size as f64; let mut max_y = 0.0;
 
         let mut i = start_idx;
-        while i < stop_idx {
+
+        if debug && i == start_idx {
             let e = xy.get(i);
             let n = xy.get(i + 1);
             let px = (e - ul_e) * px_per_m_x;
             let py = (ul_n - n) * px_per_m_y;
+            println!("[Build-Coord] Raw E: {:.1}, N: {:.1} -> Px: {:.1}, {:.1}", e, n, px, py);
+        }
+
+        while i < stop_idx {
+            let e = xy.get(i);
+            let n = xy.get(i + 1);
+
+            let px = (e - ul_e) * px_per_m_x;
+            let py = (ul_n - n) * px_per_m_y;
+
             if px < min_x { min_x = px; }
             if px > max_x { max_x = px; }
             if py < min_y { min_y = py; }
@@ -323,13 +401,25 @@ fn process_geometry_lv95(
         let start_y = min_y.floor().max(0.0) as u32;
         let end_y = max_y.ceil().min(size as f64) as u32;
 
+        if debug {
+            println!("[Build-Raster] Box: X {}..{} Y {}..{}", start_x, end_x, start_y, end_y);
+        }
+
         for y in start_y..end_y {
             let py_center = y as f64 + 0.5;
             for x in start_x..end_x {
                 if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
                     let idx = (y * size + x) as usize;
-                    if idx < buffer.len() && roof_val > buffer[idx] {
-                        buffer[idx] = roof_val;
+                    if idx < buffer.len() {
+                        let current_h = buffer[idx];
+                        if roof_val > current_h {
+                            buffer[idx] = roof_val;
+                            pixels_modified += 1;
+                        } else if debug && pixels_modified == 0 {
+                            if (x + y * size) % 99999 == 0 {
+                                println!("[Build-Info] Roof {} <= Terrain {}. Building buried?", roof_val, current_h);
+                            }
+                        }
                     }
                 }
             }
@@ -338,7 +428,6 @@ fn process_geometry_lv95(
 
     if let Some(ends_vec) = geo.ends() {
         let mut start = 0;
-        // FIX 2: No dereference (*). Iterator yields `u32` values.
         for end in ends_vec {
             rasterize_ring(end as usize, start);
             start = end as usize;
@@ -346,6 +435,8 @@ fn process_geometry_lv95(
     } else {
         rasterize_ring(xy.len(), 0);
     }
+
+    pixels_modified
 }
 
 fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
