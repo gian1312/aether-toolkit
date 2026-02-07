@@ -114,7 +114,7 @@ pub fn process_tile_with_cache(
         for (p, res) in loaded {
             match res {
                 Ok(img) => { cache.insert(p, img); },
-                Err(e) => println!("[PROOF] FAILED TO LOAD {:?}: {}", p, e),
+                Err(e) => println!("[Warn] Failed to load {:?}: {}", p, e),
             }
         }
     }
@@ -124,32 +124,13 @@ pub fn process_tile_with_cache(
         if let Some(img) = cache.get(p) { swiss_images.push(img.clone()); }
     }
 
-    // Diagnostic Output
     let deg_per_meter = 1.0 / 111111.0;
     let pixel_deg = job.resolution_m * deg_per_meter;
     let out_size = job.size_px as usize;
-
-    let (ul_e, ul_n) = wgs84_to_lv95_fast(job.ul_lat, job.ul_lon);
-    let lr_lat = job.ul_lat - (out_size as f64 * pixel_deg);
-    let lr_lon = job.ul_lon + (out_size as f64 * pixel_deg);
-    let (lr_e, lr_n) = wgs84_to_lv95_fast(lr_lat, lr_lon);
-
-    println!("\n=== FORENSIC REPORT: {:?} ===", job.output_path.file_name().unwrap());
-    println!("   [PROOF] Target Bounds (LV95): N={:.1}..{:.1}, E={:.1}..{:.1}", ul_n, lr_n, ul_e, lr_e);
-    println!("   [PROOF] Loaded {} Source Tiles.", swiss_images.len());
-
-    let mut overlap_count = 0;
-    for img in swiss_images.iter() {
-        if img.origin_n > lr_n && img.limit_n < ul_n && img.limit_e > ul_e && img.origin_e < lr_e {
-            overlap_count += 1;
-        }
-    }
-    println!("   Total Overlapping Tiles: {}", overlap_count);
-
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
-    let cutoff_row = Arc::new(Mutex::new(None));
 
+    // Terrain Rasterization
     buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
         let (e_start, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
@@ -158,7 +139,6 @@ pub fn process_tile_with_cache(
         let step_e = (e_end - e_start) / out_size as f64;
         let step_n = (n_end - n_start) / out_size as f64;
 
-        // Precise Row Bounds (Min/Max N occupied by this tilted scanline)
         let row_min_n = n_start.min(n_end);
         let row_max_n = n_start.max(n_end);
         let row_min_e = e_start.min(e_end);
@@ -172,20 +152,12 @@ pub fn process_tile_with_cache(
             }
         }
 
-        if row_images.is_empty() {
-            let mut lock = cutoff_row.lock().unwrap();
-            if lock.is_none() && y > 100 {
-                *lock = Some((y, n_start));
-            }
-        }
-
         for (x, out_pixel) in row_buffer.iter_mut().enumerate() {
             let e = e_start + (step_e * x as f64);
             let n = n_start + (step_n * x as f64);
             let mut val = -9999i16;
 
             for img in &row_images {
-                // Precise Point Check
                 if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
                     let px = ((e - img.origin_e) / img.scale) as u32;
                     let py = ((img.origin_n - n) / img.scale) as u32;
@@ -199,14 +171,11 @@ pub fn process_tile_with_cache(
         }
     });
 
-    if let Some((y, n)) = *cutoff_row.lock().unwrap() {
-        println!("   [PROOF] CUTOFF DETECTED at Row Y={} (N={:.1}). Source data ends here.", y, n);
-    } else {
-        println!("   [PROOF] Coverage Complete.");
-    }
-
+    // Building Rasterization
     if let Some(fgb) = &job.buildings_file {
-        let _ = apply_buildings(&job, &mut buffer, fgb, pixel_deg);
+        if let Err(e) = apply_buildings(&job, &mut buffer, fgb, pixel_deg) {
+            println!("[Warn] Failed to apply buildings: {}", e);
+        }
     }
 
     let f = File::create(&job.output_path)?;
@@ -230,8 +199,6 @@ pub fn process_tile_with_cache(
 }
 
 fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_deg: f64) -> Result<()> {
-    println!("[Build] searching for buildings in: {:?}", fgb_target);
-
     let mut files_to_process = Vec::new();
     if fgb_target.is_dir() {
         if let Ok(entries) = fs::read_dir(fgb_target) {
@@ -258,8 +225,6 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
     let tile_width_m = (lr_e - ul_e).abs();
     let tile_height_m = (ul_n - lr_n).abs();
 
-    println!("[Build] Query Box (LV95): E {:.1}..{:.1}, N {:.1}..{:.1}", min_e, max_e, min_n, max_n);
-
     let mut total_pixels_mod = 0;
     let mut total_features = 0;
 
@@ -277,69 +242,44 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         while let Some(feature) = features.next()? {
             if let Some(geo) = feature.geometry() {
                 let g_type = geo.type_();
-                // 3D MultiPolygons often store parts instead of flat buffers.
-                // We process recursively to handle both.
                 if g_type == GeometryType::MultiPolygon || g_type == GeometryType::Polygon {
                     total_features += 1;
-
-                    let debug_trace = total_features <= 3;
-
-                    if debug_trace {
-                        println!("[Build-Trace] Processing Feature #{} (Type: {:?})", total_features, g_type);
-                    }
-
-                    let mod_count = process_geometry_lv95(
+                    total_pixels_mod += process_geometry_lv95(
                         &geo, buffer, job.size_px,
-                        ul_e, ul_n, tile_width_m, tile_height_m, debug_trace
+                        ul_e, ul_n, tile_width_m, tile_height_m
                     );
-                    total_pixels_mod += mod_count;
-                } else if total_features < 5 {
-                    println!("[Build-Warn] Skipped Feature type: {:?}", g_type);
                 }
             }
         }
     }
 
-    println!("[Build] Scanned {} features. Modified {} pixels.", total_features, total_pixels_mod);
+    if total_features > 0 {
+        println!("[Build] Scanned {} features. Modified {} pixels.", total_features, total_pixels_mod);
+    }
     Ok(())
 }
 
 fn process_geometry_lv95(
     geo: &flatgeobuf::Geometry, buffer: &mut [i16], size: u32,
-    ul_e: f64, ul_n: f64, total_w_m: f64, total_h_m: f64,
-    debug: bool
+    ul_e: f64, ul_n: f64, total_w_m: f64, total_h_m: f64
 ) -> usize {
-    // 0. Handle Recursive Parts (Nested Geometry)
-    // This is required when MultiPolygon is stored as a list of Polygons
+    // 0. Recursive handling for MultiPolygon parts
     if let Some(parts) = geo.parts() {
         if parts.len() > 0 {
-            if debug { println!("[Build-Trace] Found {} nested parts. Recursing...", parts.len()); }
             let mut total_modified = 0;
             for i in 0..parts.len() {
                 let part = parts.get(i);
-                total_modified += process_geometry_lv95(&part, buffer, size, ul_e, ul_n, total_w_m, total_h_m, debug);
+                total_modified += process_geometry_lv95(&part, buffer, size, ul_e, ul_n, total_w_m, total_h_m);
             }
             return total_modified;
         }
     }
 
     // 1. XY Check
-    let xy = match geo.xy() {
-        Some(v) => v,
-        None => {
-            if debug { println!("[Build-Err] Feature has NO XY data!"); }
-            return 0;
-        }
-    };
+    let xy = match geo.xy() { Some(v) => v, None => return 0 };
 
     // 2. Z Check
-    let z_vals = match geo.z() {
-        Some(v) => v,
-        None => {
-            if debug { println!("[Build-Err] Feature has NO Z data (Expected 3D)!"); }
-            return 0;
-        }
-    };
+    let z_vals = match geo.z() { Some(v) => v, None => return 0 };
 
     // 3. Max Z Calculation
     let mut max_z: f64 = -1000.0;
@@ -347,16 +287,9 @@ fn process_geometry_lv95(
         if z > max_z { max_z = z; }
     }
 
-    if debug {
-        println!("[Build-Data] XY Length: {}, Z Length: {}, Max Z: {:.2}", xy.len(), z_vals.len(), max_z);
-    }
-
     // 4. Conversion to Internal Units
     let roof_val = (max_z * 2.0) as i16;
-    if roof_val < 0 {
-        if debug { println!("[Build-Err] Roof Value Negative ({}), skipping.", roof_val); }
-        return 0;
-    }
+    if roof_val < 0 { return 0; }
 
     let px_per_m_x = size as f64 / total_w_m;
     let px_per_m_y = size as f64 / total_h_m;
@@ -372,15 +305,6 @@ fn process_geometry_lv95(
         let mut min_y = size as f64; let mut max_y = 0.0;
 
         let mut i = start_idx;
-
-        if debug && i == start_idx {
-            let e = xy.get(i);
-            let n = xy.get(i + 1);
-            let px = (e - ul_e) * px_per_m_x;
-            let py = (ul_n - n) * px_per_m_y;
-            println!("[Build-Coord] Raw E: {:.1}, N: {:.1} -> Px: {:.1}, {:.1}", e, n, px, py);
-        }
-
         while i < stop_idx {
             let e = xy.get(i);
             let n = xy.get(i + 1);
@@ -401,10 +325,6 @@ fn process_geometry_lv95(
         let start_y = min_y.floor().max(0.0) as u32;
         let end_y = max_y.ceil().min(size as f64) as u32;
 
-        if debug {
-            println!("[Build-Raster] Box: X {}..{} Y {}..{}", start_x, end_x, start_y, end_y);
-        }
-
         for y in start_y..end_y {
             let py_center = y as f64 + 0.5;
             for x in start_x..end_x {
@@ -415,10 +335,6 @@ fn process_geometry_lv95(
                         if roof_val > current_h {
                             buffer[idx] = roof_val;
                             pixels_modified += 1;
-                        } else if debug && pixels_modified == 0 {
-                            if (x + y * size) % 99999 == 0 {
-                                println!("[Build-Info] Roof {} <= Terrain {}. Building buried?", roof_val, current_h);
-                            }
                         }
                     }
                 }

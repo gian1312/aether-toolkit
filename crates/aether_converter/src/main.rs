@@ -29,10 +29,10 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     // FIX: Strictly ignore environment variables for noisy modules.
-    let mut builder = env_logger::Builder::new(); // 'new' ignores RUST_LOG env var initially
+    let mut builder = env_logger::Builder::new();
 
-    builder.filter(None, log::LevelFilter::Info); // Default to Info for our code
-    builder.filter_module("flatgeobuf", log::LevelFilter::Off); // CRITICAL: Complete silence
+    builder.filter(None, log::LevelFilter::Info); // Default to Info
+    builder.filter_module("flatgeobuf", log::LevelFilter::Off); // Silence FGB
     builder.filter_module("wgpu", log::LevelFilter::Error);     // Silence GPU
     builder.filter_module("tiff", log::LevelFilter::Warn);
 
@@ -56,11 +56,19 @@ fn main() -> anyhow::Result<()> {
                 println!("[Rust] Batch processing {} tiles...", jobs.len());
                 let total = jobs.len();
                 for (i, job) in jobs.into_iter().enumerate() {
-                    // Log only significant progress
+                    // Log progress every 10 tiles
                     if i % 10 == 0 || i == total - 1 {
                         println!("[Rust] Progress: {}/{}", i + 1, total);
                     }
                     ingest::process_tile_with_cache(job, &mut texture_cache)?;
+
+                    // --- OOM FIX ---
+                    // Prevent infinite memory growth during large batches.
+                    // If we hold more than 15 loaded TIFFs, clear the cache.
+                    // 15 * ~200MB = ~3GB, which is safe for most systems.
+                    if texture_cache.len() > 30 {
+                        texture_cache.clear();
+                    }
                 }
             }
             Ok(())
