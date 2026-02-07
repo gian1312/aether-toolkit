@@ -1,6 +1,6 @@
 [package]
 name = "aether_converter"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 
 [dependencies]
@@ -16,9 +16,9 @@ tiff = "0.9"
 rayon = "1.8"
 # Error Handling
 anyhow = "1.0"
-# GIS / Geometry
-flatgeobuf = "3.0"
-geozero = "0.10"
+# GIS
+flatgeobuf = "4.0"
+fallible-streaming-iterator = "0.1"
 # Logging
 log = "0.4"
 env_logger = "0.11"

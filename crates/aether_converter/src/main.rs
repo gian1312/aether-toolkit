@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::fs;
 use std::collections::HashMap;
-use env_logger::Env;
 
 #[derive(Parser)]
 #[command(name = "aether_converter")]
@@ -29,22 +28,25 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-    // FIX: Strictly configure logger to ignore dependencies like flatgeobuf
-    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-        .filter_module("flatgeobuf", log::LevelFilter::Off) // Silence the noise
-        .filter_module("wgpu", log::LevelFilter::Warn)
-        .init();
+    // FIX: Strictly ignore environment variables for noisy modules.
+    let mut builder = env_logger::Builder::new(); // 'new' ignores RUST_LOG env var initially
+
+    builder.filter(None, log::LevelFilter::Info); // Default to Info for our code
+    builder.filter_module("flatgeobuf", log::LevelFilter::Off); // CRITICAL: Complete silence
+    builder.filter_module("wgpu", log::LevelFilter::Error);     // Silence GPU
+    builder.filter_module("tiff", log::LevelFilter::Warn);
+
+    builder.init();
 
     let args = Cli::parse();
 
     match args.command {
-        Commands::Convert { input: _, output: _ } => {
-            println!("Legacy convert not optimized. Use Ingest.");
+        Commands::Convert { .. } => {
+            println!("Legacy convert command is deprecated. Use 'ingest'.");
             Ok(())
         },
         Commands::Ingest { job_file } => {
             let content = fs::read_to_string(&job_file)?;
-
             let mut texture_cache = HashMap::new();
 
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
@@ -54,7 +56,10 @@ fn main() -> anyhow::Result<()> {
                 println!("[Rust] Batch processing {} tiles...", jobs.len());
                 let total = jobs.len();
                 for (i, job) in jobs.into_iter().enumerate() {
-                    println!("[Rust] [{}/{}] Generating {:?}", i+1, total, job.output_path);
+                    // Log only significant progress
+                    if i % 10 == 0 || i == total - 1 {
+                        println!("[Rust] Progress: {}/{}", i + 1, total);
+                    }
                     ingest::process_tile_with_cache(job, &mut texture_cache)?;
                 }
             }
