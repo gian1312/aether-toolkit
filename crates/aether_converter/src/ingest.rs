@@ -180,6 +180,12 @@ pub fn process_tile_with_cache(
 
     let f = File::create(&job.output_path)?;
     let mut w = BufWriter::with_capacity(1024 * 1024, f);
+
+    // Calculate 256-byte aligned stride
+    let bytes_per_row = job.size_px as u32 * 2;
+    let aligned_stride = (bytes_per_row + 255) & !255;
+    let padding_bytes = aligned_stride - bytes_per_row;
+
     w.write_all(b"AETH")?;
     w.write_u16::<LittleEndian>(1)?;
     w.write_u16::<LittleEndian>(job.size_px as u16)?;
@@ -188,12 +194,20 @@ pub fn process_tile_with_cache(
     w.write_f64::<LittleEndian>(pixel_deg)?;
     w.write_f64::<LittleEndian>(pixel_deg)?;
     w.write_i16::<LittleEndian>(0)?;
-    w.write_u16::<LittleEndian>(0)?;
+    // Write Stride instead of Reserved
+    w.write_u16::<LittleEndian>(aligned_stride as u16)?;
 
-    let ptr = buffer.as_ptr() as *const u8;
-    let len = buffer.len() * 2;
-    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-    w.write_all(slice)?;
+    // Write Row-by-Row with Padding
+    let padding_buf = vec![0u8; padding_bytes as usize];
+    for chunk in buffer.chunks(job.size_px as usize) {
+        let ptr = chunk.as_ptr() as *const u8;
+        let len = chunk.len() * 2;
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        w.write_all(slice)?;
+        if padding_bytes > 0 {
+            w.write_all(&padding_buf)?;
+        }
+    }
 
     Ok(())
 }
