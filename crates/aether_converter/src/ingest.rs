@@ -105,8 +105,14 @@ pub fn process_tile_with_cache(
     cache: &mut HashMap<PathBuf, Arc<LoadedImage>>
 ) -> Result<()> {
 
-    let missing: Vec<PathBuf> = job.swiss_tifs.iter()
+    let mut missing: Vec<PathBuf> = job.swiss_tifs.iter()
         .filter(|p| !cache.contains_key(*p)).cloned().collect();
+
+    if let Some(base_path) = &job.base_tif {
+        if !cache.contains_key(base_path) {
+            missing.push(base_path.clone());
+        }
+    }
 
     if !missing.is_empty() {
         let loaded: Vec<_> = missing.par_iter()
@@ -124,15 +130,36 @@ pub fn process_tile_with_cache(
         if let Some(img) = cache.get(p) { swiss_images.push(img.clone()); }
     }
 
+    let base_image = job.base_tif.as_ref().and_then(|p| cache.get(p).cloned());
+    let base_image_ref = base_image.as_deref();
+
     let deg_per_meter = 1.0 / 111111.0;
     let pixel_deg = job.resolution_m * deg_per_meter;
     let out_size = job.size_px as usize;
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
 
-    // Terrain Rasterization
+    // Terrain Rasterization (Painter's Algorithm)
     buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
+
+        // --- PERFORMANCE OPTIMIZATION ---
+        // Precalculate Base Map Y-axis intersection to avoid looping float-math per pixel
+        let mut base_row_valid = false;
+        let mut base_py = 0;
+        if let Some(base) = base_image_ref {
+            if row_lat <= base.origin_n && row_lat >= base.limit_n {
+                let py_f = (base.origin_n - row_lat) / base.scale;
+                if py_f >= 0.0 {
+                    let py = py_f as u32;
+                    if py < base.height {
+                        base_row_valid = true;
+                        base_py = py;
+                    }
+                }
+            }
+        }
+
         let (e_start, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
         let (e_end, n_end) = wgs84_to_lv95_fast(row_lat, job.ul_lon + (out_size as f64 * pixel_deg));
 
@@ -157,16 +184,41 @@ pub fn process_tile_with_cache(
             let n = n_start + (step_n * x as f64);
             let mut val = -9999i16;
 
+            // 1. Try High-Res Swiss Data (LV95 specific)
             for img in &row_images {
                 if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
                     let px = ((e - img.origin_e) / img.scale) as u32;
                     let py = ((img.origin_n - n) / img.scale) as u32;
                     if px < img.width && py < img.height {
-                        unsafe { val = *img.data.get_unchecked((py * img.width + px) as usize); }
-                        break;
+                        let v = unsafe { *img.data.get_unchecked((py * img.width + px) as usize) };
+                        if v > -5000 {
+                            val = v;
+                            break;
+                        }
                     }
                 }
             }
+
+            // 2. Fallback to Upsampled Base Map (WGS84 specific)
+            if val <= -5000 && base_row_valid {
+                // Guaranteed safe because base_row_valid implies is_some()
+                let base = base_image_ref.unwrap();
+                let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
+
+                if pixel_lon >= base.origin_e && pixel_lon < base.limit_e {
+                    let px_f = (pixel_lon - base.origin_e) / base.scale;
+                    if px_f >= 0.0 {
+                        let px = px_f as u32;
+                        if px < base.width {
+                            let v = unsafe { *base.data.get_unchecked((base_py * base.width + px) as usize) };
+                            if v > -5000 {
+                                val = v;
+                            }
+                        }
+                    }
+                }
+            }
+
             *out_pixel = val;
         }
     });
@@ -277,7 +329,6 @@ fn process_geometry_lv95(
     geo: &flatgeobuf::Geometry, buffer: &mut [i16], size: u32,
     ul_e: f64, ul_n: f64, total_w_m: f64, total_h_m: f64
 ) -> usize {
-    // 0. Recursive handling for MultiPolygon parts
     if let Some(parts) = geo.parts() {
         if parts.len() > 0 {
             let mut total_modified = 0;
@@ -289,19 +340,14 @@ fn process_geometry_lv95(
         }
     }
 
-    // 1. XY Check
     let xy = match geo.xy() { Some(v) => v, None => return 0 };
-
-    // 2. Z Check
     let z_vals = match geo.z() { Some(v) => v, None => return 0 };
 
-    // 3. Max Z Calculation
     let mut max_z: f64 = -1000.0;
     for z in z_vals {
         if z > max_z { max_z = z; }
     }
 
-    // 4. Conversion to Internal Units
     let roof_val = (max_z * 2.0) as i16;
     if roof_val < 0 { return 0; }
 

@@ -62,12 +62,12 @@ fn main() -> anyhow::Result<()> {
                     }
                     ingest::process_tile_with_cache(job, &mut texture_cache)?;
 
-                    // --- OOM FIX ---
-                    // Prevent infinite memory growth during large batches.
-                    // If we hold more than 15 loaded TIFFs, clear the cache.
-                    // 15 * ~200MB = ~3GB, which is safe for most systems.
+                    // --- OOM FIX / CACHE THRASHING FIX ---
+                    // Prevent memory fragmentation and thread-starvation.
+                    // If we hold more than 30 TIFFs, we drop the small Swiss tiles
+                    // BUT permanently retain the massive 'Chunk_*.tif' Base DEMs!
                     if texture_cache.len() > 30 {
-                        texture_cache.clear();
+                        texture_cache.retain(|k, _| k.file_name().unwrap_or_default().to_string_lossy().starts_with("Chunk_"));
                     }
                 }
             }
