@@ -139,12 +139,11 @@ pub fn process_tile_with_cache(
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
 
-    // Terrain Rasterization (Painter's Algorithm)
+    // Terrain Rasterization
     buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
 
-        // --- PERFORMANCE OPTIMIZATION ---
-        // Precalculate Base Map Y-axis intersection to avoid looping float-math per pixel
+        // Base Map Y-axis Fast Intersect
         let mut base_row_valid = false;
         let mut base_py = 0;
         if let Some(base) = base_image_ref {
@@ -184,7 +183,6 @@ pub fn process_tile_with_cache(
             let n = n_start + (step_n * x as f64);
             let mut val = -9999i16;
 
-            // 1. Try High-Res Swiss Data (LV95 specific)
             for img in &row_images {
                 if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
                     let px = ((e - img.origin_e) / img.scale) as u32;
@@ -199,9 +197,7 @@ pub fn process_tile_with_cache(
                 }
             }
 
-            // 2. Fallback to Upsampled Base Map (WGS84 specific)
             if val <= -5000 && base_row_valid {
-                // Guaranteed safe because base_row_valid implies is_some()
                 let base = base_image_ref.unwrap();
                 let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
 
@@ -233,7 +229,6 @@ pub fn process_tile_with_cache(
     let f = File::create(&job.output_path)?;
     let mut w = BufWriter::with_capacity(1024 * 1024, f);
 
-    // Calculate 256-byte aligned stride
     let bytes_per_row = job.size_px as u32 * 2;
     let aligned_stride = (bytes_per_row + 255) & !255;
     let padding_bytes = aligned_stride - bytes_per_row;
@@ -246,10 +241,8 @@ pub fn process_tile_with_cache(
     w.write_f64::<LittleEndian>(pixel_deg)?;
     w.write_f64::<LittleEndian>(pixel_deg)?;
     w.write_i16::<LittleEndian>(0)?;
-    // Write Stride instead of Reserved
     w.write_u16::<LittleEndian>(aligned_stride as u16)?;
 
-    // Write Row-by-Row with Padding
     let padding_buf = vec![0u8; padding_bytes as usize];
     for chunk in buffer.chunks(job.size_px as usize) {
         let ptr = chunk.as_ptr() as *const u8;
@@ -278,18 +271,17 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         files_to_process.push(fgb_target.to_path_buf());
     }
 
-    let (ul_e, ul_n) = wgs84_to_lv95_fast(job.ul_lat, job.ul_lon);
+    // --- MINIMAL FIX: Search Bounding Box is now strictly WGS84 ---
     let lr_lat = job.ul_lat - (job.size_px as f64 * px_deg);
     let lr_lon = job.ul_lon + (job.size_px as f64 * px_deg);
-    let (lr_e, lr_n) = wgs84_to_lv95_fast(lr_lat, lr_lon);
 
-    let min_e = ul_e.min(lr_e) - 20.0;
-    let max_e = ul_e.max(lr_e) + 20.0;
-    let min_n = ul_n.min(lr_n) - 20.0;
-    let max_n = ul_n.max(lr_n) + 20.0;
+    // Approx 20 meter padding in degrees
+    let pad_deg = 20.0 / 111111.0;
 
-    let tile_width_m = (lr_e - ul_e).abs();
-    let tile_height_m = (ul_n - lr_n).abs();
+    let min_lon = job.ul_lon.min(lr_lon) - pad_deg;
+    let max_lon = job.ul_lon.max(lr_lon) + pad_deg;
+    let min_lat = job.ul_lat.min(lr_lat) - pad_deg;
+    let max_lat = job.ul_lat.max(lr_lat) + pad_deg;
 
     let mut total_pixels_mod = 0;
     let mut total_features = 0;
@@ -299,20 +291,21 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         let fgb = FgbReader::open(BufReader::new(file))?;
 
         if let Some(env) = fgb.header().envelope() {
-            if env.get(0) > max_e || env.get(2) < min_e || env.get(1) > max_n || env.get(3) < min_n {
+            // env is[min_x, min_y, max_x, max_y]
+            if env.get(0) > max_lon || env.get(2) < min_lon || env.get(1) > max_lat || env.get(3) < min_lat {
                 continue;
             }
         }
 
-        let mut features = fgb.select_bbox(min_e, min_n, max_e, max_n)?;
+        let mut features = fgb.select_bbox(min_lon, min_lat, max_lon, max_lat)?;
         while let Some(feature) = features.next()? {
             if let Some(geo) = feature.geometry() {
                 let g_type = geo.type_();
                 if g_type == GeometryType::MultiPolygon || g_type == GeometryType::Polygon {
                     total_features += 1;
-                    total_pixels_mod += process_geometry_lv95(
+                    total_pixels_mod += process_geometry_wgs84(
                         &geo, buffer, job.size_px,
-                        ul_e, ul_n, tile_width_m, tile_height_m
+                        job.ul_lon, job.ul_lat, px_deg
                     );
                 }
             }
@@ -325,16 +318,16 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
     Ok(())
 }
 
-fn process_geometry_lv95(
+fn process_geometry_wgs84(
     geo: &flatgeobuf::Geometry, buffer: &mut [i16], size: u32,
-    ul_e: f64, ul_n: f64, total_w_m: f64, total_h_m: f64
+    ul_lon: f64, ul_lat: f64, px_deg: f64
 ) -> usize {
     if let Some(parts) = geo.parts() {
         if parts.len() > 0 {
             let mut total_modified = 0;
             for i in 0..parts.len() {
                 let part = parts.get(i);
-                total_modified += process_geometry_lv95(&part, buffer, size, ul_e, ul_n, total_w_m, total_h_m);
+                total_modified += process_geometry_wgs84(&part, buffer, size, ul_lon, ul_lat, px_deg);
             }
             return total_modified;
         }
@@ -351,9 +344,6 @@ fn process_geometry_lv95(
     let roof_val = (max_z * 2.0) as i16;
     if roof_val < 0 { return 0; }
 
-    let px_per_m_x = size as f64 / total_w_m;
-    let px_per_m_y = size as f64 / total_h_m;
-
     let mut pixels_modified = 0;
 
     let mut rasterize_ring = |stop_idx: usize, start_idx: usize| {
@@ -366,11 +356,12 @@ fn process_geometry_lv95(
 
         let mut i = start_idx;
         while i < stop_idx {
-            let e = xy.get(i);
-            let n = xy.get(i + 1);
+            // --- MINIMAL FIX: Directly map Longitude and Latitude ---
+            let lon = xy.get(i);
+            let lat = xy.get(i + 1);
 
-            let px = (e - ul_e) * px_per_m_x;
-            let py = (ul_n - n) * px_per_m_y;
+            let px = (lon - ul_lon) / px_deg;
+            let py = (ul_lat - lat) / px_deg;
 
             if px < min_x { min_x = px; }
             if px > max_x { max_x = px; }
