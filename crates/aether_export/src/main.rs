@@ -13,6 +13,10 @@
 // for the main image. The entire unpack→repack cycle from the Python
 // version is eliminated.
 //
+//[8-BIT MODE] In 8-bit propagation loss mode, the input is raw u8 bytes
+// (one byte per pixel). Tile extraction is also pure memcpy — just copy
+// tile_size bytes per row instead of tile_size/8.
+//
 // ARCHITECTURE:
 //   1. mmap the .bit input (zero-copy)
 //   2. For each tile-row, extract+compress all tiles in parallel (rayon)
@@ -76,7 +80,13 @@ struct Metadata {
     projection: String,
     #[serde(default)]
     row_stride_bytes: Option<usize>,
+    //[8-BIT MODE] Output format from sidecar: "1BIT_LOS" or "8BIT_PROP"
+    #[serde(default = "default_output_format")]
+    output_format: String,
 }
+
+//[8-BIT MODE] Default to 1-bit for backward compatibility
+fn default_output_format() -> String { "1BIT_LOS".to_string() }
 
 #[derive(Deserialize)]
 struct Dimensions {
@@ -268,7 +278,7 @@ fn is_all_zero(data: &[u8]) -> bool {
         && suffix.iter().all(|&b| b == 0)
 }
 
-/// Extract a tile's packed bit data directly from the memory-mapped input.
+/// Extract a 1-bit tile's packed bit data directly from the memory-mapped input.
 ///
 /// This is the critical optimization: since tile_size is a multiple of 8,
 /// tile column boundaries are always byte-aligned in the packed bit input.
@@ -276,7 +286,7 @@ fn is_all_zero(data: &[u8]) -> bool {
 ///
 /// The returned buffer is tile_size/8 × tile_size bytes (the full tile,
 /// zero-padded at edges), ready for DEFLATE compression.
-fn extract_tile_packed(
+fn extract_tile_packed_1bit(
     mmap: &[u8],
     row_stride: usize,
     width: usize,
@@ -323,6 +333,43 @@ fn extract_tile_packed(
     buf
 }
 
+//[8-BIT MODE] Extract an 8-bit tile (one byte per pixel) via direct memcpy.
+// Returns tile_size × tile_size bytes, zero-padded at edges.
+fn extract_tile_packed_8bit(
+    mmap: &[u8],
+    row_stride: usize,
+    width: usize,
+    height: usize,
+    ts: usize,
+    tx: usize,
+    ty: usize,
+) -> Vec<u8> {
+    let tile_row_bytes = ts; // 1 byte per pixel
+    let mut buf = vec![0u8; tile_row_bytes * ts];
+
+    let x0 = tx * ts;
+    let y0 = ty * ts;
+    let tw = std::cmp::min(ts, width.saturating_sub(x0));
+    let th = std::cmp::min(ts, height.saturating_sub(y0));
+    if tw == 0 || th == 0 {
+        return buf;
+    }
+
+    for row in 0..th {
+        let src_offset = (y0 + row) * row_stride + x0;
+        let dst_offset = row * tile_row_bytes;
+
+        if src_offset + tw > mmap.len() {
+            break;
+        }
+
+        buf[dst_offset..dst_offset + tw]
+            .copy_from_slice(&mmap[src_offset..src_offset + tw]);
+    }
+
+    buf
+}
+
 /// Read a single bit from the packed input.
 #[inline(always)]
 fn get_bit(mmap: &[u8], row_stride: usize, x: usize, y: usize) -> u8 {
@@ -331,8 +378,16 @@ fn get_bit(mmap: &[u8], row_stride: usize, x: usize, y: usize) -> u8 {
     (mmap[idx] >> (7 - (x & 7))) & 1
 }
 
-/// Extract an overview tile by nearest-neighbor sampling from the original.
-fn extract_overview_tile(
+//[8-BIT MODE] Read a single byte from 8-bit input.
+#[inline(always)]
+fn get_byte(mmap: &[u8], row_stride: usize, x: usize, y: usize) -> u8 {
+    let idx = y * row_stride + x;
+    if idx >= mmap.len() { return 0; }
+    mmap[idx]
+}
+
+/// Extract a 1-bit overview tile by nearest-neighbor sampling from the original.
+fn extract_overview_tile_1bit(
     mmap: &[u8],
     row_stride: usize,
     src_width: usize,
@@ -365,6 +420,44 @@ fn extract_overview_tile(
             if get_bit(mmap, row_stride, sx, sy) != 0 {
                 buf[py * tile_row_bytes + px / 8] |= 1 << (7 - (px & 7));
             }
+        }
+    }
+
+    buf
+}
+
+//[8-BIT MODE] Extract an 8-bit overview tile by nearest-neighbor sampling.
+fn extract_overview_tile_8bit(
+    mmap: &[u8],
+    row_stride: usize,
+    src_width: usize,
+    src_height: usize,
+    ts: usize,
+    tx: usize,
+    ty: usize,
+    factor: usize,
+) -> Vec<u8> {
+    let tile_row_bytes = ts;
+    let mut buf = vec![0u8; tile_row_bytes * ts];
+
+    let ovr_w = (src_width + factor - 1) / factor;
+    let ovr_h = (src_height + factor - 1) / factor;
+    let x0 = tx * ts;
+    let y0 = ty * ts;
+
+    for py in 0..ts {
+        let oy = y0 + py;
+        if oy >= ovr_h { break; }
+        let sy = oy * factor;
+        if sy >= src_height { break; }
+
+        for px in 0..ts {
+            let ox = x0 + px;
+            if ox >= ovr_w { break; }
+            let sx = ox * factor;
+            if sx >= src_width { break; }
+
+            buf[py * tile_row_bytes + px] = get_byte(mmap, row_stride, sx, sy);
         }
     }
 
@@ -469,11 +562,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let width = meta.dimensions.width;
     let height = meta.dimensions.height;
 
+    //[8-BIT MODE] Detect output format from sidecar
+    let is_8bit = meta.output_format == "8BIT_PROP";
+
     // FIX: The core engine (aether_core) aligns rows to 32-bit (4-byte) boundaries.
     // The previous fallback ((width + 7) / 8) assumed 1-byte alignment, causing
     // diagonal streaks if 'row_stride_bytes' was missing from JSON or failed to parse.
     let row_stride = meta.row_stride_bytes.unwrap_or_else(|| {
-        ((width + 31) / 32) * 4
+        //[8-BIT MODE] Default stride depends on format
+        if is_8bit {
+            width // 1 byte per pixel, no alignment needed
+        } else {
+            ((width + 31) / 32) * 4
+        }
     });
 
     let ts = args.tile_size;
@@ -483,8 +584,12 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let use_compression = args.level > 0;
     let compress_code = if use_compression { COMPRESS_DEFLATE } else { COMPRESS_NONE };
 
-    eprintln!("[Export] Image: {}×{} | Tile: {} | Stride: {} B | Compress: {}",
+    //[8-BIT MODE] Bits per sample depends on format
+    let bits_per_sample: u16 = if is_8bit { 8 } else { 1 };
+
+    eprintln!("[Export] Image: {}×{} | Tile: {} | Stride: {} B | Format: {} | Compress: {}",
               width, height, ts, row_stride,
+              if is_8bit { "8BIT_PROP" } else { "1BIT_LOS" },
               if use_compression { format!("deflate-{}", args.level) } else { "none".into() }
     );
 
@@ -511,7 +616,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 5. Write main image tiles ────────────────────────────────────────
     let main_level = write_tiles(
-        &mut w, &mmap, row_stride, width, height, ts, args.level, None,
+        &mut w, &mmap, row_stride, width, height, ts, args.level, None, is_8bit,
     )?;
     prof.lap("Main tiles written");
 
@@ -523,7 +628,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("[Export] Overview {}: {}× → {}×{}", i + 1, factor, ovr_w, ovr_h);
 
         let level = write_tiles(
-            &mut w, &mmap, row_stride, width, height, ts, args.level, Some(factor),
+            &mut w, &mmap, row_stride, width, height, ts, args.level, Some(factor), is_8bit,
         )?;
         ovr_levels.push(level);
     }
@@ -549,6 +654,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             compress_code,
             &level.tile_info,
             true, // is_overview
+            bits_per_sample, //[8-BIT MODE]
         );
 
         let (ifd_off, next_fix) = write_ifd(&mut w, &mut entries, next_ifd_offset)?;
@@ -565,6 +671,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         compress_code,
         &main_level.tile_info,
         false,
+        bits_per_sample, //[8-BIT MODE]
     );
     // Add GeoTIFF tags
     main_entries.extend(build_geo_tags(&meta));
@@ -593,6 +700,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Build standard TIFF tags for an image level.
+//[8-BIT MODE] Added bits_per_sample parameter
 fn build_image_tags(
     width: u32,
     height: u32,
@@ -600,6 +708,7 @@ fn build_image_tags(
     compression: u16,
     tile_info: &[(u64, u64)],
     is_overview: bool,
+    bits_per_sample: u16,
 ) -> Vec<TagEntry> {
     let offsets: Vec<u64> = tile_info.iter().map(|t| t.0).collect();
     let sizes: Vec<u64> = tile_info.iter().map(|t| t.1).collect();
@@ -607,7 +716,7 @@ fn build_image_tags(
     let mut tags = vec![
         TagEntry::long(TAG_IMAGE_WIDTH, width),
         TagEntry::long(TAG_IMAGE_LENGTH, height),
-        TagEntry::short(TAG_BITS_PER_SAMPLE, 1),
+        TagEntry::short(TAG_BITS_PER_SAMPLE, bits_per_sample), //[8-BIT MODE] Parametrized
         TagEntry::short(TAG_COMPRESSION, compression),
         TagEntry::short(TAG_PHOTOMETRIC, 1), // MINISBLACK
         TagEntry::short(TAG_SAMPLES_PER_PIXEL, 1),
@@ -628,6 +737,7 @@ fn build_image_tags(
 /// Process and write all tiles for one image level.
 /// If `overview_factor` is None, extracts tiles directly (memcpy path).
 /// If Some(f), does nearest-neighbor sampling at factor f.
+//[8-BIT MODE] Added is_8bit parameter to switch extraction logic
 fn write_tiles(
     w: &mut (impl Write + Seek),
     mmap: &Mmap,
@@ -637,6 +747,7 @@ fn write_tiles(
     ts: usize,
     level: u32,
     overview_factor: Option<usize>,
+    is_8bit: bool,
 ) -> io::Result<ImageLevel> {
     let (img_w, img_h) = match overview_factor {
         None => (src_width, src_height),
@@ -657,9 +768,12 @@ fn write_tiles(
         let row_tiles: Vec<Option<Vec<u8>>> = (0..tiles_x)
             .into_par_iter()
             .map(|tx| {
-                let raw = match overview_factor {
-                    None => extract_tile_packed(mmap, row_stride, src_width, src_height, ts, tx, ty),
-                    Some(f) => extract_overview_tile(mmap, row_stride, src_width, src_height, ts, tx, ty, f),
+                //[8-BIT MODE] Route to format-specific extraction
+                let raw = match (overview_factor, is_8bit) {
+                    (None, false) => extract_tile_packed_1bit(mmap, row_stride, src_width, src_height, ts, tx, ty),
+                    (None, true)  => extract_tile_packed_8bit(mmap, row_stride, src_width, src_height, ts, tx, ty),
+                    (Some(f), false) => extract_overview_tile_1bit(mmap, row_stride, src_width, src_height, ts, tx, ty, f),
+                    (Some(f), true)  => extract_overview_tile_8bit(mmap, row_stride, src_width, src_height, ts, tx, ty, f),
                 };
 
                 // Sparse optimization: skip all-zero tiles
