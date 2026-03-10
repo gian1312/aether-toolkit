@@ -118,6 +118,7 @@ const BIGTIFF_VERSION: u16 = 43;
 const BIGTIFF_OFFSET_SIZE: u16 = 8;
 
 // TIFF data types
+const TY_ASCII: u16 = 2;   // NUL-terminated string
 const TY_SHORT: u16 = 3;   // u16
 const TY_LONG: u16 = 4;    // u32
 const TY_DOUBLE: u16 = 12; // f64
@@ -141,6 +142,10 @@ const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
+
+//[8-BIT MODE] GDAL extension tags for offset/scale and nodata
+const TAG_GDAL_METADATA: u16 = 42112;
+const TAG_GDAL_NODATA: u16 = 42113;
 
 // Compression codes
 const COMPRESS_NONE: u16 = 1;
@@ -191,6 +196,13 @@ impl TagEntry {
     fn short_array(tag: u16, vals: &[u16]) -> Self {
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         Self { tag, dtype: TY_SHORT, count: vals.len() as u64, data, overflow_offset: 0 }
+    }
+    //[8-BIT MODE] ASCII string tag (NUL-terminated, count includes NUL)
+    fn ascii(tag: u16, s: &str) -> Self {
+        let mut data = s.as_bytes().to_vec();
+        data.push(0); // NUL terminator
+        let count = data.len() as u64;
+        Self { tag, dtype: TY_ASCII, count, data, overflow_offset: 0 }
     }
 }
 
@@ -675,6 +687,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
     // Add GeoTIFF tags
     main_entries.extend(build_geo_tags(&meta));
+
+    //[8-BIT MODE] Add GDAL offset/scale metadata so GIS tools display real dBm values.
+    // Stored pixel = clamp(dBm + 150, 0, 255). GIS applies: real = pixel * scale + offset.
+    // With scale=1, offset=-150: real = pixel - 150 = dBm. Nodata = pixel value 0.
+    if is_8bit {
+        main_entries.push(TagEntry::ascii(TAG_GDAL_METADATA,
+                                          "<GDALMetadata>\n\
+             <Item name=\"OFFSET\" sample=\"0\" role=\"offset\">-150`.0</Item>\n\
+             <Item name=\"SCALE\" sample=\"0\" role=\"scale\">1</Item>\n\
+             </GDALMetadata>"
+        ));
+        main_entries.push(TagEntry::ascii(TAG_GDAL_NODATA, "0"));
+    }
 
     let (main_ifd_off, _main_next_fix) = write_ifd(&mut w, &mut main_entries, next_ifd_offset)?;
 
