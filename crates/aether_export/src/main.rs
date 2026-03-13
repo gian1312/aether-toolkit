@@ -771,7 +771,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let height = meta.dimensions.height;
 
     //[8-BIT MODE] Detect output format from sidecar
-    let is_8bit = meta.output_format == "8BIT_PROP";
+    let is_8bit = meta.output_format != "1BIT_LOS";
 
     //[TILED-OUTPUT] Detect input format from sidecar
     let is_tiled = meta.tile_format.as_deref() == Some("TILED");
