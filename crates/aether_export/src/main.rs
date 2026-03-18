@@ -82,7 +82,7 @@ struct Args {
 #[derive(Deserialize)]
 struct Metadata {
     dimensions: Dimensions,
-    geotransform: [f64; 6],
+    geotransform:[f64; 6],
     projection: String,
     #[serde(default)]
     row_stride_bytes: Option<usize>,
@@ -698,7 +698,7 @@ struct ImageLevel {
 
 fn build_geo_tags(meta: &Metadata) -> Vec<TagEntry> {
     let gt = &meta.geotransform;
-    // gt = [originX, pixelWidth, rotX, originY, rotY, pixelHeight]
+    // gt =[originX, pixelWidth, rotX, originY, rotY, pixelHeight]
     // pixelHeight is negative for north-up
     let pixel_scale_x = gt[1].abs();
     let pixel_scale_y = gt[5].abs();
@@ -710,7 +710,7 @@ fn build_geo_tags(meta: &Metadata) -> Vec<TagEntry> {
         pixel_scale_x, pixel_scale_y, 0.0,
     ]));
 
-    // ModelTiepointTag: [I, J, K, X, Y, Z] — maps pixel (0,0) to geo origin
+    // ModelTiepointTag:[I, J, K, X, Y, Z] — maps pixel (0,0) to geo origin
     tags.push(TagEntry::double_array(TAG_MODEL_TIEPOINT, &[
         0.0, 0.0, 0.0, gt[0], gt[3], 0.0,
     ]));
@@ -762,6 +762,9 @@ fn parse_epsg(proj: &str) -> Option<u32> {
 fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut prof = Profiler::new();
     let t_total = Instant::now();
+
+    println!("[P:0]");
+    println!("[S:Starting GeoTIFF Export...]");
 
     // ── 1. Load metadata ─────────────────────────────────────────────────
     let meta: Metadata =
@@ -1143,7 +1146,8 @@ fn write_tiles_from_tiled(
 
         if tiles_y > 20 && (ty + 1) % (tiles_y / 10).max(1) == 0 {
             let pct = (ty + 1) as f64 / tiles_y as f64 * 100.0;
-            eprintln!("[Export] Main {:.0}%", pct);
+            println!("[P:{}]", pct as u32);
+            println!("[S:Exporting Main Tiles {:.0}%]", pct);
         }
     }
 
@@ -1207,8 +1211,7 @@ fn write_overview_tiles_from_tiled(
 
         if tiles_y > 20 && (ty + 1) % (tiles_y / 10).max(1) == 0 {
             let pct = (ty + 1) as f64 / tiles_y as f64 * 100.0;
-            let label = format!("OVR {}×", factor);
-            eprintln!("[Export] {} {:.0}%", label, pct);
+            println!("[S:Exporting Overviews {}x ({:.0}%)]", factor, pct);
         }
     }
 
@@ -1296,8 +1299,11 @@ fn write_tiles(
         // Progress reporting for large images
         if tiles_y > 20 && (ty + 1) % (tiles_y / 10).max(1) == 0 {
             let pct = (ty + 1) as f64 / tiles_y as f64 * 100.0;
-            let label = overview_factor.map_or("Main".to_string(), |f| format!("OVR {}×", f));
-            eprintln!("[Export] {} {:.0}%", label, pct);
+            let label = overview_factor.map_or("Main Tiles".to_string(), |f| format!("Overviews {}×", f));
+            println!("[S:Exporting {} {:.0}%]", label, pct);
+            if overview_factor.is_none() {
+                println!("[P:{}]", pct as u32);
+            }
         }
     }
 
@@ -1322,7 +1328,7 @@ fn write_tiles(
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
-        eprintln!("[Export] FATAL: {}", e);
+        println!("[E:{}]", e);
         std::process::exit(1);
     }
 }
