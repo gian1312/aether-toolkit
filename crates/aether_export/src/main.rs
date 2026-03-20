@@ -974,10 +974,13 @@ fn write_ifds_and_fixup(
     if is_8bit {
         main_entries.push(TagEntry::ascii(TAG_GDAL_METADATA,
                                           "<GDALMetadata>\n\
-             <Item name=\"OFFSET\" sample=\"0\" role=\"offset\">-150`.0</Item>\n\
-             <Item name=\"SCALE\" sample=\"0\" role=\"scale\">1</Item>\n\
+             <Item name=\"OFFSET\" sample=\"0\" role=\"offset\">-150.0</Item>\n\
+             <Item name=\"SCALE\" sample=\"0\" role=\"scale\">1.0</Item>\n\
              </GDALMetadata>"
         ));
+        main_entries.push(TagEntry::ascii(TAG_GDAL_NODATA, "0"));
+    } else {
+        // Explicitly set Nodata for 1-bit LOS mode as well
         main_entries.push(TagEntry::ascii(TAG_GDAL_NODATA, "0"));
     }
 
