@@ -1,3 +1,4 @@
+// rust/aether_converter/src/main.rs
 mod geo;
 mod ingest;
 
@@ -5,6 +6,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::fs;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "aether_converter")]
@@ -28,7 +32,7 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-    // FIX: Strictly ignore environment variables for noisy modules.
+    // Strictly ignore environment variables for noisy modules.
     let mut builder = env_logger::Builder::new();
 
     builder.filter(None, log::LevelFilter::Info); // Default to Info
@@ -47,29 +51,39 @@ fn main() -> anyhow::Result<()> {
         },
         Commands::Ingest { job_file } => {
             let content = fs::read_to_string(&job_file)?;
-            let mut texture_cache = HashMap::new();
+
+            // Wrap cache in Arc<Mutex> for safe multi-threading
+            let texture_cache = Arc::new(Mutex::new(HashMap::new()));
 
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
                 println!("[Rust] Processing single tile: {:?}", job.output_path);
-                ingest::process_tile_with_cache(job, &mut texture_cache)?;
+                ingest::process_tile_with_cache(job, texture_cache)?;
             } else if let Ok(jobs) = serde_json::from_str::<Vec<ingest::IngestJob>>(&content) {
-                println!("[Rust] Batch processing {} tiles...", jobs.len());
+                println!("[Rust] Batch processing {} tiles in parallel...", jobs.len());
                 let total = jobs.len();
-                for (i, job) in jobs.into_iter().enumerate() {
-                    // Log progress every 10 tiles
-                    if i % 10 == 0 || i == total - 1 {
-                        println!("[Rust] Progress: {}/{}", i + 1, total);
+                let progress = AtomicUsize::new(0);
+
+                // Run all jobs in parallel using Rayon
+                jobs.into_par_iter().for_each(|job| {
+                    if let Err(e) = ingest::process_tile_with_cache(job, texture_cache.clone()) {
+                        println!("[Error] Failed to process tile: {}", e);
                     }
-                    ingest::process_tile_with_cache(job, &mut texture_cache)?;
+
+                    let curr = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if curr % 10 == 0 || curr == total {
+                        println!("[Rust] Progress: {}/{}", curr, total);
+                    }
 
                     // --- OOM FIX / CACHE THRASHING FIX ---
-                    // Prevent memory fragmentation and thread-starvation.
-                    // If we hold more than 30 TIFFs, we drop the small Swiss tiles
-                    // BUT permanently retain the massive 'Chunk_*.tif' Base DEMs!
-                    if texture_cache.len() > 30 {
-                        texture_cache.retain(|k, _| k.file_name().unwrap_or_default().to_string_lossy().starts_with("Chunk_"));
+                    // Periodically let one thread clean the cache if it gets too large
+                    if curr % 5 == 0 {
+                        if let Ok(mut cache) = texture_cache.try_lock() {
+                            if cache.len() > 30 {
+                                cache.retain(|k, _| k.file_name().unwrap_or_default().to_string_lossy().starts_with("Chunk_"));
+                            }
+                        }
                     }
-                }
+                });
             }
             Ok(())
         }

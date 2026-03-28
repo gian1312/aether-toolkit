@@ -1,6 +1,6 @@
 [package]
 name = "aether_converter"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [dependencies]
@@ -12,6 +12,8 @@ serde_json = "1.0"
 # Image IO
 byteorder = "1.5"
 tiff = "0.9"
+image_dds = "0.3"
+bytemuck = "1.14"
 # Parallel Processing
 rayon = "1.8"
 # Error Handling

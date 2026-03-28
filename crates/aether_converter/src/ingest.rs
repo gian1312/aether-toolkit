@@ -1,3 +1,4 @@
+// rust/aether_converter/src/ingest.rs
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write, BufReader};
@@ -11,10 +12,12 @@ use tiff::tags::Tag;
 use anyhow::{Context, Result};
 use flatgeobuf::{FgbReader, GeometryType};
 use fallible_streaming_iterator::FallibleStreamingIterator;
+use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct IngestJob {
     pub output_path: PathBuf,
+    pub format: Option<String>, // "bc6h" or "r16sint"
     pub ul_lat: f64,
     pub ul_lon: f64,
     pub resolution_m: f64,
@@ -102,21 +105,27 @@ fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
 
 pub fn process_tile_with_cache(
     job: IngestJob,
-    cache: &mut HashMap<PathBuf, Arc<LoadedImage>>
+    cache_arc: Arc<Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>
 ) -> Result<()> {
 
-    let mut missing: Vec<PathBuf> = job.swiss_tifs.iter()
-        .filter(|p| !cache.contains_key(*p)).cloned().collect();
-
-    if let Some(base_path) = &job.base_tif {
-        if !cache.contains_key(base_path) {
-            missing.push(base_path.clone());
+    // 1. Identify missing files inside a lock
+    let mut missing = Vec::new();
+    {
+        let cache = cache_arc.lock().unwrap();
+        for p in &job.swiss_tifs {
+            if !cache.contains_key(p) { missing.push(p.clone()); }
+        }
+        if let Some(base_path) = &job.base_tif {
+            if !cache.contains_key(base_path) { missing.push(base_path.clone()); }
         }
     }
 
+    // 2. Load missing files into RAM
     if !missing.is_empty() {
-        let loaded: Vec<_> = missing.par_iter()
-            .map(|p| (p.clone(), load_tiff_to_ram(p))).collect();
+        let loaded: Vec<_> = missing.into_par_iter()
+            .map(|p| (p.clone(), load_tiff_to_ram(&p))).collect();
+
+        let mut cache = cache_arc.lock().unwrap();
         for (p, res) in loaded {
             match res {
                 Ok(img) => { cache.insert(p, img); },
@@ -125,12 +134,18 @@ pub fn process_tile_with_cache(
         }
     }
 
+    // 3. Extract required images from cache
     let mut swiss_images = Vec::new();
-    for p in &job.swiss_tifs {
-        if let Some(img) = cache.get(p) { swiss_images.push(img.clone()); }
+    let mut base_image = None;
+    {
+        let cache = cache_arc.lock().unwrap();
+        for p in &job.swiss_tifs {
+            if let Some(img) = cache.get(p) { swiss_images.push(img.clone()); }
+        }
+        if let Some(p) = &job.base_tif {
+            base_image = cache.get(p).cloned();
+        }
     }
-
-    let base_image = job.base_tif.as_ref().and_then(|p| cache.get(p).cloned());
     let base_image_ref = base_image.as_deref();
 
     let deg_per_meter = 1.0 / 111111.0;
@@ -143,7 +158,6 @@ pub fn process_tile_with_cache(
     buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
 
-        // Base Map Y-axis Fast Intersect
         let mut base_row_valid = false;
         let mut base_py = 0;
         if let Some(base) = base_image_ref {
@@ -226,31 +240,95 @@ pub fn process_tile_with_cache(
         }
     }
 
+    let format_str = job.format.as_deref().unwrap_or("r16sint");
+    let is_bc6h = format_str.eq_ignore_ascii_case("bc6h");
+
+    // Dynamic BaseElev calculation for BC6H
+    let mut base_elev = 0i16;
+    if is_bc6h {
+        let mut min_elev = i16::MAX;
+        for &v in buffer.iter() {
+            if v > -5000 && v < min_elev {
+                min_elev = v;
+            }
+        }
+        if min_elev == i16::MAX { min_elev = 0; }
+        base_elev = min_elev;
+    }
+
     let f = File::create(&job.output_path)?;
     let mut w = BufWriter::with_capacity(1024 * 1024, f);
 
-    let bytes_per_row = job.size_px as u32 * 2;
-    let aligned_stride = (bytes_per_row + 255) & !255;
-    let padding_bytes = aligned_stride - bytes_per_row;
-
     w.write_all(b"AETH")?;
-    w.write_u16::<LittleEndian>(1)?;
+
+    // Version 2 for BC6H, Version 1 for legacy R16SINT
+    let version = if is_bc6h { 2u16 } else { 1u16 };
+    w.write_u16::<LittleEndian>(version)?;
     w.write_u16::<LittleEndian>(job.size_px as u16)?;
     w.write_f64::<LittleEndian>(job.ul_lat)?;
     w.write_f64::<LittleEndian>(job.ul_lon)?;
     w.write_f64::<LittleEndian>(pixel_deg)?;
     w.write_f64::<LittleEndian>(pixel_deg)?;
-    w.write_i16::<LittleEndian>(0)?;
-    w.write_u16::<LittleEndian>(aligned_stride as u16)?;
+    w.write_i16::<LittleEndian>(base_elev)?;
 
-    let padding_buf = vec![0u8; padding_bytes as usize];
-    for chunk in buffer.chunks(job.size_px as usize) {
-        let ptr = chunk.as_ptr() as *const u8;
-        let len = chunk.len() * 2;
-        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        w.write_all(slice)?;
-        if padding_bytes > 0 {
-            w.write_all(&padding_buf)?;
+    let bytes_per_row_r16 = job.size_px as u32 * 2;
+    let aligned_stride_r16 = (bytes_per_row_r16 + 255) & !255;
+
+    // Calculate final physical row stride (to skip padding during decode)
+    let final_stride = if is_bc6h {
+        // BC6H block is 16 bytes. Row stride is the width of blocks * 16.
+        ((job.size_px + 3) / 4 * 16) as u16
+    } else {
+        aligned_stride_r16 as u16
+    };
+    w.write_u16::<LittleEndian>(final_stride)?;
+
+    if is_bc6h {
+        // 1. Map terrain to 0-aligned RGBA float buffer
+        let mut rgba = vec![0.0f32; total_pixels * 4];
+        for (i, &v) in buffer.iter().enumerate() {
+            let real_val = if v > -5000 {
+                (v - base_elev) as f32 * 0.5
+            } else {
+                -10.0 // Small negative number to flag as void without destroying block palette
+            };
+            // R, G, B must be identical so BC6H compressor finds a clean greyscale vector
+            rgba[i * 4] = real_val;
+            rgba[i * 4 + 1] = real_val;
+            rgba[i * 4 + 2] = real_val;
+            rgba[i * 4 + 3] = 1.0;
+        }
+
+        // 2. Perform AOT Texture Compression using image_dds
+        let surface = SurfaceRgba32Float {
+            width: job.size_px,
+            height: job.size_px,
+            depth: 1,
+            layers: 1,
+            mipmaps: 1,
+            data: rgba,
+        };
+
+        // Quality::Fast is highly optimized and provides near identical results for heightmaps
+        let dds_surface = surface.encode(
+            ImageFormat::BC6Ufloat,
+            Quality::Fast,
+            Mipmaps::Disabled
+        ).map_err(|e| anyhow::anyhow!("BC6H Encoding failed: {:?}", e))?;
+
+        w.write_all(&dds_surface.data)?;
+    } else {
+        // Legacy R16SINT writing with 256-byte pitch padding
+        let padding_bytes = aligned_stride_r16 - bytes_per_row_r16;
+        let padding_buf = vec![0u8; padding_bytes as usize];
+        for chunk in buffer.chunks(job.size_px as usize) {
+            let ptr = chunk.as_ptr() as *const u8;
+            let len = chunk.len() * 2;
+            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+            w.write_all(slice)?;
+            if padding_bytes > 0 {
+                w.write_all(&padding_buf)?;
+            }
         }
     }
 
@@ -271,11 +349,8 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         files_to_process.push(fgb_target.to_path_buf());
     }
 
-    // --- MINIMAL FIX: Search Bounding Box is now strictly WGS84 ---
     let lr_lat = job.ul_lat - (job.size_px as f64 * px_deg);
     let lr_lon = job.ul_lon + (job.size_px as f64 * px_deg);
-
-    // Approx 20 meter padding in degrees
     let pad_deg = 20.0 / 111111.0;
 
     let min_lon = job.ul_lon.min(lr_lon) - pad_deg;
@@ -291,7 +366,6 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         let fgb = FgbReader::open(BufReader::new(file))?;
 
         if let Some(env) = fgb.header().envelope() {
-            // env is[min_x, min_y, max_x, max_y]
             if env.get(0) > max_lon || env.get(2) < min_lon || env.get(1) > max_lat || env.get(3) < min_lat {
                 continue;
             }
@@ -312,14 +386,11 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         }
     }
 
-    if total_features > 0 {
-        println!("[Build] Scanned {} features. Modified {} pixels.", total_features, total_pixels_mod);
-    }
     Ok(())
 }
 
 fn process_geometry_wgs84(
-    geo: &flatgeobuf::Geometry, buffer: &mut [i16], size: u32,
+    geo: &flatgeobuf::Geometry, buffer: &mut[i16], size: u32,
     ul_lon: f64, ul_lat: f64, px_deg: f64
 ) -> usize {
     if let Some(parts) = geo.parts() {
@@ -356,7 +427,6 @@ fn process_geometry_wgs84(
 
         let mut i = start_idx;
         while i < stop_idx {
-            // --- MINIMAL FIX: Directly map Longitude and Latitude ---
             let lon = xy.get(i);
             let lat = xy.get(i + 1);
 
