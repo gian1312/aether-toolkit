@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use serde::Deserialize;
 use rayon::prelude::*;
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -64,7 +64,8 @@ fn parse_swiss_filename(p: &Path) -> Option<(f64, f64)> {
     None
 }
 
-fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
+// FIX: Made public so main.rs can access it for sequential pre-loading
+pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
     let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
     let reader = BufReader::with_capacity(1024 * 1024, file);
     let mut decoder = Decoder::new(reader)?;
@@ -105,7 +106,7 @@ fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
 
 pub fn process_tile_with_cache(
     job: IngestJob,
-    cache_arc: Arc<Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>
+    cache_arc: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>
 ) -> Result<()> {
 
     // 1. Identify missing files inside a lock
@@ -120,9 +121,9 @@ pub fn process_tile_with_cache(
         }
     }
 
-    // 2. Load missing files into RAM
+    // 2. Load missing files sequentially to prevent RAM spikes (OOM fix)
     if !missing.is_empty() {
-        let loaded: Vec<_> = missing.into_par_iter()
+        let loaded: Vec<_> = missing.into_iter()
             .map(|p| (p.clone(), load_tiff_to_ram(&p))).collect();
 
         let mut cache = cache_arc.lock().unwrap();
@@ -284,32 +285,50 @@ pub fn process_tile_with_cache(
     w.write_u16::<LittleEndian>(final_stride)?;
 
     if is_bc6h {
-        // 1. Map terrain to 0-aligned RGBA float buffer
+         // 1. Map terrain to 0-aligned RGBA float buffer
         let mut rgba = vec![0.0f32; total_pixels * 4];
         for (i, &v) in buffer.iter().enumerate() {
             let real_val = if v > -5000 {
-                (v - base_elev) as f32 * 0.5
+                (v - base_elev) as f32 * 0.5 + 1.0
             } else {
-                -10.0 // Small negative number to flag as void without destroying block palette
+                0.0
             };
-            // R, G, B must be identical so BC6H compressor finds a clean greyscale vector
             rgba[i * 4] = real_val;
             rgba[i * 4 + 1] = real_val;
             rgba[i * 4 + 2] = real_val;
             rgba[i * 4 + 3] = 1.0;
         }
 
-        // 2. Perform AOT Texture Compression using image_dds
+        // ═════════════════════════════════════════════════════════════════════
+        // [BC6H-DEBUG] Sample values before encoding
+        // ═════════════════════════════════════════════════════════════════════
+        let sample_positions: Vec<(usize, usize)> = vec![
+            (0, 0), (1, 0), (2, 0), (3, 0),
+            (0, 1), (1, 1), (2, 1), (3, 1),
+            (out_size/2, out_size/2),
+            (out_size/2+1, out_size/2),
+            (out_size-1, out_size-1),
+        ];
+        eprintln!("[BC6H-DEBUG] PRE-ENCODE sample values:");
+        for &(x, y) in &sample_positions {
+            if x < out_size && y < out_size {
+                let idx = y * out_size + x;
+                eprintln!("[BC6H-DEBUG]   px({:4},{:4}) raw_i16={:6} → R={:12.4}",
+                          x, y, buffer[idx], rgba[idx * 4]);
+            }
+        }
+
+        // 2. Encode
         let surface = SurfaceRgba32Float {
             width: job.size_px,
             height: job.size_px,
             depth: 1,
             layers: 1,
             mipmaps: 1,
-            data: rgba,
+            data: rgba.clone(),
         };
 
-        // Quality::Fast is highly optimized and provides near identical results for heightmaps
+        eprintln!("[BC6H-DEBUG] Calling image_dds encode(BC6Sfloat, Fast) ...");
         let dds_surface = surface.encode(
             ImageFormat::BC6Ufloat,
             Quality::Fast,

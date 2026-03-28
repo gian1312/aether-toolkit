@@ -1,6 +1,6 @@
 [package]
 name = "aether_converter"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 
 [dependencies]
@@ -24,3 +24,5 @@ fallible-streaming-iterator = "0.1"
 # Logging
 log = "0.4"
 env_logger = "0.11"
+# System
+sysinfo = "0.30"
