@@ -3,12 +3,11 @@
 // =============================================================================
 //
 // Main tiles: parallel geo-coordinate mapping from input files.
-// Overviews: each level built by 4× downsampling the PREVIOUS level
-//            (not from inputs). Bounded memory: ~16 source tiles per overview
-//            tile, decompressed on demand with local cache.
+// Max is written natively as 8-bit Integer (scaled inside standard GIS RAM).
+// Count is written natively as 16-bit Integer (65k overhead ceiling).
 
 use crate::reader::InputRaster;
-use crate::writer::{self, BigTiffWriter, TileStore};
+use crate::writer::{self, BigTiffWriter, TileStoreU8, TileStoreU16};
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -30,8 +29,8 @@ pub fn run(
     tile_size: usize,
     compress_level: u32,
 ) -> Result<AggregateStats, Box<dyn std::error::Error>> {
-    let nodata: f32 = -9999.0;
-    let count_nodata: f32 = 0.0;
+    let nodata: u8 = 0;
+    let count_nodata: u16 = 0;
     let ts = tile_size;
 
     // --- 1. Compute master grid ---
@@ -68,10 +67,11 @@ pub fn run(
     );
 
     // --- 4. Open outputs + tile stores ---
-    let mut max_out = BigTiffWriter::create(max_path, master_w, master_h, ts, &master_gt, nodata, compress_level)?;
-    let mut count_out = BigTiffWriter::create(count_path, master_w, master_h, ts, &master_gt, count_nodata, compress_level)?;
-    let mut max_store = TileStore::new(master_w, master_h, ts, nodata, compress_level);
-    let mut count_store = TileStore::new(master_w, master_h, ts, count_nodata, compress_level);
+    // Inject BitsPerSample (8 for signal, 16 for counter limitation mitigation)
+    let mut max_out = BigTiffWriter::create(max_path, master_w, master_h, ts, &master_gt, nodata as u16, compress_level, 8)?;
+    let mut count_out = BigTiffWriter::create(count_path, master_w, master_h, ts, &master_gt, count_nodata, compress_level, 16)?;
+    let mut max_store = TileStoreU8::new(master_w, master_h, ts, nodata, compress_level);
+    let mut count_store = TileStoreU16::new(master_w, master_h, ts, count_nodata, compress_level);
 
     // --- 5. Process main tiles (parallel per row) ---
     let t_main = Instant::now();
@@ -140,8 +140,8 @@ pub fn run(
         let ovr_max = cur_max.build_overview_4x();
         let ovr_count = cur_count.build_overview_4x();
 
-        max_out.write_overview_from_store(&ovr_max)?;
-        count_out.write_overview_from_store(&ovr_count)?;
+        max_out.write_overview_from_store_u8(&ovr_max)?;
+        count_out.write_overview_from_store_u16(&ovr_count)?;
 
         println!("[S:Overview {}× done]", factor);
 
@@ -154,10 +154,15 @@ pub fn run(
     println!("[P:98]");
     println!("[S:Writing file headers]");
 
+    // Recover GDAL scaling metadata so standard GIS dynamically promotes our 8-bit into negative decibels
+    let gdal_scale = inputs.first().map_or(1.0, |i| i.scale);
+    let gdal_offset = inputs.first().map_or(0.0, |i| i.offset);
+
     let max_stats = if global.has_valid_data { Some((global.max_min, global.max_max)) } else { None };
     let count_stats = if global.has_valid_data { Some((1.0, global.count_max)) } else { None };
-    max_out.finalize(max_stats)?;
-    count_out.finalize(count_stats)?;
+
+    max_out.finalize(max_stats, gdal_scale, gdal_offset)?;
+    count_out.finalize(count_stats, 1.0, 0.0)?; // Counter is strictly nominal u16 
 
     Ok(global)
 }
@@ -211,7 +216,7 @@ fn process_tile(
     tx: usize, ty: usize, ts: usize,
     img_w: usize, img_h: usize, out_gt: &[f64; 6],
     inputs: &[InputRaster], file_geo: &[GeoBounds],
-    file_indices: &[usize], nodata: f32, compress_level: u32,
+    file_indices: &[usize], nodata: u8, compress_level: u32,
 ) -> TileResult {
     let bw = ts.min(img_w - tx * ts);
     let bh = ts.min(img_h - ty * ts);
@@ -220,7 +225,7 @@ fn process_tile(
     let tile_geo_y = out_gt[3] + (ty * ts) as f64 * out_gt[5];
 
     let mut max_tile = vec![nodata; ts * ts];
-    let mut count_tile = vec![0.0f32; ts * ts];
+    let mut count_tile = vec![0u16; ts * ts];
     let mut has_data = false;
 
     for &fi in file_indices {
@@ -231,7 +236,6 @@ fn process_tile(
         let t_right  = tile_geo_x + bw as f64 * out_gt[1];
         let t_bottom = tile_geo_y + bh as f64 * out_gt[5];
 
-        // Geographic overlap
         let ovl_left   = tile_geo_x.max(fb.left);
         let ovl_right  = t_right.min(fb.right);
         let ovl_top    = tile_geo_y.min(fb.top);
@@ -239,7 +243,6 @@ fn process_tile(
 
         if ovl_left >= ovl_right || ovl_top <= ovl_bottom { continue; }
 
-        // Source region in INPUT file's pixel coords
         let src_x0 = ((ovl_left - igt[0]) / igt[1]).floor().max(0.0) as usize;
         let src_y0 = ((ovl_top - igt[3]) / igt[5]).floor().max(0.0) as usize;
         let src_x1 = (((ovl_right - igt[0]) / igt[1]).ceil() as usize).min(inp.width);
@@ -249,15 +252,13 @@ fn process_tile(
 
         if src_w == 0 || src_h == 0 { continue; }
 
-        let region = inp.read_region_f32(src_x0, src_y0, src_w, src_h);
+        let region = inp.read_region_u8(src_x0, src_y0, src_w, src_h);
 
-        // Output pixel range within tile
         let dst_x0 = ((ovl_left - tile_geo_x) / out_gt[1]).round().max(0.0) as usize;
         let dst_y0 = ((ovl_top - tile_geo_y) / out_gt[5]).round().max(0.0) as usize;
         let dst_x1 = (((ovl_right - tile_geo_x) / out_gt[1]).round().max(0.0) as usize).min(bw);
         let dst_y1 = (((ovl_bottom - tile_geo_y) / out_gt[5]).round().max(0.0) as usize).min(bh);
 
-        // Affine: output pixel → input file pixel (nearest neighbor)
         let base_fx = (tile_geo_x - igt[0]) / igt[1];
         let base_fy = (tile_geo_y - igt[3]) / igt[5];
         let step_x = out_gt[1] / igt[1];
@@ -287,14 +288,14 @@ fn process_tile(
                     if lx >= src_w { continue; }
 
                     let val = region[row_in_idx + lx];
-                    if val == inp.nodata || val.is_nan() { continue; }
+                    if val == 0 { continue; }
 
                     let idx = row_out_idx + dx;
                     has_data = true;
-                    if max_tile[idx] == nodata || val > max_tile[idx] {
+                    if val > max_tile[idx] {
                         max_tile[idx] = val;
                     }
-                    count_tile[idx] += 1.0;
+                    count_tile[idx] = count_tile[idx].saturating_add(1);
                 }
             }
         } else {
@@ -312,14 +313,14 @@ fn process_tile(
                     if lx >= src_w { continue; }
 
                     let val = region[ly * src_w + lx];
-                    if val == inp.nodata || val.is_nan() { continue; }
+                    if val == 0 { continue; }
 
                     let idx = dy * ts + dx;
                     has_data = true;
-                    if max_tile[idx] == nodata || val > max_tile[idx] {
+                    if val > max_tile[idx] {
                         max_tile[idx] = val;
                     }
-                    count_tile[idx] += 1.0;
+                    count_tile[idx] = count_tile[idx].saturating_add(1);
                 }
             }
         }
@@ -329,23 +330,32 @@ fn process_tile(
         return TileResult { tx, max_data: None, count_data: None, stats: None };
     }
 
-    let mut t_min = f64::INFINITY;
-    let mut t_max = f64::NEG_INFINITY;
-    let mut t_cmax = 0.0f64;
+    // Process exact integer max values natively 
+    let mut t_min = 255u8;
+    let mut t_max = 0u8;
+    let mut t_cmax = 0u16;
     for i in 0..ts * ts {
-        if max_tile[i] != nodata {
-            let v = max_tile[i] as f64;
+        let v = max_tile[i];
+        if v != 0 {
             if v < t_min { t_min = v; }
             if v > t_max { t_max = v; }
         }
-        if count_tile[i] as f64 > t_cmax { t_cmax = count_tile[i] as f64; }
+        let cv = count_tile[i];
+        if cv > t_cmax { t_cmax = cv; }
     }
+
+    // Now simply restore floating point representation for the terminal summary block statistics using input scale 
+    let input_scale = inputs.first().map_or(1.0, |i| i.scale);
+    let input_offset = inputs.first().map_or(0.0, |i| i.offset);
+
+    let t_min_f = if t_min <= t_max { t_min as f64 * input_scale + input_offset } else { f64::INFINITY };
+    let t_max_f = if t_min <= t_max { t_max as f64 * input_scale + input_offset } else { f64::NEG_INFINITY };
 
     TileResult {
         tx,
-        max_data: Some(writer::compress_f32_tile(&max_tile, ts, ts, compress_level)),
-        count_data: Some(writer::compress_f32_tile(&count_tile, ts, ts, compress_level)),
-        stats: Some((t_min, t_max, t_cmax)),
+        max_data: Some(writer::compress_u8_tile(&max_tile, ts, ts, compress_level)),
+        count_data: Some(writer::compress_u16_tile(&count_tile, ts, ts, compress_level)),
+        stats: Some((t_min_f, t_max_f, t_cmax as f64)),
     }
 }
 
