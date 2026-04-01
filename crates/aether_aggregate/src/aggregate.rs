@@ -10,6 +10,8 @@ use crate::reader::InputRaster;
 use crate::writer::{self, BigTiffWriter, TileStoreU8, TileStoreU16};
 use rayon::prelude::*;
 use std::time::Instant;
+use std::sync::mpsc;
+use std::thread;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public Interface
@@ -24,14 +26,17 @@ pub struct AggregateStats {
 
 pub fn run(
     inputs: &[InputRaster],
+    wp_ids: &[u32],
     max_path: &str,
     count_path: &str,
+    index_db_path: Option<&str>,
     tile_size: usize,
     compress_level: u32,
 ) -> Result<AggregateStats, Box<dyn std::error::Error>> {
     let nodata: u8 = 0;
     let count_nodata: u16 = 0;
     let ts = tile_size;
+    let build_index = index_db_path.is_some();
 
     // --- 1. Compute master grid ---
     let (master_gt, master_w, master_h) = compute_master_grid(inputs)?;
@@ -73,6 +78,35 @@ pub fn run(
     let mut max_store = TileStoreU8::new(master_w, master_h, ts, nodata, compress_level);
     let mut count_store = TileStoreU16::new(master_w, master_h, ts, count_nodata, compress_level);
 
+    // --- SQLite Background Writer ---
+    let (tx_sql, rx_sql) = mpsc::channel::<Vec<(u64, u32)>>();
+    let sql_thread = if let Some(db_path) = index_db_path {
+        let db_path = db_path.to_string();
+        Some(thread::spawn(move || {
+            let mut conn = rusqlite::Connection::open(db_path).unwrap();
+            conn.execute_batch("
+                PRAGMA synchronous = OFF;
+                PRAGMA journal_mode = MEMORY;
+                CREATE TABLE IF NOT EXISTS visibility (pixel_id INTEGER, wp_id INTEGER);
+                DELETE FROM visibility;
+            ").unwrap();
+
+            let mut tx_db = conn.transaction().unwrap();
+            {
+                let mut stmt = tx_db.prepare("INSERT INTO visibility VALUES (?, ?)").unwrap();
+                for records in rx_sql {
+                    for (pid, wid) in records {
+                        stmt.execute((pid, wid)).unwrap();
+                    }
+                }
+            }
+            tx_db.commit().unwrap();
+            conn.execute("CREATE INDEX idx_pixel ON visibility(pixel_id)", ()).unwrap();
+        }))
+    } else {
+        None
+    };
+
     // --- 5. Process main tiles (parallel per row) ---
     let t_main = Instant::now();
     let mut global = AggregateStats {
@@ -92,6 +126,7 @@ pub fn run(
                 process_tile(
                     *tx, ty, ts, master_w, master_h, &master_gt,
                     inputs, &file_geo, file_indices, nodata, compress_level,
+                    wp_ids, build_index
                 )
             })
             .collect();
@@ -103,6 +138,11 @@ pub fn run(
             // Store compressed data for overview generation
             if let Some(ref d) = r.max_data { max_store.store(r.tx, ty, d.clone()); }
             if let Some(ref d) = r.count_data { count_store.store(r.tx, ty, d.clone()); }
+
+            // Dispatch visibility records to SQLite thread
+            if let Some(vis) = r.visibility {
+                let _ = tx_sql.send(vis);
+            }
 
             if let Some(s) = r.stats {
                 global.has_valid_data = true;
@@ -119,11 +159,18 @@ pub fn run(
             println!("[S:Main tiles {:.0}%]", pct);
         }
     }
+
+    // Close channel to allow SQLite thread to wrap up
+    drop(tx_sql);
+    if let Some(t) = sql_thread {
+        println!("[S:Finalizing spatial index...]");
+        t.join().unwrap();
+    }
+
     eprintln!("[Aggregate] Main tiles done in {:.2}s", t_main.elapsed().as_secs_f64());
 
     // --- 6. Build overview pyramid (each level from the previous, 4× downsample) ---
     let t_ovr = Instant::now();
-    let dim = master_w.max(master_h);
     let mut cur_max = max_store;
     let mut cur_count = count_store;
     let mut level = 0u32;
@@ -162,7 +209,7 @@ pub fn run(
     let count_stats = if global.has_valid_data { Some((1.0, global.count_max)) } else { None };
 
     max_out.finalize(max_stats, gdal_scale, gdal_offset)?;
-    count_out.finalize(count_stats, 1.0, 0.0)?; // Counter is strictly nominal u16 
+    count_out.finalize(count_stats, 1.0, 0.0)?; // Counter is strictly nominal u16
 
     Ok(global)
 }
@@ -182,6 +229,7 @@ struct TileResult {
     tx: usize,
     max_data: Option<Vec<u8>>,
     count_data: Option<Vec<u8>>,
+    visibility: Option<Vec<(u64, u32)>>,
     stats: Option<(f64, f64, f64)>,
 }
 
@@ -217,6 +265,7 @@ fn process_tile(
     img_w: usize, img_h: usize, out_gt: &[f64; 6],
     inputs: &[InputRaster], file_geo: &[GeoBounds],
     file_indices: &[usize], nodata: u8, compress_level: u32,
+    wp_ids: &[u32], build_index: bool
 ) -> TileResult {
     let bw = ts.min(img_w - tx * ts);
     let bh = ts.min(img_h - ty * ts);
@@ -227,11 +276,13 @@ fn process_tile(
     let mut max_tile = vec![nodata; ts * ts];
     let mut count_tile = vec![0u16; ts * ts];
     let mut has_data = false;
+    let mut vis_records = if build_index { Some(Vec::new()) } else { None };
 
     for &fi in file_indices {
         let fb = &file_geo[fi];
         let inp = &inputs[fi];
         let igt = &inp.geotransform;
+        let wpid = wp_ids[fi];
 
         let t_right  = tile_geo_x + bw as f64 * out_gt[1];
         let t_bottom = tile_geo_y + bh as f64 * out_gt[5];
@@ -296,6 +347,13 @@ fn process_tile(
                         max_tile[idx] = val;
                     }
                     count_tile[idx] = count_tile[idx].saturating_add(1);
+
+                    if let Some(ref mut vr) = vis_records {
+                        let abs_x = tx * ts + dx;
+                        let abs_y = ty * ts + dy;
+                        // Build spatial index using master grid dimensions
+                        vr.push(((abs_y * img_w + abs_x) as u64, wpid));
+                    }
                 }
             }
         } else {
@@ -321,16 +379,22 @@ fn process_tile(
                         max_tile[idx] = val;
                     }
                     count_tile[idx] = count_tile[idx].saturating_add(1);
+
+                    if let Some(ref mut vr) = vis_records {
+                        let abs_x = tx * ts + dx;
+                        let abs_y = ty * ts + dy;
+                        vr.push(((abs_y * img_w + abs_x) as u64, wpid));
+                    }
                 }
             }
         }
     }
 
     if !has_data {
-        return TileResult { tx, max_data: None, count_data: None, stats: None };
+        return TileResult { tx, max_data: None, count_data: None, visibility: None, stats: None };
     }
 
-    // Process exact integer max values natively 
+    // Process exact integer max values natively
     let mut t_min = 255u8;
     let mut t_max = 0u8;
     let mut t_cmax = 0u16;
@@ -344,7 +408,7 @@ fn process_tile(
         if cv > t_cmax { t_cmax = cv; }
     }
 
-    // Now simply restore floating point representation for the terminal summary block statistics using input scale 
+    // Now simply restore floating point representation for the terminal summary block statistics using input scale
     let input_scale = inputs.first().map_or(1.0, |i| i.scale);
     let input_offset = inputs.first().map_or(0.0, |i| i.offset);
 
@@ -355,6 +419,7 @@ fn process_tile(
         tx,
         max_data: Some(writer::compress_u8_tile(&max_tile, ts, ts, compress_level)),
         count_data: Some(writer::compress_u16_tile(&count_tile, ts, ts, compress_level)),
+        visibility: vis_records,
         stats: Some((t_min_f, t_max_f, t_cmax as f64)),
     }
 }

@@ -1,20 +1,3 @@
-// =============================================================================
-// AETHER Raster Aggregator
-// =============================================================================
-//
-// Aggregates multiple raster files (.tif or .dat) into max + count GeoTIFFs.
-// Pure Rust, no GDAL. Writes valid BigTIFF directly.
-//
-// Progress protocol (matched to aether_export):
-//   [P:NN]       — percentage (0–100)
-//   [S:message]  — status string
-//   [E:message]  — fatal error
-//
-// Output: two sparse BigTIFF files (<basename>_max.tif, <basename>_count.tif)
-// with DEFLATE compression, tiled, GeoTIFF tags, EPSG:4326.
-// Overviews are NOT built here — the Python caller adds them via GDAL
-// after this process exits (clean memory context).
-
 use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
@@ -47,6 +30,10 @@ struct Args {
     /// Tile size in pixels (default 2048, must be multiple of 16)
     #[arg(short = 't', long, default_value_t = 2048)]
     tile_size: usize,
+
+    /// Optional path to SQLite file to generate the visibility index
+    #[arg(long)]
+    index_db: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -80,6 +67,20 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     eprintln!("[Aggregate] {} input files", paths.len());
 
+    // --- Parse Waypoint IDs from paths ---
+    let mut wp_ids = Vec::with_capacity(paths.len());
+    for p in &paths {
+        let path_str = p.to_string_lossy().to_string();
+        let wp_id = if let Some(idx) = path_str.find("wp_") {
+            let rest = &path_str[idx + 3..];
+            let end = rest.find('/').or_else(|| rest.find('\\')).unwrap_or(rest.len());
+            rest[..end].parse::<u32>().unwrap_or(0)
+        } else {
+            0
+        };
+        wp_ids.push(wp_id);
+    }
+
     // --- Open all inputs ---
     let mut inputs: Vec<reader::InputRaster> = Vec::with_capacity(paths.len());
     for p in &paths {
@@ -99,8 +100,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let stats = aggregate::run(
         &inputs,
+        &wp_ids,
         &max_path,
         &count_path,
+        args.index_db.as_deref(),
         args.tile_size,
         args.level,
     )?;
