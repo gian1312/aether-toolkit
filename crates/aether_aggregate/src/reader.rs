@@ -1,12 +1,11 @@
 // =============================================================================
-// Input Raster Reader — .dat (SPLAT!) and .tif (TIFF / BigTIFF)
+// Input Raster Reader — .tif (TIFF / BigTIFF)
 // =============================================================================
 //
 // Reads raster metadata (dimensions, geotransform, nodata, scale/offset) and
 // provides region-based pixel access returning raw u8 values (avoiding float
 // promotion in RAM).
 //
-// .dat: SPLAT! proprietary format — fixed binary header + raw int16 pixels.
 // .tif: Supports tiled layout, DEFLATE compression, and GeoTIFF tags.
 
 use flate2::read::ZlibDecoder;
@@ -30,7 +29,6 @@ pub struct InputRaster {
 }
 
 enum Inner {
-    Dat(DatFile),
     Tif(TifFile),
 }
 
@@ -43,7 +41,6 @@ impl InputRaster {
             .to_lowercase();
 
         match ext.as_str() {
-            "dat" => open_dat(path),
             "tif" | "tiff" => open_tif(path),
             _ => Err(format!("Unsupported format: .{}", ext).into()),
         }
@@ -53,97 +50,8 @@ impl InputRaster {
     /// Invalid pixels or nodata = 0.
     pub fn read_region_u8(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
         match &self.inner {
-            Inner::Dat(d) => d.read_region_u8(x, y, w, h),
             Inner::Tif(t) => t.read_region_u8(x, y, w, h),
         }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SPLAT! .dat Reader
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const DAT_HEADER_SIZE: usize = 4 + 4 + 2 + 4 + 6 * 8; // 58 bytes
-
-struct DatFile {
-    mmap: Mmap,
-    width: usize,
-    height: usize,
-    raw_nodata: i16,
-    scale: f32,
-}
-
-fn open_dat(path: &Path) -> Result<InputRaster, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-
-    if mmap.len() < DAT_HEADER_SIZE {
-        return Err("File too small for .dat header".into());
-    }
-    let d = &mmap[..];
-    let width = i32::from_le_bytes(d[0..4].try_into()?) as usize;
-    let height = i32::from_le_bytes(d[4..8].try_into()?) as usize;
-    let raw_nodata = i16::from_le_bytes(d[8..10].try_into()?);
-    let scale = f32::from_le_bytes(d[10..14].try_into()?);
-
-    let mut gt =[0f64; 6];
-    for i in 0..6 {
-        let off = 14 + i * 8;
-        gt[i] = f64::from_le_bytes(d[off..off + 8].try_into()?);
-    }
-    if gt[0] > 180.0 {
-        gt[0] -= 360.0;
-    }
-
-    Ok(InputRaster {
-        width,
-        height,
-        geotransform: gt,
-        nodata: -9999.0,
-        scale: scale as f64,
-        offset: 0.0,
-        inner: Inner::Dat(DatFile {
-            mmap,
-            width,
-            height,
-            raw_nodata,
-            scale,
-        }),
-    })
-}
-
-impl DatFile {
-    fn read_region_u8(
-        &self,
-        x: usize,
-        y: usize,
-        w: usize,
-        h: usize,
-    ) -> Vec<u8> {
-        let mut buf = vec![0u8; w * h];
-        let data = &self.mmap[..];
-
-        for row in 0..h {
-            let sy = y + row;
-            if sy >= self.height {
-                break;
-            }
-            let actual_w = w.min(self.width.saturating_sub(x));
-            let src_row_off = DAT_HEADER_SIZE + (sy * self.width + x) * 2;
-            let dst_row_off = row * w;
-
-            for col in 0..actual_w {
-                let pix_off = src_row_off + col * 2;
-                if pix_off + 2 > data.len() {
-                    break;
-                }
-                let raw = i16::from_le_bytes([data[pix_off], data[pix_off + 1]]);
-                if raw != self.raw_nodata && raw > 0 {
-                    buf[dst_row_off + col] = raw.min(255) as u8;
-                }
-            }
-        }
-        buf
     }
 }
 

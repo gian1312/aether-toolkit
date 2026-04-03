@@ -15,7 +15,7 @@ mod writer;
 #[command(name = "aether_aggregate")]
 #[command(about = "Aggregate raster files into max/count COG outputs (pure Rust, no GDAL)")]
 struct Args {
-    /// Text file with one input path per line (.tif or .dat)
+    /// Text file with one input path per line (.tif)
     #[arg(short = 'f', long)]
     file_list: PathBuf,
 
