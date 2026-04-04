@@ -15,7 +15,7 @@ mod writer;
 #[command(name = "aether_aggregate")]
 #[command(about = "Aggregate raster files into max/count COG outputs (pure Rust, no GDAL)")]
 struct Args {
-    /// Text file with one input path per line (.tif)
+    /// Text file with one input path per line (.bit or .tif)
     #[arg(short = 'f', long)]
     file_list: PathBuf,
 
@@ -31,9 +31,9 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 2048)]
     tile_size: usize,
 
-    /// Optional path to SQLite file to generate the visibility index
+    /// Optional output path for binary visibility bitmask file (.aeth)
     #[arg(long)]
-    index_db: Option<String>,
+    visibility: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -103,7 +103,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         &wp_ids,
         &max_path,
         &count_path,
-        args.index_db.as_deref(),
+        args.visibility.as_deref(),
         args.tile_size,
         args.level,
     )?;

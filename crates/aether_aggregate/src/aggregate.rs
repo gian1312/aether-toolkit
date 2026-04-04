@@ -5,13 +5,21 @@
 // Main tiles: parallel geo-coordinate mapping from input files.
 // Max is written natively as 8-bit Integer (scaled inside standard GIS RAM).
 // Count is written natively as 16-bit Integer (65k overhead ceiling).
+//
+// Visibility index: Dense Tiled CSR (.vix) — per-tile compressed CSR arrays
+// with O(1) pixel lookup. Written by a background thread fed from rayon.
 
 use crate::reader::InputRaster;
 use crate::writer::{self, BigTiffWriter, TileStoreU8, TileStoreU16};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use rayon::prelude::*;
-use std::time::Instant;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public Interface
@@ -24,19 +32,26 @@ pub struct AggregateStats {
     pub count_max: f64,
 }
 
+/// Message sent from rayon workers to the .vix writer thread.
+struct VixTile {
+    tx: u32,
+    ty: u32,
+    compressed: Vec<u8>,
+}
+
 pub fn run(
     inputs: &[InputRaster],
     wp_ids: &[u32],
     max_path: &str,
     count_path: &str,
-    index_db_path: Option<&str>,
+    visibility_path: Option<&str>,
     tile_size: usize,
     compress_level: u32,
 ) -> Result<AggregateStats, Box<dyn std::error::Error>> {
     let nodata: u8 = 0;
     let count_nodata: u16 = 0;
     let ts = tile_size;
-    let build_index = index_db_path.is_some();
+    let build_vis = visibility_path.is_some();
 
     // --- 1. Compute master grid ---
     let (master_gt, master_w, master_h) = compute_master_grid(inputs)?;
@@ -72,36 +87,53 @@ pub fn run(
     );
 
     // --- 4. Open outputs + tile stores ---
-    // Inject BitsPerSample (8 for signal, 16 for counter limitation mitigation)
     let mut max_out = BigTiffWriter::create(max_path, master_w, master_h, ts, &master_gt, nodata as u16, compress_level, 8)?;
     let mut count_out = BigTiffWriter::create(count_path, master_w, master_h, ts, &master_gt, count_nodata, compress_level, 16)?;
     let mut max_store = TileStoreU8::new(master_w, master_h, ts, nodata, compress_level);
     let mut count_store = TileStoreU16::new(master_w, master_h, ts, count_nodata, compress_level);
 
-    // --- SQLite Background Writer ---
-    let (tx_sql, rx_sql) = mpsc::channel::<Vec<(u64, u32)>>();
-    let sql_thread = if let Some(db_path) = index_db_path {
-        let db_path = db_path.to_string();
+    // --- .vix writer thread ---
+    let (vix_tx, vix_rx) = mpsc::channel::<VixTile>();
+    let vix_thread = if let Some(vis_path) = visibility_path {
+        let vis_path = vis_path.to_string();
+        let master_w_copy = master_w;
+        let master_h_copy = master_h;
+        let ts_copy = ts;
+        let gt_copy = master_gt;
         Some(thread::spawn(move || {
-            let mut conn = rusqlite::Connection::open(db_path).unwrap();
-            conn.execute_batch("
-                PRAGMA synchronous = OFF;
-                PRAGMA journal_mode = MEMORY;
-                CREATE TABLE IF NOT EXISTS visibility (pixel_id INTEGER, wp_id INTEGER);
-                DELETE FROM visibility;
-            ").unwrap();
+            let mut file = BufWriter::new(File::create(&vis_path).expect("create .vix"));
+            let mut toc: Vec<(u32, u32, u64, u64)> = Vec::new(); // (tx, ty, offset, size)
+            let mut current_offset: u64 = 0;
 
-            let mut tx_db = conn.transaction().unwrap();
-            {
-                let mut stmt = tx_db.prepare("INSERT INTO visibility VALUES (?, ?)").unwrap();
-                for records in rx_sql {
-                    for (pid, wid) in records {
-                        stmt.execute((pid, wid)).unwrap();
-                    }
-                }
+            for tile in vix_rx {
+                let size = tile.compressed.len() as u64;
+                file.write_all(&tile.compressed).expect("write .vix tile");
+                toc.push((tile.tx, tile.ty, current_offset, size));
+                current_offset += size;
             }
-            tx_db.commit().unwrap();
-            conn.execute("CREATE INDEX idx_pixel ON visibility(pixel_id)", ()).unwrap();
+
+            // Write JSON TOC
+            let toc_json = serde_json::json!({
+                "tile_size": ts_copy,
+                "master_width": master_w_copy,
+                "master_height": master_h_copy,
+                "geotransform": gt_copy,
+                "projection": "EPSG:4326",
+                "tiles": toc.iter().map(|&(tx, ty, off, sz)| {
+                    serde_json::json!({ "tx": tx, "ty": ty, "offset": off, "size": sz })
+                }).collect::<Vec<_>>(),
+            });
+            let toc_bytes = serde_json::to_vec(&toc_json).expect("serialize TOC");
+            let toc_offset = current_offset;
+            file.write_all(&toc_bytes).expect("write TOC");
+
+            // Trailer: toc_offset(u64) + magic("VIX!")
+            file.write_all(&toc_offset.to_le_bytes()).expect("write toc offset");
+            file.write_all(b"VIX!").expect("write magic");
+            file.flush().expect("flush .vix");
+
+            eprintln!("[VIX] Written {} tiles, {:.1} MB compressed",
+                     toc.len(), current_offset as f64 / 1e6);
         }))
     } else {
         None
@@ -109,6 +141,11 @@ pub fn run(
 
     // --- 5. Process main tiles (parallel per row) ---
     let t_main = Instant::now();
+    let prof_read_us = AtomicU64::new(0);
+    let prof_read_calls = AtomicU64::new(0);
+    let prof_read_pixels = AtomicU64::new(0);
+    let prof_process_us = AtomicU64::new(0);
+    let prof_vis_bits = AtomicU64::new(0);
     let mut global = AggregateStats {
         has_valid_data: false,
         max_min: f64::INFINITY,
@@ -126,22 +163,21 @@ pub fn run(
                 process_tile(
                     *tx, ty, ts, master_w, master_h, &master_gt,
                     inputs, &file_geo, file_indices, nodata, compress_level,
-                    wp_ids, build_index
+                    wp_ids, build_vis,
+                    &prof_read_us, &prof_read_calls, &prof_read_pixels,
+                    &prof_process_us, &prof_vis_bits
                 )
             })
             .collect();
 
         for r in results {
-            // Write to output file
             max_out.write_tile(r.tx, ty, r.max_data.as_ref())?;
             count_out.write_tile(r.tx, ty, r.count_data.as_ref())?;
-            // Store compressed data for overview generation
             if let Some(ref d) = r.max_data { max_store.store(r.tx, ty, d.clone()); }
             if let Some(ref d) = r.count_data { count_store.store(r.tx, ty, d.clone()); }
 
-            // Dispatch visibility records to SQLite thread
-            if let Some(vis) = r.visibility {
-                let _ = tx_sql.send(vis);
+            if let Some(vix_data) = r.vix_compressed {
+                let _ = vix_tx.send(VixTile { tx: r.tx as u32, ty: ty as u32, compressed: vix_data });
             }
 
             if let Some(s) = r.stats {
@@ -160,16 +196,28 @@ pub fn run(
         }
     }
 
-    // Close channel to allow SQLite thread to wrap up
-    drop(tx_sql);
-    if let Some(t) = sql_thread {
-        println!("[S:Finalizing spatial index...]");
+    let tile_loop_secs = t_main.elapsed().as_secs_f64();
+    eprintln!("[Profile] Tile loop: {:.2}s", tile_loop_secs);
+    eprintln!("[Profile] read_region_u8: {} calls, {:.1}M pixels, {:.2}s (thread-sum)",
+             prof_read_calls.load(Ordering::Relaxed),
+             prof_read_pixels.load(Ordering::Relaxed) as f64 / 1e6,
+             prof_read_us.load(Ordering::Relaxed) as f64 / 1e6);
+    eprintln!("[Profile] pixel processing: {:.2}s (thread-sum), {} vis links",
+             prof_process_us.load(Ordering::Relaxed) as f64 / 1e6,
+             prof_vis_bits.load(Ordering::Relaxed));
+
+    // Close channel and wait for .vix writer
+    drop(vix_tx);
+    let t_vix_join = Instant::now();
+    if let Some(t) = vix_thread {
+        println!("[S:Finalizing visibility index...]");
         t.join().unwrap();
     }
+    eprintln!("[Profile] VIX write wait: {:.2}s", t_vix_join.elapsed().as_secs_f64());
 
     eprintln!("[Aggregate] Main tiles done in {:.2}s", t_main.elapsed().as_secs_f64());
 
-    // --- 6. Build overview pyramid (each level from the previous, 4× downsample) ---
+    // --- 6. Build overview pyramid ---
     let t_ovr = Instant::now();
     let mut cur_max = max_store;
     let mut cur_count = count_store;
@@ -201,7 +249,6 @@ pub fn run(
     println!("[P:98]");
     println!("[S:Writing file headers]");
 
-    // Recover GDAL scaling metadata so standard GIS dynamically promotes our 8-bit into negative decibels
     let gdal_scale = inputs.first().map_or(1.0, |i| i.scale);
     let gdal_offset = inputs.first().map_or(0.0, |i| i.offset);
 
@@ -209,7 +256,7 @@ pub fn run(
     let count_stats = if global.has_valid_data { Some((1.0, global.count_max)) } else { None };
 
     max_out.finalize(max_stats, gdal_scale, gdal_offset)?;
-    count_out.finalize(count_stats, 1.0, 0.0)?; // Counter is strictly nominal u16
+    count_out.finalize(count_stats, 1.0, 0.0)?;
 
     Ok(global)
 }
@@ -229,7 +276,7 @@ struct TileResult {
     tx: usize,
     max_data: Option<Vec<u8>>,
     count_data: Option<Vec<u8>>,
-    visibility: Option<Vec<(u64, u32)>>,
+    vix_compressed: Option<Vec<u8>>,
     stats: Option<(f64, f64, f64)>,
 }
 
@@ -265,7 +312,9 @@ fn process_tile(
     img_w: usize, img_h: usize, out_gt: &[f64; 6],
     inputs: &[InputRaster], file_geo: &[GeoBounds],
     file_indices: &[usize], nodata: u8, compress_level: u32,
-    wp_ids: &[u32], build_index: bool
+    wp_ids: &[u32], build_vis: bool,
+    prof_read_us: &AtomicU64, prof_read_calls: &AtomicU64, prof_read_pixels: &AtomicU64,
+    prof_process_us: &AtomicU64, prof_vis_bits: &AtomicU64
 ) -> TileResult {
     let bw = ts.min(img_w - tx * ts);
     let bh = ts.min(img_h - ty * ts);
@@ -276,13 +325,21 @@ fn process_tile(
     let mut max_tile = vec![nodata; ts * ts];
     let mut count_tile = vec![0u16; ts * ts];
     let mut has_data = false;
-    let mut vis_records = if build_index { Some(Vec::new()) } else { None };
+    let mut local_vis_links: u64 = 0;
+    let t_process = Instant::now();
+
+    // Per-pixel visibility lists (only allocated if building .vix)
+    let mut vis_lists: Option<Vec<Vec<u16>>> = if build_vis {
+        Some(vec![Vec::new(); ts * ts])
+    } else {
+        None
+    };
 
     for &fi in file_indices {
         let fb = &file_geo[fi];
         let inp = &inputs[fi];
         let igt = &inp.geotransform;
-        let wpid = wp_ids[fi];
+        let wpid = wp_ids[fi] as u16;
 
         let t_right  = tile_geo_x + bw as f64 * out_gt[1];
         let t_bottom = tile_geo_y + bh as f64 * out_gt[5];
@@ -303,7 +360,11 @@ fn process_tile(
 
         if src_w == 0 || src_h == 0 { continue; }
 
+        let t_read = Instant::now();
         let region = inp.read_region_u8(src_x0, src_y0, src_w, src_h);
+        prof_read_us.fetch_add(t_read.elapsed().as_micros() as u64, Ordering::Relaxed);
+        prof_read_calls.fetch_add(1, Ordering::Relaxed);
+        prof_read_pixels.fetch_add((src_w * src_h) as u64, Ordering::Relaxed);
 
         let dst_x0 = ((ovl_left - tile_geo_x) / out_gt[1]).round().max(0.0) as usize;
         let dst_y0 = ((ovl_top - tile_geo_y) / out_gt[5]).round().max(0.0) as usize;
@@ -348,11 +409,9 @@ fn process_tile(
                     }
                     count_tile[idx] = count_tile[idx].saturating_add(1);
 
-                    if let Some(ref mut vr) = vis_records {
-                        let abs_x = tx * ts + dx;
-                        let abs_y = ty * ts + dy;
-                        // Build spatial index using master grid dimensions
-                        vr.push(((abs_y * img_w + abs_x) as u64, wpid));
+                    if let Some(ref mut vl) = vis_lists {
+                        vl[idx].push(wpid);
+                        local_vis_links += 1;
                     }
                 }
             }
@@ -380,19 +439,66 @@ fn process_tile(
                     }
                     count_tile[idx] = count_tile[idx].saturating_add(1);
 
-                    if let Some(ref mut vr) = vis_records {
-                        let abs_x = tx * ts + dx;
-                        let abs_y = ty * ts + dy;
-                        vr.push(((abs_y * img_w + abs_x) as u64, wpid));
+                    if let Some(ref mut vl) = vis_lists {
+                        vl[idx].push(wpid);
+                        local_vis_links += 1;
                     }
                 }
             }
         }
     }
 
+    prof_process_us.fetch_add(t_process.elapsed().as_micros() as u64, Ordering::Relaxed);
+    prof_vis_bits.fetch_add(local_vis_links, Ordering::Relaxed);
+
     if !has_data {
-        return TileResult { tx, max_data: None, count_data: None, visibility: None, stats: None };
+        return TileResult { tx, max_data: None, count_data: None, vix_compressed: None, stats: None };
     }
+
+    // --- Build Dense CSR and compress for .vix ---
+    let vix_compressed = if let Some(vl) = vis_lists {
+        // Build CSR: offsets[ts*ts + 1] + flat wp_ids
+        let num_pixels = ts * ts;
+        let mut offsets = Vec::with_capacity(num_pixels + 1);
+        let mut flat_wp_ids: Vec<u16> = Vec::new();
+        let mut running = 0u32;
+
+        for i in 0..num_pixels {
+            offsets.push(running);
+            let list = &vl[i];
+            for &wid in list {
+                flat_wp_ids.push(wid);
+            }
+            running += list.len() as u32;
+        }
+        offsets.push(running);
+
+        if flat_wp_ids.is_empty() {
+            None
+        } else {
+            // Serialize: [offsets as le bytes][wp_ids as le bytes]
+            let offsets_bytes: Vec<u8> = offsets.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let wp_ids_bytes: Vec<u8> = flat_wp_ids.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+
+            let mut raw = Vec::with_capacity(offsets_bytes.len() + wp_ids_bytes.len());
+            raw.extend_from_slice(&offsets_bytes);
+            raw.extend_from_slice(&wp_ids_bytes);
+
+            // Compress (inside rayon thread — parallel compression)
+            let mut encoder = ZlibEncoder::new(
+                Vec::with_capacity(raw.len() / 4),
+                Compression::best(),
+            );
+            encoder.write_all(&raw).expect("zlib compress vix tile");
+            Some(encoder.finish().expect("zlib finish vix tile"))
+        }
+    } else {
+        None
+    };
 
     // Process exact integer max values natively
     let mut t_min = 255u8;
@@ -408,7 +514,6 @@ fn process_tile(
         if cv > t_cmax { t_cmax = cv; }
     }
 
-    // Now simply restore floating point representation for the terminal summary block statistics using input scale
     let input_scale = inputs.first().map_or(1.0, |i| i.scale);
     let input_offset = inputs.first().map_or(0.0, |i| i.offset);
 
@@ -419,7 +524,7 @@ fn process_tile(
         tx,
         max_data: Some(writer::compress_u8_tile(&max_tile, ts, ts, compress_level)),
         count_data: Some(writer::compress_u16_tile(&count_tile, ts, ts, compress_level)),
-        visibility: vis_records,
+        vix_compressed,
         stats: Some((t_min_f, t_max_f, t_cmax as f64)),
     }
 }

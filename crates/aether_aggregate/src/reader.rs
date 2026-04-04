@@ -1,15 +1,18 @@
 // =============================================================================
-// Input Raster Reader — .tif (TIFF / BigTIFF)
+// Input Raster Reader — .bit (AETHER tiled) and .tif (TIFF / BigTIFF)
 // =============================================================================
 //
 // Reads raster metadata (dimensions, geotransform, nodata, scale/offset) and
 // provides region-based pixel access returning raw u8 values (avoiding float
 // promotion in RAM).
 //
+// .bit: AETHER tiled output — raw tile data + ATIL index footer + JSON sidecar.
 // .tif: Supports tiled layout, DEFLATE compression, and GeoTIFF tags.
 
 use flate2::read::ZlibDecoder;
 use memmap2::Mmap;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -29,6 +32,7 @@ pub struct InputRaster {
 }
 
 enum Inner {
+    Bit(BitFile),
     Tif(TifFile),
 }
 
@@ -41,6 +45,7 @@ impl InputRaster {
             .to_lowercase();
 
         match ext.as_str() {
+            "bit" => open_bit(path),
             "tif" | "tiff" => open_tif(path),
             _ => Err(format!("Unsupported format: .{}", ext).into()),
         }
@@ -50,8 +55,149 @@ impl InputRaster {
     /// Invalid pixels or nodata = 0.
     pub fn read_region_u8(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
         match &self.inner {
+            Inner::Bit(b) => b.read_region_u8(x, y, w, h),
             Inner::Tif(t) => t.read_region_u8(x, y, w, h),
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AETHER .bit Tiled Reader
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct BitSidecar {
+    dimensions: BitDimensions,
+    geotransform: [f64; 6],
+    #[serde(default = "default_bit_format")]
+    output_format: String,
+    #[serde(default)]
+    tile_size: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct BitDimensions { width: usize, height: usize }
+
+fn default_bit_format() -> String { "1BIT_LOS".to_string() }
+
+struct BitFile {
+    mmap: Mmap,
+    width: usize,
+    height: usize,
+    tile_size: usize,
+    is_8bit: bool,
+    // (tx, ty) → (offset, size) into mmap
+    tile_index: HashMap<(u32, u32), (u64, u32)>,
+}
+
+fn open_bit(path: &Path) -> Result<InputRaster, Box<dyn std::error::Error>> {
+    // Read JSON sidecar
+    let json_path = path.with_extension("json");
+    let json_str = std::fs::read_to_string(&json_path)
+        .map_err(|e| format!("Missing .bit sidecar {}: {}", json_path.display(), e))?;
+    let sidecar: BitSidecar = serde_json::from_str(&json_str)?;
+
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+
+    let is_8bit = sidecar.output_format != "1BIT_LOS";
+    let tile_size = sidecar.tile_size.unwrap_or(512);
+
+    // Parse ATIL footer (last 24 bytes): index_offset(u64), tile_count(u64), magic(4), reserved(4)
+    let len = mmap.len();
+    if len < 24 { return Err("File too small for ATIL footer".into()); }
+    let footer = &mmap[len - 24..];
+    let index_offset = u64::from_le_bytes(footer[0..8].try_into()?);
+    let tile_count = u64::from_le_bytes(footer[8..16].try_into()?);
+    if &footer[16..20] != b"ATIL" {
+        return Err("Missing ATIL magic in .bit footer".into());
+    }
+
+    // Parse tile index: tx(u32), ty(u32), offset(u64), size(u32) = 20 bytes per entry
+    let mut tile_index = HashMap::with_capacity(tile_count as usize);
+    let idx_start = index_offset as usize;
+    for i in 0..tile_count as usize {
+        let e = idx_start + i * 20;
+        if e + 20 > len { break; }
+        let tx = u32::from_le_bytes(mmap[e..e + 4].try_into()?);
+        let ty = u32::from_le_bytes(mmap[e + 4..e + 8].try_into()?);
+        let off = u64::from_le_bytes(mmap[e + 8..e + 16].try_into()?);
+        let sz = u32::from_le_bytes(mmap[e + 16..e + 20].try_into()?);
+        tile_index.insert((tx, ty), (off, sz));
+    }
+
+    Ok(InputRaster {
+        width: sidecar.dimensions.width,
+        height: sidecar.dimensions.height,
+        geotransform: sidecar.geotransform,
+        nodata: 0.0,
+        scale: 1.0,
+        offset: 0.0,
+        inner: Inner::Bit(BitFile {
+            mmap,
+            width: sidecar.dimensions.width,
+            height: sidecar.dimensions.height,
+            tile_size,
+            is_8bit,
+            tile_index,
+        }),
+    })
+}
+
+impl BitFile {
+    fn read_region_u8(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; w * h];
+        let ts = self.tile_size;
+
+        let tx0 = x / ts;
+        let ty0 = y / ts;
+        let tx1 = ((x + w).min(self.width) + ts - 1) / ts;
+        let ty1 = ((y + h).min(self.height) + ts - 1) / ts;
+
+        for ty in ty0..ty1 {
+            for tx in tx0..tx1 {
+                let (off, sz) = match self.tile_index.get(&(tx as u32, ty as u32)) {
+                    Some(&v) => v,
+                    None => continue, // sparse tile (all zeros)
+                };
+
+                let off = off as usize;
+                let sz = sz as usize;
+                if off + sz > self.mmap.len() { continue; }
+                let tile_data = &self.mmap[off..off + sz];
+
+                let tile_x0 = tx * ts;
+                let tile_y0 = ty * ts;
+                let ry0 = y.max(tile_y0);
+                let ry1 = (y + h).min(tile_y0 + ts).min(self.height);
+                let rx0 = x.max(tile_x0);
+                let rx1 = (x + w).min(tile_x0 + ts).min(self.width);
+
+                for sy in ry0..ry1 {
+                    let tile_row = sy - tile_y0;
+                    let dst_row = sy - y;
+                    for sx in rx0..rx1 {
+                        let tile_col = sx - tile_x0;
+                        let dst_col = sx - x;
+                        let val = if self.is_8bit {
+                            let idx = tile_row * ts + tile_col;
+                            if idx < tile_data.len() { tile_data[idx] } else { 0 }
+                        } else {
+                            // 1-bit packed: MSB-first, rows byte-aligned to tile width
+                            let row_bytes = (ts + 7) / 8;
+                            let idx = tile_row * row_bytes + tile_col / 8;
+                            if idx < tile_data.len() {
+                                (tile_data[idx] >> (7 - (tile_col & 7))) & 1
+                            } else { 0 }
+                        };
+                        if val != 0 {
+                            buf[dst_row * w + dst_col] = val;
+                        }
+                    }
+                }
+            }
+        }
+        buf
     }
 }
 
