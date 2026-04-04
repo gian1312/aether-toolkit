@@ -103,6 +103,9 @@ fn open_bit(path: &Path) -> Result<InputRaster, Box<dyn std::error::Error>> {
     let is_8bit = sidecar.output_format != "1BIT_LOS";
     let tile_size = sidecar.tile_size.unwrap_or(512);
 
+    // Hardcoded encoding: 8-bit prop mode stores signal_dBm = raw_byte + offset
+    let (scale, offset) = if is_8bit { (1.0, -150.0) } else { (1.0, 0.0) };
+
     // Parse ATIL footer (last 24 bytes): index_offset(u64), tile_count(u64), magic(4), reserved(4)
     let len = mmap.len();
     if len < 24 { return Err("File too small for ATIL footer".into()); }
@@ -131,8 +134,8 @@ fn open_bit(path: &Path) -> Result<InputRaster, Box<dyn std::error::Error>> {
         height: sidecar.dimensions.height,
         geotransform: sidecar.geotransform,
         nodata: 0.0,
-        scale: 1.0,
-        offset: 0.0,
+        scale,
+        offset,
         inner: Inner::Bit(BitFile {
             mmap,
             width: sidecar.dimensions.width,

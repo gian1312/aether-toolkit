@@ -328,9 +328,16 @@ fn process_tile(
     let mut local_vis_links: u64 = 0;
     let t_process = Instant::now();
 
-    // Per-pixel visibility lists (only allocated if building .vix)
-    let mut vis_lists: Option<Vec<Vec<u16>>> = if build_vis {
-        Some(vec![Vec::new(); ts * ts])
+    // Dense pre-allocated visibility storage (fixed-stride, zero realloc)
+    let max_wp_per_pixel = file_indices.len();
+    let num_pixels = ts * ts;
+    let mut vis_storage: Option<Vec<u16>> = if build_vis && max_wp_per_pixel > 0 {
+        Some(vec![0u16; num_pixels * max_wp_per_pixel])
+    } else {
+        None
+    };
+    let mut vis_cursors: Option<Vec<u16>> = if build_vis {
+        Some(vec![0u16; num_pixels])
     } else {
         None
     };
@@ -409,8 +416,10 @@ fn process_tile(
                     }
                     count_tile[idx] = count_tile[idx].saturating_add(1);
 
-                    if let Some(ref mut vl) = vis_lists {
-                        vl[idx].push(wpid);
+                    if let (Some(ref mut st), Some(ref mut cu)) = (&mut vis_storage, &mut vis_cursors) {
+                        let slot = idx * max_wp_per_pixel + cu[idx] as usize;
+                        st[slot] = wpid;
+                        cu[idx] += 1;
                         local_vis_links += 1;
                     }
                 }
@@ -423,8 +432,10 @@ fn process_tile(
                 let ly = (fy as usize).wrapping_sub(src_y0);
                 if ly >= src_h { continue; }
 
+                let mut current_fx = base_fx + dst_x0 as f64 * step_x;
                 for dx in dst_x0..dst_x1 {
-                    let fx = (base_fx + dx as f64 * step_x).round() as isize;
+                    let fx = current_fx.round() as isize;
+                    current_fx += step_x;
                     if fx < 0 || fx as usize >= inp.width { continue; }
                     let lx = (fx as usize).wrapping_sub(src_x0);
                     if lx >= src_w { continue; }
@@ -439,8 +450,10 @@ fn process_tile(
                     }
                     count_tile[idx] = count_tile[idx].saturating_add(1);
 
-                    if let Some(ref mut vl) = vis_lists {
-                        vl[idx].push(wpid);
+                    if let (Some(ref mut st), Some(ref mut cu)) = (&mut vis_storage, &mut vis_cursors) {
+                        let slot = idx * max_wp_per_pixel + cu[idx] as usize;
+                        st[slot] = wpid;
+                        cu[idx] += 1;
                         local_vis_links += 1;
                     }
                 }
@@ -456,44 +469,48 @@ fn process_tile(
     }
 
     // --- Build Dense CSR and compress for .vix ---
-    let vix_compressed = if let Some(vl) = vis_lists {
-        // Build CSR: offsets[ts*ts + 1] + flat wp_ids
-        let num_pixels = ts * ts;
-        let mut offsets = Vec::with_capacity(num_pixels + 1);
-        let mut flat_wp_ids: Vec<u16> = Vec::new();
-        let mut running = 0u32;
-
-        for i in 0..num_pixels {
-            offsets.push(running);
-            let list = &vl[i];
-            for &wid in list {
-                flat_wp_ids.push(wid);
-            }
-            running += list.len() as u32;
-        }
-        offsets.push(running);
-
-        if flat_wp_ids.is_empty() {
+    let vix_compressed = if let (Some(st), Some(cu)) = (vis_storage, vis_cursors) {
+        // Build CSR offsets from cursors (prefix sum) + compact-copy wp_ids
+        let total_links: usize = cu.iter().map(|&c| c as usize).sum();
+        if total_links == 0 {
             None
         } else {
-            // Serialize: [offsets as le bytes][wp_ids as le bytes]
-            let offsets_bytes: Vec<u8> = offsets.iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
-            let wp_ids_bytes: Vec<u8> = flat_wp_ids.iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
+            let mut offsets = Vec::with_capacity(num_pixels + 1);
+            let mut flat_wp_ids = Vec::with_capacity(total_links);
+            let mut running = 0u32;
 
-            let mut raw = Vec::with_capacity(offsets_bytes.len() + wp_ids_bytes.len());
-            raw.extend_from_slice(&offsets_bytes);
-            raw.extend_from_slice(&wp_ids_bytes);
+            for i in 0..num_pixels {
+                offsets.push(running);
+                let count = cu[i] as usize;
+                let base = i * max_wp_per_pixel;
+                for j in 0..count {
+                    flat_wp_ids.push(st[base + j]);
+                }
+                running += count as u32;
+            }
+            offsets.push(running);
 
-            // Compress (inside rayon thread — parallel compression)
+            // Zero-copy serialization: cast slices directly to bytes
+            let offsets_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    offsets.as_ptr() as *const u8,
+                    offsets.len() * 4,
+                )
+            };
+            let wp_ids_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    flat_wp_ids.as_ptr() as *const u8,
+                    flat_wp_ids.len() * 2,
+                )
+            };
+
+            // Compress with level 1 (fast — repeating zeros compress equally well)
             let mut encoder = ZlibEncoder::new(
-                Vec::with_capacity(raw.len() / 4),
-                Compression::best(),
+                Vec::with_capacity(offsets_bytes.len() / 4),
+                Compression::new(1),
             );
-            encoder.write_all(&raw).expect("zlib compress vix tile");
+            encoder.write_all(offsets_bytes).expect("zlib compress vix offsets");
+            encoder.write_all(wp_ids_bytes).expect("zlib compress vix wp_ids");
             Some(encoder.finish().expect("zlib finish vix tile"))
         }
     } else {
