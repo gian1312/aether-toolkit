@@ -313,8 +313,8 @@ impl BigTiffWriter {
             md.push_str(&format!("<Item name=\"SCALE\" sample=\"0\" role=\"scale\">{}</Item>\n", gdal_scale));
         }
         if let Some((min_v, max_v)) = stats {
-            md.push_str(&format!("<Item name=\"STATISTICS_MINIMUM\">{}</Item>\n", min_v));
-            md.push_str(&format!("<Item name=\"STATISTICS_MAXIMUM\">{}</Item>\n", max_v));
+            md.push_str(&format!("<Item name=\"STATISTICS_MINIMUM\" sample=\"0\">{}</Item>\n", min_v));
+            md.push_str(&format!("<Item name=\"STATISTICS_MAXIMUM\" sample=\"0\">{}</Item>\n", max_v));
         }
         md.push_str("</GDALMetadata>");
 

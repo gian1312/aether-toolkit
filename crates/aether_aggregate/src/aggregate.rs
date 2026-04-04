@@ -255,6 +255,10 @@ pub fn run(
     let max_stats = if global.has_valid_data { Some((global.max_min, global.max_max)) } else { None };
     let count_stats = if global.has_valid_data { Some((1.0, global.count_max)) } else { None };
 
+    eprintln!("[Aggregate] Max GeoTIFF: scale={}, offset={}, stats(raw)={:?}",
+             gdal_scale, gdal_offset, max_stats);
+    eprintln!("[Aggregate] Count GeoTIFF: scale=1.0, offset=0.0, stats={:?}", count_stats);
+
     max_out.finalize(max_stats, gdal_scale, gdal_offset)?;
     count_out.finalize(count_stats, 1.0, 0.0)?;
 
@@ -531,11 +535,9 @@ fn process_tile(
         if cv > t_cmax { t_cmax = cv; }
     }
 
-    let input_scale = inputs.first().map_or(1.0, |i| i.scale);
-    let input_offset = inputs.first().map_or(0.0, |i| i.offset);
-
-    let t_min_f = if t_min <= t_max { t_min as f64 * input_scale + input_offset } else { f64::INFINITY };
-    let t_max_f = if t_min <= t_max { t_max as f64 * input_scale + input_offset } else { f64::NEG_INFINITY };
+    // Stats as raw stored values (GDAL convention: consumer applies scale/offset)
+    let t_min_f = if t_min <= t_max { t_min as f64 } else { f64::INFINITY };
+    let t_max_f = if t_min <= t_max { t_max as f64 } else { f64::NEG_INFINITY };
 
     TileResult {
         tx,
