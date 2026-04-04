@@ -112,16 +112,23 @@ pub fn run(
                 current_offset += size;
             }
 
-            // Write JSON TOC
+            // Write JSON TOC (matching Python VixWriter format)
+            let mut tiles_map = serde_json::Map::new();
+            for &(tx, ty, off, sz) in &toc {
+                tiles_map.insert(
+                    format!("{},{}", tx, ty),
+                    serde_json::json!({ "offset": off, "size": sz }),
+                );
+            }
             let toc_json = serde_json::json!({
-                "tile_size": ts_copy,
-                "master_width": master_w_copy,
-                "master_height": master_h_copy,
-                "geotransform": gt_copy,
-                "projection": "EPSG:4326",
-                "tiles": toc.iter().map(|&(tx, ty, off, sz)| {
-                    serde_json::json!({ "tx": tx, "ty": ty, "offset": off, "size": sz })
-                }).collect::<Vec<_>>(),
+                "meta": {
+                    "tile_size": ts_copy,
+                    "master_width": master_w_copy,
+                    "master_height": master_h_copy,
+                    "geotransform": gt_copy,
+                    "projection": "EPSG:4326",
+                },
+                "tiles": tiles_map,
             });
             let toc_bytes = serde_json::to_vec(&toc_json).expect("serialize TOC");
             let toc_offset = current_offset;
