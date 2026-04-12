@@ -12,6 +12,7 @@ use tiff::tags::Tag;
 use anyhow::{Context, Result};
 use flatgeobuf::{FgbReader, GeometryType};
 use fallible_streaming_iterator::FallibleStreamingIterator;
+#[cfg(feature = "bc6h")]
 use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
 
 #[derive(Deserialize, Debug, Clone)]
@@ -244,6 +245,11 @@ pub fn process_tile_with_cache(
     let format_str = job.format.as_deref().unwrap_or("r16sint");
     let is_bc6h = format_str.eq_ignore_ascii_case("bc6h");
 
+    #[cfg(not(feature = "bc6h"))]
+    if is_bc6h {
+        return Err(anyhow::anyhow!("BC6H format requested but binary was built without the 'bc6h' feature"));
+    }
+
     // Dynamic BaseElev calculation for BC6H
     let mut base_elev = 0i16;
     if is_bc6h {
@@ -284,6 +290,7 @@ pub fn process_tile_with_cache(
     };
     w.write_u16::<LittleEndian>(final_stride)?;
 
+    #[cfg(feature = "bc6h")]
     if is_bc6h {
          // 1. Map terrain to 0-aligned RGBA float buffer
         let mut rgba = vec![0.0f32; total_pixels * 4];
@@ -336,7 +343,9 @@ pub fn process_tile_with_cache(
         ).map_err(|e| anyhow::anyhow!("BC6H Encoding failed: {:?}", e))?;
 
         w.write_all(&dds_surface.data)?;
-    } else {
+    }
+
+    if !is_bc6h {
         // Legacy R16SINT writing with 256-byte pitch padding
         let padding_bytes = aligned_stride_r16 - bytes_per_row_r16;
         let padding_buf = vec![0u8; padding_bytes as usize];

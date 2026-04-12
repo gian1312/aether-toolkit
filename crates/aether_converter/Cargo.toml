@@ -12,17 +12,20 @@ serde_json = "1.0"
 # Image IO
 byteorder = "1.5"
 tiff = "0.9"
-image_dds = "0.3"
+image_dds = { version = "0.3", optional = true }
 bytemuck = "1.14"
 # Parallel Processing
 rayon = "1.8"
 # Error Handling
 anyhow = "1.0"
 # GIS
-flatgeobuf = "4.0"
+flatgeobuf = { version = "4.0", default-features = false }
 fallible-streaming-iterator = "0.1"
 # Logging
 log = "0.4"
 env_logger = "0.11"
 # System
 sysinfo = "0.30"
+
+[features]
+bc6h = ["image_dds"]
