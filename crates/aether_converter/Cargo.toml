@@ -27,5 +27,8 @@ env_logger = "0.11"
 # System
 sysinfo = "0.30"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 bc6h = ["image_dds"]
