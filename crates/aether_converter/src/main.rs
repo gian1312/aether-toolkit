@@ -1,4 +1,5 @@
 // rust/aether_converter/src/main.rs
+mod download;
 mod geo;
 mod ingest;
 
@@ -29,7 +30,12 @@ enum Commands {
     Ingest {
         #[arg(short, long)]
         job_file: PathBuf,
-    }
+    },
+    /// Download XYZ terrain tiles in parallel and produce a WGS84 GeoTIFF.
+    Download {
+        #[arg(short, long)]
+        job_file: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -125,6 +131,9 @@ fn main() -> anyhow::Result<()> {
                 });
             }
             Ok(())
-        }
+        },
+        Commands::Download { job_file } => {
+            download::run_download(&job_file)
+        },
     }
 }
