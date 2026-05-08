@@ -28,7 +28,7 @@ env_logger = "0.11"
 sysinfo = "0.30"
 # HTTP (async tile download)
 reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 futures = "0.3"
 # PNG decoding (for terrain tile decode)
 png = "0.17"
