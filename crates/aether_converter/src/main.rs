@@ -39,6 +39,11 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Force line-buffered stdout so progress reaches the parent process
+    // immediately when piped (default is fully-buffered when not a TTY).
+    use std::io::Write;
+    let _ = std::io::stdout().flush(); // touch stdout to init
+
     // Strictly ignore environment variables for noisy modules.
     let mut builder = env_logger::Builder::new();
 
@@ -78,6 +83,10 @@ fn main() -> anyhow::Result<()> {
 
                 println!("[Rust] Batch processing {} tiles...", jobs.len());
                 println!("[Rust] Rayon Pool: {} threads (System RAM: {} GB)", safe_threads, total_ram_gb);
+                {
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
 
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(safe_threads).build().unwrap();
 
@@ -115,6 +124,8 @@ fn main() -> anyhow::Result<()> {
                         let curr = progress.fetch_add(1, Ordering::Relaxed) + 1;
                         if curr % 10 == 0 || curr == total {
                             println!("[Rust] Progress: {}/{}", curr, total);
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
                         }
 
                         // --- CACHE THRASHING FIX ---
