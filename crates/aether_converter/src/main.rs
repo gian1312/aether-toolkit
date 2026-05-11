@@ -9,7 +9,9 @@ use std::fs;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "native")]
 use rayon::prelude::*;
+#[cfg(feature = "native")]
 use sysinfo::System;
 
 #[derive(Parser)]

@@ -9,12 +9,33 @@ use anyhow::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
+#[cfg(feature = "native")]
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+#[cfg(feature = "native")]
+use std::io::{BufWriter, Seek, SeekFrom};
+#[cfg(feature = "native")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+// std::time::Instant panics on wasm32 — use a simple f64 (ms) wrapper instead.
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct Instant(f64);
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    fn now() -> Self { Self(js_sys::Date::now()) }
+    fn elapsed(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64((js_sys::Date::now() - self.0) / 1000.0)
+    }
+}
+#[cfg(feature = "native")]
 use sysinfo::{Disks, System};
 use tokio::sync::Semaphore;
 
@@ -39,20 +60,20 @@ pub struct SubTileSpec {
 
 // -- Tile math ----------------------------------------------------------------
 
-fn lon2tx(lon: f64, z: u32) -> u32 {
+pub fn lon2tx(lon: f64, z: u32) -> u32 {
     let n = 2f64.powi(z as i32);
     ((lon + 180.0) / 360.0 * n).floor().max(0.0) as u32
 }
-fn lat2ty(lat: f64, z: u32) -> u32 {
+pub fn lat2ty(lat: f64, z: u32) -> u32 {
     let n = 2f64.powi(z as i32);
     let r = lat.to_radians();
     ((1.0 - r.tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor().max(0.0) as u32
 }
-fn ty2lat(y: u32, z: u32) -> f64 {
+pub fn ty2lat(y: u32, z: u32) -> f64 {
     let n = 2f64.powi(z as i32);
     (std::f64::consts::PI * (1.0 - 2.0 * y as f64 / n)).sinh().atan().to_degrees()
 }
-fn tx2lon(x: u32, z: u32) -> f64 {
+pub fn tx2lon(x: u32, z: u32) -> f64 {
     let n = 2f64.powi(z as i32);
     x as f64 / n * 360.0 - 180.0
 }
@@ -60,15 +81,15 @@ fn tx2lon(x: u32, z: u32) -> f64 {
 // -- Decode -------------------------------------------------------------------
 
 #[inline]
-fn dec_terrarium(r: u8, g: u8, b: u8) -> f32 {
+pub fn dec_terrarium(r: u8, g: u8, b: u8) -> f32 {
     (r as f32 * 256.0 + g as f32 + b as f32 / 256.0) - 32768.0
 }
 #[inline]
-fn dec_mapbox(r: u8, g: u8, b: u8) -> f32 {
+pub fn dec_mapbox(r: u8, g: u8, b: u8) -> f32 {
     -10000.0 + (r as f32 * 6553.6 + g as f32 * 25.6 + b as f32 * 0.1)
 }
 
-fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
+pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
     let decoder = png::Decoder::new(std::io::Cursor::new(body));
     let mut reader = decoder.read_info()?;
     let info = reader.info().clone();
@@ -205,6 +226,7 @@ impl DownloadStats {
 
 // -- Resource helpers ---------------------------------------------------------
 
+#[cfg(feature = "native")]
 fn available_disk_space(path: &Path) -> Option<u64> {
     let canonical = std::fs::canonicalize(path)
         .or_else(|_| {
@@ -221,6 +243,7 @@ fn available_disk_space(path: &Path) -> Option<u64> {
         .map(|d| d.available_space())
 }
 
+#[cfg(feature = "native")]
 fn estimate_abt_bytes(tiles: &[SubTileSpec]) -> u64 {
     tiles.iter().map(|spec| {
         let bpr = spec.size_px as u64 * 2;
@@ -231,12 +254,14 @@ fn estimate_abt_bytes(tiles: &[SubTileSpec]) -> u64 {
 
 // -- .abt writer --------------------------------------------------------------
 
+#[cfg(feature = "native")]
 struct AbtWriter {
     writer: BufWriter<File>,
     size_px: u32,
     stride: usize,
 }
 
+#[cfg(feature = "native")]
 impl AbtWriter {
     fn create(path: &Path, sz: u32, ul_lat: f64, ul_lon: f64, pd: f64) -> Result<Self> {
         let bpr = sz as usize * 2;
@@ -477,6 +502,7 @@ async fn download_strip(
 
 // -- Entry point (sync wrapper around async) ----------------------------------
 
+#[cfg(feature = "native")]
 pub fn run_download(job_file: &Path) -> Result<()> {
     let content = fs::read_to_string(job_file)?;
     let job: DownloadJob = serde_json::from_str(&content)?;
@@ -488,6 +514,7 @@ pub fn run_download(job_file: &Path) -> Result<()> {
     rt.block_on(run_download_async(job))
 }
 
+#[cfg(feature = "native")]
 async fn run_download_async(job: DownloadJob) -> Result<()> {
     let start = Instant::now();
     let conns = job.max_connections.unwrap_or(256);
@@ -865,4 +892,219 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     stats.log_summary(elapsed);
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     Ok(())
+}
+
+// -- In-memory download (WASM-compatible, no rayon/sysinfo/File) --------------
+
+/// Same pipeline as `run_download_async` but returns .abt bytes in memory.
+/// Does NOT use rayon, sysinfo, or filesystem I/O — suitable for WASM targets.
+pub async fn run_download_mem(
+    job: &DownloadJob,
+    client: &reqwest::Client,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+    let start = Instant::now();
+    let conns = job.max_connections.unwrap_or(64);
+
+    let dec: fn(u8, u8, u8) -> f32 = match job.encoding.to_lowercase().as_str() {
+        "terrarium" => dec_terrarium,
+        "mapbox" => dec_mapbox,
+        o => anyhow::bail!("Unknown encoding '{o}'"),
+    };
+
+    // 1. Full bbox across all sub-tiles.
+    let (mut bb_s, mut bb_n, mut bb_w, mut bb_e) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for t in &job.tiles {
+        let pd = t.resolution_m / 111_111.0;
+        let sp = t.size_px as f64 * pd;
+        bb_s = bb_s.min(t.ul_lat - sp);
+        bb_n = bb_n.max(t.ul_lat);
+        bb_w = bb_w.min(t.ul_lon);
+        bb_e = bb_e.max(t.ul_lon + sp);
+    }
+
+    // 2. Tile range.
+    let (x0, x1) = (lon2tx(bb_w, job.zoom), lon2tx(bb_e, job.zoom));
+    let (y0, y1) = (lat2ty(bb_n, job.zoom), lat2ty(bb_s, job.zoom));
+    let nx = (x1 - x0 + 1) as usize;
+    let ny = (y1 - y0 + 1) as usize;
+    let total = nx * ny;
+    let gul_lon = tx2lon(x0, job.zoom);
+    let glr_lon = tx2lon(x1 + 1, job.zoom);
+    let gw = nx * 256;
+    let gpx = (glr_lon - gul_lon) / gw as f64;
+
+    eprintln!("[DownloadMem] z={} tiles={}x{}={} connections={}",
+        job.zoom, nx, ny, total, conns);
+
+    // 3. Prepare in-memory .abt buffers (pre-allocate with header + zeroed body).
+    struct MemAbt {
+        filename: String,
+        buf: Vec<u8>,
+        size_px: u32,
+        stride: usize,
+        ul_lat: f64,
+        ul_lon: f64,
+        pd: f64,
+    }
+
+    let mut abt_bufs: Vec<MemAbt> = Vec::with_capacity(job.tiles.len());
+    for spec in &job.tiles {
+        let pd = spec.resolution_m / 111_111.0;
+        let bpr = spec.size_px as usize * 2;
+        let stride = (bpr + 255) & !255;
+        let total_bytes = 44 + stride * spec.size_px as usize;
+        let mut buf = vec![0u8; total_bytes];
+
+        // Write 44-byte .abt header (identical to AbtWriter::create).
+        {
+            let mut cursor = std::io::Cursor::new(&mut buf[..44]);
+            cursor.write_all(b"AETH")?;
+            cursor.write_u16::<LittleEndian>(1)?;             // version
+            cursor.write_u16::<LittleEndian>(spec.size_px as u16)?;
+            cursor.write_f64::<LittleEndian>(spec.ul_lat)?;
+            cursor.write_f64::<LittleEndian>(spec.ul_lon)?;
+            cursor.write_f64::<LittleEndian>(pd)?;             // pixel_deg lat
+            cursor.write_f64::<LittleEndian>(pd)?;             // pixel_deg lon
+            cursor.write_i16::<LittleEndian>(0)?;              // base_elev
+            cursor.write_u16::<LittleEndian>(stride as u16)?;
+        }
+
+        abt_bufs.push(MemAbt {
+            filename: spec.filename.clone(),
+            buf,
+            size_px: spec.size_px,
+            stride,
+            ul_lat: spec.ul_lat,
+            ul_lon: spec.ul_lon,
+            pd,
+        });
+    }
+
+    // 4. Pre-compute x-lookup tables (pixel x → global grid column).
+    let x_luts: Vec<Vec<usize>> = abt_bufs.iter().map(|abt| {
+        let sz = abt.size_px as usize;
+        (0..sz).map(|x| {
+            let gc = ((abt.ul_lon + (x as f64 + 0.5) * abt.pd - gul_lon)
+                / gpx).round() as isize;
+            if gc >= 0 && (gc as usize) < gw { gc as usize } else { usize::MAX }
+        }).collect()
+    }).collect();
+
+    // 5. Build strip ranges.
+    let strip_rows: u32 = 32;
+    let mut strips: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut cur = y0;
+        while cur <= y1 {
+            let end = (cur + strip_rows - 1).min(y1);
+            strips.push((cur, end));
+            cur = end + 1;
+        }
+    }
+
+    let zoom = job.zoom;
+    let progress = Arc::new(AtomicUsize::new(0));
+    let stats = Arc::new(DownloadStats::new());
+    let semaphore = Arc::new(Semaphore::new(conns));
+
+    // 6. Process strips sequentially (no prefetch pipeline — WASM single-threaded).
+    let mut mini_grid = vec![0.0f32; gw * 256];
+
+    for (strip_idx, &(sy0, sy1)) in strips.iter().enumerate() {
+        let sny = (sy1 - sy0 + 1) as usize;
+
+        // Download this strip.
+        let results = download_strip(
+            client, &job.url_template, zoom, x0, x1, sy0, sy1,
+            dec, conns, &progress, total, &stats, start, &semaphore,
+        ).await;
+
+        let strip_ok = results.iter().filter(|(_, _, r)| r.is_ok()).count();
+        let strip_total = results.len();
+        let strip_err = strip_total - strip_ok;
+        if strip_err > 0 {
+            eprintln!("[StripMem {}/{}] {} tiles: {} ok, {} FAILED",
+                strip_idx + 1, strips.len(), strip_total, strip_ok, strip_err);
+        }
+
+        // Report progress to caller
+        if let Some(cb) = &on_progress {
+            cb(progress.load(Ordering::Relaxed), total);
+        }
+
+        // Group tiles by row within the strip.
+        let mut tiles_by_row: Vec<Vec<(u32, &[f32])>> = vec![Vec::new(); sny];
+        for (tx, ty, r) in &results {
+            if let Ok(elev) = r {
+                tiles_by_row[(*ty - sy0) as usize].push((*tx, elev.as_slice()));
+            }
+        }
+
+        // Process one tile-row at a time.
+        for tr in 0..sny {
+            let ty = sy0 + tr as u32;
+
+            // Fill mini-grid from downloaded tile data.
+            for &(tx, elev) in &tiles_by_row[tr] {
+                let col = (tx - x0) as usize * 256;
+                for py in 0..256usize {
+                    let cw = 256.min(gw - col);
+                    mini_grid[py * gw + col..py * gw + col + cw]
+                        .copy_from_slice(&elev[py * 256..py * 256 + cw]);
+                }
+            }
+
+            let tr_top = ty2lat(ty, zoom);
+            let tr_bot = ty2lat(ty + 1, zoom);
+            let tr_spy = (tr_top - tr_bot) / 256.0;
+
+            // Sample output rows from the mini-grid into each abt buffer.
+            for (sti, abt) in abt_bufs.iter_mut().enumerate() {
+                let sz = abt.size_px as usize;
+                let x_lut = &x_luts[sti];
+
+                // Skip sub-tiles that don't overlap this tile-row.
+                let spec_bot = abt.ul_lat - sz as f64 * abt.pd;
+                if abt.ul_lat <= tr_bot || spec_bot >= tr_top {
+                    continue;
+                }
+
+                for y in 0..sz {
+                    let lat = abt.ul_lat - (y as f64 + 0.5) * abt.pd;
+                    if lat > tr_top || lat <= tr_bot { continue; }
+                    let gr = ((tr_top - lat) / tr_spy).round() as usize;
+                    if gr >= 256 { continue; }
+
+                    let row_off = gr * gw;
+                    let buf_offset = 44 + y * abt.stride;
+
+                    // Write i16 elevation values directly into the buffer.
+                    for x in 0..sz {
+                        let gc = x_lut[x];
+                        let val: i16 = if gc < gw {
+                            (mini_grid[row_off + gc] * 2.0).round() as i16
+                        } else {
+                            0
+                        };
+                        let byte_off = buf_offset + x * 2;
+                        abt.buf[byte_off..byte_off + 2]
+                            .copy_from_slice(&val.to_le_bytes());
+                    }
+                    // Stride padding is already zeroed from vec![0u8; ...].
+                }
+            }
+        }
+    }
+
+    // 7. Build result map.
+    let mut result = std::collections::HashMap::with_capacity(abt_bufs.len());
+    for abt in abt_bufs {
+        result.insert(abt.filename, abt.buf);
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    stats.log_summary(elapsed);
+    eprintln!("[DownloadMem] TOTAL: {:.1}s", elapsed);
+    Ok(result)
 }

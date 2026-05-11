@@ -5,6 +5,7 @@ use std::io::{BufWriter, Write, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use serde::Deserialize;
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 use byteorder::{LittleEndian, WriteBytesExt};
 use tiff::decoder::{Decoder, DecodingResult};
@@ -157,7 +158,11 @@ pub fn process_tile_with_cache(
     let mut buffer = vec![0i16; total_pixels];
 
     // Terrain Rasterization
-    buffer.par_chunks_mut(out_size).enumerate().for_each(|(y, row_buffer)| {
+    #[cfg(feature = "native")]
+    let iter = buffer.par_chunks_mut(out_size);
+    #[cfg(not(feature = "native"))]
+    let iter = buffer.chunks_mut(out_size);
+    iter.enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
 
         let mut base_row_valid = false;

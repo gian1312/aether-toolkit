@@ -15,7 +15,7 @@ tiff = "0.9"
 image_dds = { version = "0.3", optional = true }
 bytemuck = "1.14"
 # Parallel Processing
-rayon = "1.8"
+rayon = { version = "1.8", optional = true }
 # Error Handling
 anyhow = "1.0"
 # GIS
@@ -25,16 +25,21 @@ fallible-streaming-iterator = "0.1"
 log = "0.4"
 env_logger = "0.11"
 # System
-sysinfo = "0.30"
+sysinfo = { version = "0.30", optional = true }
 # HTTP (async tile download)
 reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
 futures = "0.3"
 # PNG decoding (for terrain tile decode)
 png = "0.17"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
+default = ["native"]
+native = ["tokio/rt-multi-thread", "dep:sysinfo", "dep:rayon"]
 bc6h = ["image_dds"]
