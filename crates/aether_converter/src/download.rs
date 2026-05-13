@@ -313,6 +313,7 @@ impl AbtWriter {
 
 // -- Async download -----------------------------------------------------------
 
+#[allow(dead_code)] // Used by run_download_async (native only); WASM uses download_strip_raw.
 async fn download_strip(
     client: &reqwest::Client,
     url_template: &str,
@@ -326,6 +327,10 @@ async fn download_strip(
     stats: &DownloadStats,
     start_time: Instant,
     semaphore: &Semaphore,
+    #[cfg(not(target_arch = "wasm32"))]
+    on_progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    #[cfg(target_arch = "wasm32")]
+    on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Vec<(u32, u32, Result<Vec<f32>>)> {
     let coords: Vec<_> = (strip_y0..=strip_y1)
         .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
@@ -341,6 +346,7 @@ async fn download_strip(
             let progress = progress;
             let stats = stats;
             let semaphore = semaphore;
+            let on_progress = on_progress;
             async move {
                 // Global concurrency gate — prevents PREFETCH_DEPTH × conns explosion.
                 let permit = semaphore.acquire().await.unwrap();
@@ -479,6 +485,14 @@ async fn download_strip(
                 let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
                 let pct = done * 100 / total;
                 let prev_pct = (done - 1) * 100 / total;
+
+                // Fire callback every 5%
+                if let Some(cb) = on_progress {
+                    if pct / 5 > prev_pct / 5 || done == total || done == 1 {
+                        cb(done, total);
+                    }
+                }
+
                 if pct / 10 > prev_pct / 10 || done == total {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64
@@ -498,6 +512,430 @@ async fn download_strip(
         .buffer_unordered(concurrency)
         .collect()
         .await
+}
+
+// -- Raw-bytes download (no decode) for WASM single-threaded mode -------------
+//
+// In WASM, `download_strip` calls `decode_png()` inside each async future.
+// Since WASM is single-threaded, only one PNG decodes at a time even though
+// `buffer_unordered(600)` queues many requests — the synchronous CPU work
+// serialises all futures at the decode step.
+//
+// `download_strip_raw` separates download from decode: it fetches ALL tiles as
+// raw `Vec<u8>` bytes concurrently (the browser handles ~100 HTTP/2 streams),
+// then the caller decodes PNGs sequentially after the network phase completes.
+// This fully saturates the network instead of alternating fetch→decode→fetch.
+
+#[allow(dead_code)] // Used by native path; WASM uses download_all_tiles_web.
+async fn download_strip_raw(
+    client: &reqwest::Client,
+    url_template: &str,
+    zoom: u32,
+    x0: u32, x1: u32,
+    strip_y0: u32, strip_y1: u32,
+    concurrency: usize,
+    progress: &AtomicUsize,
+    total: usize,
+    stats: &DownloadStats,
+    start_time: Instant,
+    semaphore: &Semaphore,
+    #[cfg(not(target_arch = "wasm32"))]
+    on_progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    #[cfg(target_arch = "wasm32")]
+    on_progress: Option<&dyn Fn(usize, usize)>,
+) -> Vec<(u32, u32, Result<Vec<u8>>)> {
+    let coords: Vec<_> = (strip_y0..=strip_y1)
+        .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
+        .collect();
+
+    stream::iter(coords)
+        .map(|(tx, ty)| {
+            let client = client.clone();
+            let url = url_template
+                .replace("{x}", &tx.to_string())
+                .replace("{y}", &ty.to_string())
+                .replace("{z}", &zoom.to_string());
+            let progress = progress;
+            let stats = stats;
+            let semaphore = semaphore;
+            let on_progress = on_progress;
+            async move {
+                // Global concurrency gate — prevents connection explosion.
+                let permit = semaphore.acquire().await.unwrap();
+                let t0 = Instant::now();
+                let cur_flight = stats.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                stats.peak_in_flight.fetch_max(cur_flight, Ordering::Relaxed);
+
+                // Retry loop: up to 3 retries with exponential backoff (1s, 2s, 4s).
+                // Retries on: timeout, connection error, HTTP 429, HTTP 5xx.
+                // No retry on: HTTP 4xx (except 429).
+                const MAX_RETRIES: u32 = 3;
+                let mut result: Result<Vec<u8>> = Err(anyhow::anyhow!("not started"));
+                let mut retryable;
+
+                for attempt in 0..=MAX_RETRIES {
+                    if attempt > 0 {
+                        stats.retries.fetch_add(1, Ordering::Relaxed);
+                        let delay_ms = 1000u64 << (attempt - 1); // 1s, 2s, 4s
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    retryable = true;
+
+                    result = async {
+                        let resp = client.get(&url).send().await?;
+                        let status = resp.status();
+                        if !status.is_success() {
+                            anyhow::bail!("HTTP {}", status.as_u16());
+                        }
+                        let body = resp.bytes().await?;
+                        stats.bytes_downloaded.fetch_add(body.len() as u64, Ordering::Relaxed);
+                        // Return raw PNG bytes — no decode here.
+                        Ok(body.to_vec())
+                    }
+                    .await;
+
+                    if result.is_ok() { break; }
+
+                    // Decide if this error is worth retrying.
+                    if let Err(ref e) = result {
+                        let msg = format!("{:#}", e);
+                        if msg.contains("HTTP ") {
+                            let code: u16 = msg.split("HTTP ")
+                                .nth(1)
+                                .and_then(|s| s.split_whitespace().next())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            // Only retry 429 and 5xx; other 4xx are permanent.
+                            if code != 429 && !(500..=599).contains(&code) {
+                                retryable = false;
+                            }
+                        }
+                        // Timeouts and connection errors are retryable (default).
+                    }
+
+                    if !retryable { break; }
+                }
+
+                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+                drop(permit);
+                let tile_us = t0.elapsed().as_micros() as u64;
+                stats.tile_us_sum.fetch_add(tile_us, Ordering::Relaxed);
+                stats.tile_us_max.fetch_max(tile_us, Ordering::Relaxed);
+                stats.tile_us_min.fetch_min(tile_us, Ordering::Relaxed);
+
+                // Classify final result (only after all retries exhausted).
+                match &result {
+                    Ok(_) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
+                    Err(e) => {
+                        let msg = format!("{:#}", e);
+                        if msg.contains("HTTP ") {
+                            let code: u16 = msg.split("HTTP ")
+                                .nth(1)
+                                .and_then(|s| s.split_whitespace().next())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            match code {
+                                429 => { stats.err_http_429.fetch_add(1, Ordering::Relaxed); }
+                                400..=499 => { stats.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
+                                500..=599 => { stats.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
+                                _ => { stats.err_other.fetch_add(1, Ordering::Relaxed); }
+                            }
+                        } else if msg.contains("timed out")
+                            || msg.contains("operation timed out")
+                        {
+                            let prev = stats.err_timeout.fetch_add(1, Ordering::Relaxed);
+                            if prev == 0 {
+                                eprintln!("[Download] first timeout: z={}/x={}/y={}",
+                                    zoom, tx, ty);
+                            }
+                        } else if msg.contains("onnect")
+                            || msg.contains("dns")
+                            || msg.contains("resolve")
+                        {
+                            let prev = stats.err_connect.fetch_add(1, Ordering::Relaxed);
+                            if prev == 0 {
+                                eprintln!("[Download] first connect error: z={}/x={}/y={} — {}",
+                                    zoom, tx, ty, msg);
+                            }
+                        } else {
+                            let prev = stats.err_other.fetch_add(1, Ordering::Relaxed);
+                            if prev == 0 {
+                                eprintln!("[Download] first unknown error: z={}/x={}/y={} — {}",
+                                    zoom, tx, ty, msg);
+                            }
+                        }
+                    }
+                }
+
+                // Warn about individually slow tiles.
+                if tile_us > 5_000_000 {
+                    let prev = stats.slow_logged.fetch_add(1, Ordering::Relaxed);
+                    if prev < 5 {
+                        eprintln!("[Download] SLOW tile z={}/x={}/y={}: {:.1}s",
+                            zoom, tx, ty, tile_us as f64 / 1_000_000.0);
+                    } else if prev == 5 {
+                        eprintln!("[Download] (suppressing further slow-tile warnings)");
+                    }
+                }
+
+                // Enhanced progress line with running throughput + error count.
+                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                let pct = done * 100 / total;
+                let prev_pct = (done - 1) * 100 / total;
+
+                // Fire callback every 5%
+                if let Some(cb) = on_progress {
+                    if pct / 5 > prev_pct / 5 || done == total || done == 1 {
+                        cb(done, total);
+                    }
+                }
+
+                if pct / 10 > prev_pct / 10 || done == total {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64
+                        / (1024.0 * 1024.0);
+                    let tp = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
+                    let errs = stats.total_errors();
+                    let in_fl = stats.in_flight.load(Ordering::Relaxed);
+                    eprintln!(
+                        "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight",
+                        pct, done, total, tp, errs, in_fl
+                    );
+                }
+
+                (tx, ty, result)
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await
+}
+
+// -- Browser-native batch download (WASM only) ----------------------------------
+//
+// Bypasses reqwest. Uses browser-native fetch() via Promise.allSettled.
+// Domain sharding spreads tiles across multiple S3 hostnames to increase the
+// browser's per-origin connection/stream budget.
+
+/// Given an S3 path-style or virtual-hosted URL template, return multiple
+/// equivalent URL templates using different S3 hostnames for domain sharding.
+/// Falls back to a single template if the URL isn't recognised as S3.
+#[cfg(target_arch = "wasm32")]
+fn shard_s3_templates(url_template: &str) -> Vec<String> {
+    // Try path-style: https://s3.amazonaws.com/BUCKET/path...
+    if let Some(rest) = url_template.strip_prefix("https://s3.amazonaws.com/") {
+        if let Some((bucket, path)) = rest.split_once('/') {
+            return make_s3_shards(bucket, path);
+        }
+    }
+    // Try virtual-hosted: https://BUCKET.s3.amazonaws.com/path...
+    if let Some(rest) = url_template.strip_prefix("https://") {
+        if let Some((host, path)) = rest.split_once('/') {
+            if let Some(bucket) = host.strip_suffix(".s3.amazonaws.com") {
+                return make_s3_shards(bucket, path);
+            }
+        }
+    }
+    vec![url_template.to_string()]
+}
+
+#[cfg(target_arch = "wasm32")]
+fn make_s3_shards(bucket: &str, path: &str) -> Vec<String> {
+    vec![
+        format!("https://s3.amazonaws.com/{bucket}/{path}"),
+        format!("https://{bucket}.s3.amazonaws.com/{path}"),
+        format!("https://s3.us-east-1.amazonaws.com/{bucket}/{path}"),
+        format!("https://{bucket}.s3.us-east-1.amazonaws.com/{path}"),
+        format!("https://s3.dualstack.us-east-1.amazonaws.com/{bucket}/{path}"),
+        format!("https://{bucket}.s3.dualstack.us-east-1.amazonaws.com/{path}"),
+    ]
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn download_all_tiles_web(
+    url_template: &str,
+    zoom: u32,
+    x0: u32, x1: u32,
+    y0: u32, y1: u32,
+    max_concurrent: usize,
+    stats: &DownloadStats,
+    start_time: Instant,
+    js_progress: Option<&js_sys::Function>,
+) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let nx = (x1 - x0 + 1) as usize;
+    let ny = (y1 - y0 + 1) as usize;
+    let total = nx * ny;
+    let mut result_map = std::collections::HashMap::with_capacity(total);
+
+    // Domain sharding: expand single S3 URL into multiple hostnames.
+    // Browser allows 6 HTTP/1.1 connections per hostname.
+    let templates = shard_s3_templates(url_template);
+    let shard_count = templates.len();
+    if shard_count > 1 {
+        eprintln!("[DownloadWeb] Domain sharding: {} hostnames × 6 conn = {} concurrent",
+            shard_count, shard_count * 6);
+    }
+
+    // Build all tile URLs, round-robin across shards.
+    let tile_info: Vec<(u32, u32, String)> = (y0..=y1)
+        .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
+        .enumerate()
+        .map(|(i, (tx, ty))| {
+            let url = templates[i % shard_count]
+                .replace("{z}", &zoom.to_string())
+                .replace("{x}", &tx.to_string())
+                .replace("{y}", &ty.to_string());
+            (tx, ty, url)
+        })
+        .collect();
+
+    // ── Concurrency: saturate the browser's HTTP/2 stream budget ──
+    // HTTP/2 multiplexes ~100 streams per connection.  Domain sharding
+    // adds parallel TCP connections when the browser uses HTTP/1.1.
+    // A high in-flight count fills the pipe regardless of protocol.
+    let concurrency = total.min(max_concurrent);
+
+    // ── Streaming fetch pool with retry + 5 % progress ─────────
+    // Each failed tile retries up to 3× with exponential backoff
+    // (500 ms, 1 s, 1.5 s).  `prog(phase, done, total)` is called
+    // every 5 % of tiles (plus first and last) so the UI stays live.
+    let fetch_pool = js_sys::Function::new_with_args(
+        "urls,conc,prog",
+        "return new Promise(function(resolve){\
+            var r=new Array(urls.length),n=0,d=0,t=urls.length,lp=-1;\
+            function doFetch(i,retries){\
+                fetch(urls[i]).then(function(resp){\
+                    if(!resp.ok)throw new Error('HTTP '+resp.status);\
+                    return resp.arrayBuffer();\
+                }).then(function(buf){\
+                    r[i]={status:'fulfilled',value:buf};\
+                    fin();\
+                }).catch(function(err){\
+                    if(retries>0){\
+                        setTimeout(function(){doFetch(i,retries-1)},(4-retries)*500);\
+                    }else{\
+                        r[i]={status:'rejected',reason:String(err)};\
+                        fin();\
+                    }\
+                });\
+            }\
+            function fin(){\
+                d++;\
+                var p5=Math.floor(d*20/t);\
+                if(prog&&(p5>lp||d===t||d===1)){lp=p5;try{prog(0,d,t)}catch(x){}}\
+                if(d===t){\
+                    try{\
+                        var e=performance.getEntriesByType('resource'),p={};\
+                        for(var j=Math.max(0,e.length-t);j<e.length;j++){\
+                            var k=e[j].nextHopProtocol||'?';p[k]=(p[k]||0)+1;}\
+                        console.log('[AETHER] tile protocols:',JSON.stringify(p));\
+                    }catch(x){}\
+                    resolve(r);\
+                }else go();\
+            }\
+            function go(){\
+                if(n>=t)return;\
+                var i=n++;\
+                doFetch(i,3);\
+            }\
+            for(var i=0;i<Math.min(conc,t);i++)go();\
+        })",
+    );
+
+    // Build JS URL array — all tiles at once, no batching.
+    let js_urls = js_sys::Array::new_with_length(total as u32);
+    for (i, (_, _, url)) in tile_info.iter().enumerate() {
+        js_urls.set(i as u32, wasm_bindgen::JsValue::from_str(url));
+    }
+
+    eprintln!("[DownloadWeb] Fetching {} tiles, concurrency={}", total, concurrency);
+
+    let prog_val: wasm_bindgen::JsValue = match js_progress {
+        Some(f) => f.clone().into(),
+        None => wasm_bindgen::JsValue::NULL,
+    };
+    let promise = match fetch_pool.call3(
+        &wasm_bindgen::JsValue::NULL,
+        &js_urls,
+        &wasm_bindgen::JsValue::from(concurrency as u32),
+        &prog_val,
+    ) {
+        Ok(p) => js_sys::Promise::from(p),
+        Err(e) => {
+            eprintln!("[DownloadWeb] Failed to start pool: {:?}", e);
+            stats.err_other.fetch_add(total, Ordering::Relaxed);
+            return result_map;
+        }
+    };
+
+    match JsFuture::from(promise).await {
+        Ok(settled) => {
+            let arr: js_sys::Array = settled.unchecked_into();
+            for (i, (tx, ty, _)) in tile_info.iter().enumerate() {
+                let entry = arr.get(i as u32);
+                let status = js_sys::Reflect::get(&entry, &"status".into())
+                    .ok()
+                    .and_then(|s| s.as_string())
+                    .unwrap_or_default();
+
+                if status == "fulfilled" {
+                    let value = js_sys::Reflect::get(&entry, &"value".into()).unwrap();
+                    let bytes = js_sys::Uint8Array::new(&value).to_vec();
+                    stats.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    stats.ok_count.fetch_add(1, Ordering::Relaxed);
+                    result_map.insert((*tx, *ty), bytes);
+                } else {
+                    let reason = js_sys::Reflect::get(&entry, &"reason".into())
+                        .ok()
+                        .and_then(|r| {
+                            r.dyn_ref::<js_sys::Error>()
+                                .map(|e| String::from(e.message()))
+                                .or_else(|| r.as_string())
+                        })
+                        .unwrap_or_else(|| "unknown".into());
+
+                    if reason.contains("429") {
+                        stats.err_http_429.fetch_add(1, Ordering::Relaxed);
+                    } else if reason.contains("HTTP 5") {
+                        stats.err_http_5xx.fetch_add(1, Ordering::Relaxed);
+                    } else if reason.contains("HTTP 4") {
+                        stats.err_http_4xx.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats.err_other.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[DownloadWeb] Pool rejected: {:?}", e);
+            stats.err_other.fetch_add(total, Ordering::Relaxed);
+        }
+    }
+
+    // Signal download-phase completion (phase 0).
+    if let Some(f) = js_progress {
+        let _ = f.call3(
+            &wasm_bindgen::JsValue::NULL,
+            &wasm_bindgen::JsValue::from(0u32),
+            &wasm_bindgen::JsValue::from(total as u32),
+            &wasm_bindgen::JsValue::from(total as u32),
+        );
+    }
+
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "[DownloadWeb] {:.1} MB in {:.1}s = {:.1} MB/s ({:.0} Mbit/s), {}/{} OK",
+        mb, elapsed,
+        if elapsed > 0.0 { mb / elapsed } else { 0.0 },
+        if elapsed > 0.0 { mb * 8.0 / elapsed } else { 0.0 },
+        result_map.len(), total,
+    );
+
+    result_map
 }
 
 // -- Entry point (sync wrapper around async) ----------------------------------
@@ -660,7 +1098,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         tokio::spawn(async move {
             download_strip(
                 &cl, &ut, zoom, x0, x1, sy0, sy1, dec, conns, &pr, total, &st, start_time,
-                &sem,
+                &sem, None,
             )
             .await
         })
@@ -778,9 +1216,10 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                     for tr in 0..sny {
                         let ty = sy0 + tr as u32;
 
-                        // Fill mini-grid from tiles. Vec allocation zeroed it initially;
-                        // subsequent iterations reuse previous data (overwritten by copy_from_slice).
-                        // Skipping fill(0.0) saves 36 MB memset and keeps grid hot in L3.
+                        // Clear mini-grid so failed tiles don't leak stale data
+                        // from previous tile-rows.
+                        mini_grid.fill(0.0);
+
                         for &(tx, elev) in &tiles_by_row[tr] {
                             let col = (tx - x0) as usize * 256;
                             for py in 0..256usize {
@@ -813,8 +1252,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                                 (0..sz).filter_map(|y| {
                                     let lat = spec.ul_lat - (y as f64 + 0.5) * pd;
                                     if lat > tr_top || lat <= tr_bot { return None; }
-                                    let gr = ((tr_top - lat) / tr_spy).round() as usize;
-                                    if gr >= 256 { return None; }
+                                    let gr = (((tr_top - lat) / tr_spy).round() as usize).min(255);
 
                                     let row_off = gr * gw;
                                     let mut row_data = vec![0i16; sz];
@@ -901,10 +1339,17 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
 pub async fn run_download_mem(
     job: &DownloadJob,
     client: &reqwest::Client,
+    #[cfg(not(target_arch = "wasm32"))]
+    on_progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
+    #[cfg(target_arch = "wasm32")]
     on_progress: Option<&dyn Fn(usize, usize)>,
+    // Raw JS callback for WASM progress: (phase: u32, done: u32, total: u32).
+    // Phase 0 = download, 1 = decode.
+    #[cfg(target_arch = "wasm32")]
+    js_progress: Option<&js_sys::Function>,
 ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
     let start = Instant::now();
-    let conns = job.max_connections.unwrap_or(64);
+    let conns = job.max_connections.unwrap_or(256);
 
     let dec: fn(u8, u8, u8) -> f32 = match job.encoding.to_lowercase().as_str() {
         "terrarium" => dec_terrarium,
@@ -1004,21 +1449,112 @@ pub async fn run_download_mem(
     }
 
     let zoom = job.zoom;
-    let progress = Arc::new(AtomicUsize::new(0));
     let stats = Arc::new(DownloadStats::new());
+
+    // Report 0% immediately
+    if let Some(cb) = &on_progress { cb(0, total); }
+
+    // ── WASM: batch-download ALL tiles via browser fetch ────────
+    // Bypasses reqwest; hands every URL to the browser in one JS call.
+    #[cfg(target_arch = "wasm32")]
+    let mut tile_cache = download_all_tiles_web(
+        &job.url_template, zoom, x0, x1, y0, y1,
+        conns.min(200),
+        &stats, start, js_progress,
+    ).await;
+    #[cfg(target_arch = "wasm32")]
+    let _ = client; // browser fetch bypasses reqwest
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let progress = Arc::new(AtomicUsize::new(0));
+    #[cfg(not(target_arch = "wasm32"))]
     let semaphore = Arc::new(Semaphore::new(conns));
 
-    // 6. Process strips sequentially (no prefetch pipeline — WASM single-threaded).
+    // 6. Process strips — decode + assemble into .abt buffers.
+    //
+    // WASM: tiles already downloaded via download_all_tiles_web (browser fetch).
+    //       Strip loop only decodes PNGs and assembles.
+    // Native: downloads per-strip via reqwest (download_strip_raw), then decodes.
     let mut mini_grid = vec![0.0f32; gw * 256];
+
+    #[cfg(target_arch = "wasm32")]
+    let mut decoded_count: usize = 0;
+    #[cfg(target_arch = "wasm32")]
+    let mut last_decode_pct5: usize = 0;
 
     for (strip_idx, &(sy0, sy1)) in strips.iter().enumerate() {
         let sny = (sy1 - sy0 + 1) as usize;
 
-        // Download this strip.
-        let results = download_strip(
+        // ── Get raw tile data ───────────────────────────────────
+        #[cfg(target_arch = "wasm32")]
+        let raw_results: Vec<(u32, u32, Result<Vec<u8>>)> = (sy0..=sy1)
+            .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
+            .map(|(tx, ty)| match tile_cache.remove(&(tx, ty)) {
+                Some(bytes) => (tx, ty, Ok(bytes)),
+                None => (tx, ty, Err(anyhow::anyhow!("download failed"))),
+            })
+            .collect();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let raw_results = download_strip_raw(
             client, &job.url_template, zoom, x0, x1, sy0, sy1,
-            dec, conns, &progress, total, &stats, start, &semaphore,
+            conns, &progress, total, &stats, start, &semaphore,
+            on_progress,
         ).await;
+
+        // Phase 2: Decode PNGs sequentially, then classify decode errors.
+
+        let mut results: Vec<(u32, u32, Result<Vec<f32>>)> =
+            Vec::with_capacity(raw_results.len());
+        for (tx, ty, raw) in raw_results {
+            match raw {
+                Ok(png_bytes) => {
+                    match decode_png(&png_bytes, dec) {
+                        Ok(elev) => {
+                            results.push((tx, ty, Ok(elev)));
+
+                            // Report decode progress every 5 % (phase 1).
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                decoded_count += 1;
+                                if let Some(f) = js_progress {
+                                    let pct5 = if total > 0 { decoded_count * 20 / total } else { 0 };
+                                    if pct5 > last_decode_pct5 || decoded_count == total || decoded_count == 1 {
+                                        last_decode_pct5 = pct5;
+                                        let _ = f.call3(
+                                            &wasm_bindgen::JsValue::NULL,
+                                            &wasm_bindgen::JsValue::from(1u32),
+                                            &wasm_bindgen::JsValue::from(decoded_count as u32),
+                                            &wasm_bindgen::JsValue::from(total as u32),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            #[cfg(target_arch = "wasm32")]
+                            { decoded_count += 1; }
+
+                            let prev = stats.err_decode.fetch_add(1, Ordering::Relaxed);
+                            // Undo ok_count credited during download
+                            // (HTTP fetch succeeded, but PNG decode failed).
+                            stats.ok_count.fetch_sub(1, Ordering::Relaxed);
+                            if prev == 0 {
+                                eprintln!(
+                                    "[Download] first decode error: z={}/x={}/y={} — {:#}",
+                                    zoom, tx, ty, e
+                                );
+                            }
+                            results.push((tx, ty, Err(e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Network error — already classified by download_strip_raw.
+                    results.push((tx, ty, Err(e)));
+                }
+            }
+        }
 
         let strip_ok = results.iter().filter(|(_, _, r)| r.is_ok()).count();
         let strip_total = results.len();
@@ -1026,11 +1562,6 @@ pub async fn run_download_mem(
         if strip_err > 0 {
             eprintln!("[StripMem {}/{}] {} tiles: {} ok, {} FAILED",
                 strip_idx + 1, strips.len(), strip_total, strip_ok, strip_err);
-        }
-
-        // Report progress to caller
-        if let Some(cb) = &on_progress {
-            cb(progress.load(Ordering::Relaxed), total);
         }
 
         // Group tiles by row within the strip.
@@ -1044,6 +1575,10 @@ pub async fn run_download_mem(
         // Process one tile-row at a time.
         for tr in 0..sny {
             let ty = sy0 + tr as u32;
+
+            // Clear mini-grid so failed tiles don't leak stale data
+            // from previous tile-rows.
+            mini_grid.fill(0.0);
 
             // Fill mini-grid from downloaded tile data.
             for &(tx, elev) in &tiles_by_row[tr] {
@@ -1073,8 +1608,7 @@ pub async fn run_download_mem(
                 for y in 0..sz {
                     let lat = abt.ul_lat - (y as f64 + 0.5) * abt.pd;
                     if lat > tr_top || lat <= tr_bot { continue; }
-                    let gr = ((tr_top - lat) / tr_spy).round() as usize;
-                    if gr >= 256 { continue; }
+                    let gr = (((tr_top - lat) / tr_spy).round() as usize).min(255);
 
                     let row_off = gr * gw;
                     let buf_offset = 44 + y * abt.stride;
@@ -1094,6 +1628,17 @@ pub async fn run_download_mem(
                     // Stride padding is already zeroed from vec![0u8; ...].
                 }
             }
+        }
+
+        // Report assembly progress per strip (phase 2).
+        #[cfg(target_arch = "wasm32")]
+        if let Some(f) = js_progress {
+            let _ = f.call3(
+                &wasm_bindgen::JsValue::NULL,
+                &wasm_bindgen::JsValue::from(2u32),
+                &wasm_bindgen::JsValue::from((strip_idx + 1) as u32),
+                &wasm_bindgen::JsValue::from(strips.len() as u32),
+            );
         }
     }
 
