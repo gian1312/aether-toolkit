@@ -3,15 +3,10 @@ use aether_converter::download::{
     DownloadJob, run_download_mem, lon2tx, lat2ty, ty2lat, tx2lon,
 };
 use aether_converter::mvt;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use serde::Deserialize;
+use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{Cursor, Write};
 
 /// Download terrain tiles and convert to .abt format in memory.
-/// job_json: JSON string matching DownloadJob schema.
-/// on_progress: optional JS callback `(phase, done, total)` called during
-///   download (phase 0, every 5 %) and decode (phase 1, every 5 %).
-/// Returns: JS object mapping filename → Uint8Array of .abt bytes.
 #[wasm_bindgen]
 pub async fn download_terrain(
     job_json: &str,
@@ -24,14 +19,9 @@ pub async fn download_terrain(
         .build()
         .map_err(|e| JsValue::from_str(&format!("HTTP client error: {e}")))?;
 
-    let result = run_download_mem(
-        &job,
-        &client,
-        None,                    // Rust callback unused — js_progress handles everything
-        on_progress.as_ref(),    // raw JS function passed directly to fetch pool + decode loop
-    )
-    .await
-    .map_err(|e| JsValue::from_str(&format!("Download failed: {e}")))?;
+    let result = run_download_mem(&job, &client, None, on_progress.as_ref())
+        .await
+        .map_err(|e| JsValue::from_str(&format!("Download failed: {e}")))?;
 
     let obj = js_sys::Object::new();
     for (name, data) in result {
@@ -45,16 +35,7 @@ pub async fn download_terrain(
 // ── Assemble pre-decoded tiles into .abt buffers ─────────────
 
 /// Assemble terrain from pre-decoded f32 elevation tiles (from Web Workers)
-/// into .abt binary buffers.  Runs only the resampling / assembly step —
-/// no network I/O, no PNG decode.
-///
-/// * `job_json`  — Same DownloadJob JSON as `download_terrain`.
-/// * `tile_xs`, `tile_ys` — Parallel arrays of XYZ tile x/y coordinates.
-/// * `tile_data` — Array of Float32Array(65536) per tile (256×256 elevations).
-/// * `on_progress` — Optional `(done, total)` callback for assembly progress.
-///
-/// Returns: JS object mapping filename → Uint8Array of .abt bytes (same
-///          format as `download_terrain`).
+/// into .abt binary buffers.
 #[wasm_bindgen]
 pub fn assemble_terrain(
     job_json: &str,
@@ -70,7 +51,6 @@ pub fn assemble_terrain(
         return Err(JsValue::from_str("tile_xs/tile_ys/tile_data length mismatch"));
     }
 
-    // 1. Full bbox across all output sub-tiles.
     let (mut bb_s, mut bb_n, mut bb_w, mut bb_e) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     for t in &job.tiles {
         let pd = t.resolution_m / 111_111.0;
@@ -81,7 +61,6 @@ pub fn assemble_terrain(
         bb_e = bb_e.max(t.ul_lon + sp);
     }
 
-    // 2. Tile range.
     let zoom = job.zoom;
     let (x0, x1) = (lon2tx(bb_w, zoom), lon2tx(bb_e, zoom));
     let (y0, y1) = (lat2ty(bb_n, zoom), lat2ty(bb_s, zoom));
@@ -91,14 +70,12 @@ pub fn assemble_terrain(
     let gw = nx * 256;
     let gpx = (glr_lon - gul_lon) / gw as f64;
 
-    // 3. Index decoded tiles by (x, y).
     let mut tile_map: std::collections::HashMap<(u32, u32), Vec<f32>> =
         std::collections::HashMap::with_capacity(tile_xs.len());
     for i in 0..tile_xs.len() {
         tile_map.insert((tile_xs[i], tile_ys[i]), tile_data[i].to_vec());
     }
 
-    // 4. Prepare in-memory .abt buffers.
     struct MemAbt {
         filename: String,
         buf: Vec<u8>,
@@ -115,9 +92,7 @@ pub fn assemble_terrain(
         let stride = (bpr + 255) & !255;
         let total_bytes = 44 + stride * spec.size_px as usize;
         let mut buf = vec![0u8; total_bytes];
-        // 44-byte .abt header
         {
-            use byteorder::WriteBytesExt;
             let mut c = Cursor::new(&mut buf[..44]);
             c.write_all(b"AETH").unwrap();
             c.write_u16::<LittleEndian>(1).unwrap();
@@ -135,7 +110,6 @@ pub fn assemble_terrain(
         });
     }
 
-    // 5. Pre-compute x-lookup tables.
     let x_luts: Vec<Vec<usize>> = abt_bufs.iter().map(|abt| {
         let sz = abt.size_px as usize;
         (0..sz).map(|x| {
@@ -144,7 +118,6 @@ pub fn assemble_terrain(
         }).collect()
     }).collect();
 
-    // 6. Build strip ranges.
     let strip_rows: u32 = 32;
     let mut strips: Vec<(u32, u32)> = Vec::new();
     {
@@ -157,13 +130,10 @@ pub fn assemble_terrain(
     }
     let total_strips = strips.len();
 
-    // 7. Resample decoded tiles into .abt buffers (strip-by-strip).
     let mut mini_grid = vec![0.0f32; gw * 256];
 
     for (strip_idx, &(sy0, sy1)) in strips.iter().enumerate() {
         let sny = (sy1 - sy0 + 1) as usize;
-
-        // Group tiles by row within the strip.
         let mut tiles_by_row: Vec<Vec<(u32, &[f32])>> = vec![Vec::new(); sny];
         for ty in sy0..=sy1 {
             for tx in x0..=x1 {
@@ -173,11 +143,9 @@ pub fn assemble_terrain(
             }
         }
 
-        // Process one tile-row at a time.
         for tr in 0..sny {
             let ty = sy0 + tr as u32;
             mini_grid.fill(0.0);
-
             for &(tx, elev) in &tiles_by_row[tr] {
                 let col = (tx - x0) as usize * 256;
                 for py in 0..256usize {
@@ -217,7 +185,6 @@ pub fn assemble_terrain(
             }
         }
 
-        // Report assembly progress per strip.
         if let Some(ref f) = on_progress {
             let _ = f.call2(
                 &JsValue::NULL,
@@ -227,7 +194,6 @@ pub fn assemble_terrain(
         }
     }
 
-    // 8. Build result object.
     let obj = js_sys::Object::new();
     for abt in abt_bufs {
         let arr = js_sys::Uint8Array::from(&abt.buf[..]);
@@ -237,276 +203,74 @@ pub fn assemble_terrain(
     Ok(obj.into())
 }
 
-/// Get tile coordinate range for a bounding box at a given zoom level.
-/// Returns [x_min, y_min, x_max, y_max] as u32 array.
+// ── Coordinate utilities ─────────────────────────────────────
+
 #[wasm_bindgen]
 pub fn tile_range(south: f64, north: f64, west: f64, east: f64, zoom: u32) -> Vec<u32> {
-    vec![
-        lon2tx(west, zoom),
-        lat2ty(north, zoom),
-        lon2tx(east, zoom),
-        lat2ty(south, zoom),
-    ]
+    vec![lon2tx(west, zoom), lat2ty(north, zoom), lon2tx(east, zoom), lat2ty(south, zoom)]
 }
 
-/// Convert resolution in meters to optimal zoom level.
-/// Capped at zoom 15 (Terrarium max).
 #[wasm_bindgen]
 pub fn zoom_for_resolution(resolution_m: f64, lat: f64) -> u32 {
     ((40_075_000.0 * lat.to_radians().cos()) / (resolution_m * 256.0))
-        .log2()
-        .ceil()
-        .min(15.0) as u32
+        .log2().ceil().min(15.0) as u32
 }
 
-/// Convert tile Y to latitude (north edge of tile).
 #[wasm_bindgen]
-pub fn tile_y_to_lat(y: u32, z: u32) -> f64 {
-    ty2lat(y, z)
-}
+pub fn tile_y_to_lat(y: u32, z: u32) -> f64 { ty2lat(y, z) }
 
-/// Convert tile X to longitude (west edge of tile).
 #[wasm_bindgen]
-pub fn tile_x_to_lon(x: u32, z: u32) -> f64 {
-    tx2lon(x, z)
-}
+pub fn tile_x_to_lon(x: u32, z: u32) -> f64 { tx2lon(x, z) }
 
-// ── Building rasterization (ported from ingest.rs) ──────────
+// ── Building integration ─────────────────────────────────────
+// All logic lives in aether_converter::mvt. These are thin JS↔Rust wrappers.
 
-#[derive(Deserialize)]
-struct BuildingPoly {
-    /// Outer ring as flat [lon, lat, lon, lat, ...] array
-    coords: Vec<f64>,
-    /// Building roof height in meters AMSL
-    height_m: f64,
-}
-
-/// Apply building heights to an .abt tile buffer in-place.
-///
-/// Reads the 44-byte .abt header to determine tile bounds and resolution,
-/// then rasterizes each building polygon onto the i16 elevation grid
-/// using the same point-in-polygon scanline logic as aether_converter's
-/// native `process_geometry_wgs84` in ingest.rs.
-///
-/// buildings_json: JSON array of `{ coords: [lon,lat,...], height_m: f64 }`
-/// Returns the MODIFIED tile data (wasm_bindgen copies &mut [u8] in, never copies back).
+/// Apply buildings from PBF vector tiles to ALL .abt tile buffers at once.
+/// Wrapper around `mvt::apply_buildings_to_abt_tiles`.
 #[wasm_bindgen]
-pub fn apply_buildings(
-    tile_data: &[u8],
-    buildings_json: &str,
-) -> Result<js_sys::Uint8Array, JsValue> {
-    let buildings: Vec<BuildingPoly> = serde_json::from_str(buildings_json)
-        .map_err(|e| JsValue::from_str(&format!("Invalid buildings JSON: {e}")))?;
-
-    if buildings.is_empty() || tile_data.len() < 44 {
-        return Ok(js_sys::Uint8Array::from(tile_data));
-    }
-
-    let mut buf = tile_data.to_vec();
-
-    // Parse .abt header
-    let mut c = Cursor::new(&tile_data[4..44]);
-    let _version = c.read_u16::<LittleEndian>().unwrap();
-    let size_px = c.read_u16::<LittleEndian>().unwrap() as u32;
-    let ul_lat = c.read_f64::<LittleEndian>().unwrap();
-    let ul_lon = c.read_f64::<LittleEndian>().unwrap();
-    let scale_y = c.read_f64::<LittleEndian>().unwrap();
-    let _scale_x_raw = c.read_f64::<LittleEndian>().unwrap();
-    let _base_elev = c.read_i16::<LittleEndian>().unwrap();
-    let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
-
-    // .abt header stores same pd for both scales. Compute correct lon scale.
-    let scale_x = scale_y / ul_lat.to_radians().cos();
-
-    let mut total_modified: u32 = 0;
-
-    for bldg in &buildings {
-        let n_verts = bldg.coords.len() / 2;
-        if n_verts < 3 { continue; }
-
-        let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(n_verts);
-        let mut min_x = size_px as f64;
-        let mut max_x = 0.0f64;
-        let mut min_y = size_px as f64;
-        let mut max_y = 0.0f64;
-
-        for i in 0..n_verts {
-            let lon = bldg.coords[i * 2];
-            let lat = bldg.coords[i * 2 + 1];
-            let px = (lon - ul_lon) / scale_x;
-            let py = (ul_lat - lat) / scale_y;
-            min_x = min_x.min(px);
-            max_x = max_x.max(px);
-            min_y = min_y.min(py);
-            max_y = max_y.max(py);
-            vertices.push((px, py));
-        }
-
-        // Quick bbox rejection
-        if max_x < 0.0 || min_x >= size_px as f64 || max_y < 0.0 || min_y >= size_px as f64 {
-            continue;
-        }
-
-        let start_x = (min_x.floor().max(0.0)) as u32;
-        let end_x = (max_x.ceil().min(size_px as f64)) as u32;
-        let start_y = (min_y.floor().max(0.0)) as u32;
-        let end_y = (max_y.ceil().min(size_px as f64)) as u32;
-
-        // height_m is building height ABOVE GROUND (from OSM tags).
-        // Add it on top of the current terrain elevation (i16 = meters × 2).
-        let bldg_h_i16 = (bldg.height_m * 2.0).round() as i16;
-        if bldg_h_i16 <= 0 { continue; }
-
-        for y in start_y..end_y {
-            let py_center = y as f64 + 0.5;
-            for x in start_x..end_x {
-                if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
-                    let offset = 44 + y as usize * stride + x as usize * 2;
-                    if offset + 1 < buf.len() {
-                        let current = i16::from_le_bytes([buf[offset], buf[offset + 1]]);
-                        let with_building = current.saturating_add(bldg_h_i16);
-                        buf[offset..offset + 2].copy_from_slice(&with_building.to_le_bytes());
-                        total_modified += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    if total_modified > 0 {
-        web_sys::console::log_1(
-            &format!("[AETHER] apply_buildings: {} pixels modified across {} buildings",
-                     total_modified, buildings.len()).into(),
-        );
-    }
-
-    Ok(js_sys::Uint8Array::from(&buf[..]))
-}
-
-fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
-    let mut inside = false;
-    let mut j = poly.len() - 1;
-    for i in 0..poly.len() {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        let intersect = ((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-        if intersect { inside = !inside; }
-        j = i;
-    }
-    inside
-}
-
-// ── PBF-based building application ─────────────────────────────
-
-/// Apply buildings from OpenFreeMap PBF vector tiles to an .abt tile buffer.
-///
-/// Decodes the `building` layer from each PBF tile, extracts polygon geometry
-/// + heights, and rasterizes onto the .abt elevation grid.  All decoding and
-/// rasterization happens in Rust — no JS building decode needed.
-///
-/// * `tile_data` — .abt tile buffer (44-byte header + i16 elevation grid)
-/// * `pbf_tiles` — Array of raw PBF tile bytes (one per vector tile)
-/// * `pbf_xs`, `pbf_ys` — Tile x/y coordinates for each PBF tile
-/// * `pbf_zoom` — Zoom level of the PBF tiles (typically 14)
-///
-/// Returns the modified .abt tile buffer.
-#[wasm_bindgen]
-pub fn apply_buildings_pbf(
-    tile_data: &[u8],
+pub fn apply_buildings_pbf_batch(
+    abt_tiles: Vec<js_sys::Uint8Array>,
     pbf_tiles: Vec<js_sys::Uint8Array>,
     pbf_xs: &[u32],
     pbf_ys: &[u32],
     pbf_zoom: u32,
-) -> Result<js_sys::Uint8Array, JsValue> {
-    if tile_data.len() < 44 {
-        return Ok(js_sys::Uint8Array::from(tile_data));
-    }
+) -> Result<js_sys::Array, JsValue> {
     if pbf_tiles.len() != pbf_xs.len() || pbf_tiles.len() != pbf_ys.len() {
         return Err(JsValue::from_str("pbf_tiles/pbf_xs/pbf_ys length mismatch"));
     }
 
-    let mut buf = tile_data.to_vec();
+    let pbf_vecs: Vec<Vec<u8>> = pbf_tiles.iter().map(|t| t.to_vec()).collect();
+    let mut abt_bufs: Vec<Vec<u8>> = abt_tiles.iter().map(|t| t.to_vec()).collect();
 
-    // Parse .abt header
-    let mut c = Cursor::new(&tile_data[4..44]);
-    let _version = c.read_u16::<LittleEndian>().unwrap();
-    let size_px = c.read_u16::<LittleEndian>().unwrap() as u32;
-    let ul_lat = c.read_f64::<LittleEndian>().unwrap();
-    let ul_lon = c.read_f64::<LittleEndian>().unwrap();
-    let scale_y = c.read_f64::<LittleEndian>().unwrap();
-    let _scale_x_raw = c.read_f64::<LittleEndian>().unwrap();
-    let _base_elev = c.read_i16::<LittleEndian>().unwrap();
-    let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
+    let stats = mvt::apply_buildings_to_abt_tiles(&mut abt_bufs, &pbf_vecs, pbf_xs, pbf_ys, pbf_zoom);
 
-    // .abt header stores same pd for both scales. Compute correct lon scale.
-    let scale_x = scale_y / ul_lat.to_radians().cos();
-
-    // Decode ALL PBF tiles once into a single building list.
-    let mut all_buildings: Vec<mvt::BuildingPolygon> = Vec::new();
-    for i in 0..pbf_tiles.len() {
-        let pbf_bytes = pbf_tiles[i].to_vec();
-        if let Ok(buildings) = mvt::extract_buildings_from_pbf(&pbf_bytes, pbf_xs[i], pbf_ys[i], pbf_zoom) {
-            all_buildings.extend(buildings);
-        }
+    web_sys::console::log_1(&format!(
+        "[AETHER] Buildings: {} decoded, {} after dedup",
+        stats.buildings_decoded, stats.buildings_after_dedup
+    ).into());
+    for (i, &(hits, pixels)) in stats.per_tile.iter().enumerate() {
+        web_sys::console::log_1(&format!(
+            "[AETHER] .abt tile {}: {} buildings, {} pixels", i, hits, pixels
+        ).into());
     }
 
-    let total_buildings = all_buildings.len();
-    let mut total_modified = 0u32;
-
-    // Rasterize decoded buildings onto this .abt tile.
-    for bldg in &all_buildings {
-        if bldg.coords.len() < 3 { continue; }
-
-        let bldg_h_i16 = (bldg.height_m * 2.0).round() as i16;
-        if bldg_h_i16 <= 0 { continue; }
-
-        let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(bldg.coords.len());
-        let mut min_x = size_px as f64;
-        let mut max_x = 0.0f64;
-        let mut min_y = size_px as f64;
-        let mut max_y = 0.0f64;
-
-        for &(lon, lat) in &bldg.coords {
-            let px = (lon - ul_lon) / scale_x;
-            let py = (ul_lat - lat) / scale_y;
-            min_x = min_x.min(px);
-            max_x = max_x.max(px);
-            min_y = min_y.min(py);
-            max_y = max_y.max(py);
-            vertices.push((px, py));
-        }
-
-        if max_x < 0.0 || min_x >= size_px as f64 || max_y < 0.0 || min_y >= size_px as f64 {
-            continue;
-        }
-
-        let start_x = (min_x.floor().max(0.0)) as u32;
-        let end_x = (max_x.ceil().min(size_px as f64)) as u32;
-        let start_y = (min_y.floor().max(0.0)) as u32;
-        let end_y = (max_y.ceil().min(size_px as f64)) as u32;
-
-        for y in start_y..end_y {
-            let py_center = y as f64 + 0.5;
-            for x in start_x..end_x {
-                if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
-                    let offset = 44 + y as usize * stride + x as usize * 2;
-                    if offset + 1 < buf.len() {
-                        let current = i16::from_le_bytes([buf[offset], buf[offset + 1]]);
-                        let with_building = current.saturating_add(bldg_h_i16);
-                        buf[offset..offset + 2].copy_from_slice(&with_building.to_le_bytes());
-                        total_modified += 1;
-                    }
-                }
-            }
-        }
+    let result = js_sys::Array::new_with_length(abt_bufs.len() as u32);
+    for (i, buf) in abt_bufs.iter().enumerate() {
+        result.set(i as u32, js_sys::Uint8Array::from(&buf[..]).into());
     }
+    Ok(result)
+}
 
-    if total_buildings > 0 {
-        web_sys::console::log_1(
-            &format!("[AETHER] apply_buildings_pbf: {} buildings decoded, {} pixels modified",
-                     total_buildings, total_modified).into(),
-        );
-    }
-
-    Ok(js_sys::Uint8Array::from(&buf[..]))
+/// Decode PBF building tiles and return GeoJSON FeatureCollection.
+/// Wrapper around `mvt::decode_buildings_to_geojson`.
+#[wasm_bindgen]
+pub fn decode_buildings_geojson(
+    pbf_tiles: Vec<js_sys::Uint8Array>,
+    pbf_xs: &[u32],
+    pbf_ys: &[u32],
+    pbf_zoom: u32,
+) -> Result<String, JsValue> {
+    let pbf_vecs: Vec<Vec<u8>> = pbf_tiles.iter().map(|t| t.to_vec()).collect();
+    mvt::decode_buildings_to_geojson(&pbf_vecs, pbf_xs, pbf_ys, pbf_zoom)
+        .map_err(|e| JsValue::from_str(&format!("{e}")))
 }

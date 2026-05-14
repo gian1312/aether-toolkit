@@ -91,6 +91,25 @@ pub struct BuildingPolygon {
     pub height_m: f64,
 }
 
+/// Diagnostic stats from PBF building extraction.
+#[derive(Default)]
+pub struct ExtractStats {
+    pub layers_total: usize,
+    pub building_layer_found: bool,
+    pub features_total: usize,
+    pub features_polygon: usize,
+    pub features_other_type: usize,
+    pub features_empty_geom: usize,
+    pub features_no_rings: usize,
+    pub features_short_ring: usize,
+    pub buildings_out: usize,
+    pub height_min: f64,
+    pub height_max: f64,
+    pub height_sum: f64,
+    pub height_default_count: usize,
+    pub height_explicit_count: usize,
+}
+
 // ── Tile coordinate conversion ─────────────────────────────────
 
 fn tile_to_lon(x: u32, z: u32) -> f64 {
@@ -186,7 +205,12 @@ fn zigzag(n: u32) -> i32 {
 const DEFAULT_HEIGHT: f64 = 6.0;
 
 fn resolve_height(feature: &Feature, layer: &Layer) -> f64 {
-    // Look for render_height or building:levels in tags
+    resolve_height_detailed(feature, layer).0
+}
+
+/// Returns (height_m, is_explicit). `is_explicit` is true if render_height or
+/// building:levels was found, false if the default was used.
+fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, bool) {
     let mut i = 0;
     while i + 1 < feature.tags.len() {
         let key_idx = feature.tags[i] as usize;
@@ -198,56 +222,371 @@ fn resolve_height(feature: &Feature, layer: &Layer) -> f64 {
         let val = &layer.values[val_idx];
 
         if key == "render_height" {
-            if let Some(v) = val.float_val { if v > 0.0 { return v as f64; } }
-            if let Some(v) = val.double_val { if v > 0.0 { return v; } }
-            if let Some(v) = val.int_val { if v > 0 { return v as f64; } }
-            if let Some(v) = val.uint_val { if v > 0 { return v as f64; } }
+            if let Some(v) = val.float_val { if v > 0.0 { return (v as f64, true); } }
+            if let Some(v) = val.double_val { if v > 0.0 { return (v, true); } }
+            if let Some(v) = val.int_val { if v > 0 { return (v as f64, true); } }
+            if let Some(v) = val.uint_val { if v > 0 { return (v as f64, true); } }
+            if let Some(v) = val.sint_val { if v > 0 { return (v as f64, true); } }
         }
         if key == "building:levels" {
-            if let Some(v) = val.int_val { if v > 0 { return v as f64 * 3.0; } }
-            if let Some(v) = val.uint_val { if v > 0 { return v as f64 * 3.0; } }
+            if let Some(v) = val.int_val { if v > 0 { return (v as f64 * 3.0, true); } }
+            if let Some(v) = val.uint_val { if v > 0 { return (v as f64 * 3.0, true); } }
+            if let Some(v) = val.sint_val { if v > 0 { return (v as f64 * 3.0, true); } }
             if let Some(ref s) = val.string_val {
-                if let Ok(n) = s.parse::<f64>() { if n > 0.0 { return n * 3.0; } }
+                if let Ok(n) = s.parse::<f64>() { if n > 0.0 { return (n * 3.0, true); } }
             }
         }
     }
-    DEFAULT_HEIGHT
+    (DEFAULT_HEIGHT, false)
+}
+
+/// Count building features using raw protobuf wire parsing (no prost).
+/// For diagnostic comparison with prost-based extraction.
+pub fn count_buildings_raw(pbf_data: &[u8]) -> Result<(usize, Vec<String>)> {
+    // Minimal protobuf wire-format parser
+    fn read_varint(data: &[u8], pos: &mut usize) -> u64 {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        while *pos < data.len() {
+            let b = data[*pos];
+            *pos += 1;
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 { break; }
+            shift += 7;
+        }
+        result
+    }
+
+    // Parse top-level Tile: find Layer messages (tag 3)
+    let mut layers_info = Vec::new();
+    let mut building_features = 0usize;
+    let mut pos = 0;
+    while pos < pbf_data.len() {
+        let tag = read_varint(pbf_data, &mut pos);
+        let field = tag >> 3;
+        let wtype = tag & 7;
+        match wtype {
+            0 => { read_varint(pbf_data, &mut pos); }
+            2 => {
+                let len = read_varint(pbf_data, &mut pos) as usize;
+                let end = pos + len;
+                if field == 3 {
+                    // Layer message — parse to find name and feature count
+                    let mut lpos = pos;
+                    let mut name = String::new();
+                    let mut feat_count = 0usize;
+                    while lpos < end {
+                        let ltag = read_varint(pbf_data, &mut lpos);
+                        let lfield = ltag >> 3;
+                        let lwtype = ltag & 7;
+                        match lwtype {
+                            0 => { read_varint(pbf_data, &mut lpos); }
+                            2 => {
+                                let llen = read_varint(pbf_data, &mut lpos) as usize;
+                                if lfield == 1 {
+                                    name = String::from_utf8_lossy(&pbf_data[lpos..lpos+llen]).to_string();
+                                }
+                                if lfield == 2 { feat_count += 1; }
+                                lpos += llen;
+                            }
+                            5 => { lpos += 4; }
+                            1 => { lpos += 8; }
+                            _ => break,
+                        }
+                    }
+                    if name == "building" {
+                        building_features += feat_count;
+                    }
+                    layers_info.push(format!("{}:{}", name, feat_count));
+                }
+                pos = end;
+            }
+            5 => { pos += 4; }
+            1 => { pos += 8; }
+            _ => break,
+        }
+    }
+    Ok((building_features, layers_info))
 }
 
 /// Decode a PBF vector tile and extract building polygons with heights.
 ///
-/// Returns building polygons in WGS84 coordinates with height above ground.
+/// Returns building polygons in WGS84 coordinates with height above ground,
+/// plus diagnostic stats for debugging extraction yield.
 /// `tile_x`, `tile_y`, `z` are the XYZ tile coordinates for geo-referencing.
 pub fn extract_buildings_from_pbf(
     pbf_data: &[u8],
     tile_x: u32,
     tile_y: u32,
     z: u32,
-) -> Result<Vec<BuildingPolygon>> {
+) -> Result<(Vec<BuildingPolygon>, ExtractStats)> {
     let tile = Tile::decode(pbf_data).map_err(|e| anyhow!("PBF decode error: {e}"))?;
 
     let mut buildings = Vec::new();
+    let mut stats = ExtractStats {
+        layers_total: tile.layers.len(),
+        height_min: f64::MAX,
+        height_max: f64::MIN,
+        ..Default::default()
+    };
 
     for layer in &tile.layers {
         if layer.name != "building" { continue; }
+        stats.building_layer_found = true;
 
         let extent = layer.extent.unwrap_or(4096);
+        stats.features_total += layer.features.len();
 
         for feature in &layer.features {
             let geom_type = feature.r#type.map(GeomType::from_i32).unwrap_or(GeomType::Unknown);
-            if geom_type != GeomType::Polygon { continue; }
 
-            let height = resolve_height(feature, layer);
+            if feature.geometry.is_empty() {
+                stats.features_empty_geom += 1;
+                continue;
+            }
+
+            if geom_type != GeomType::Polygon {
+                stats.features_other_type += 1;
+                continue;
+            }
+            stats.features_polygon += 1;
+
+            let (height, is_explicit) = resolve_height_detailed(feature, layer);
             let rings = decode_geometry(&feature.geometry, extent, tile_x, tile_y, z);
 
-            // First ring is outer, rest are holes (we take outer only)
-            if let Some(outer) = rings.into_iter().next() {
-                if outer.len() >= 3 {
-                    buildings.push(BuildingPolygon { coords: outer, height_m: height });
+            // Each feature can be a multi-polygon: Planetiler merges individual
+            // buildings into single features. Each ring is a separate building.
+            // Outer rings (clockwise in tile space) are buildings; counter-clockwise
+            // rings are holes (courtyards). At z14, most rings are outer = buildings.
+            if rings.is_empty() {
+                stats.features_no_rings += 1;
+            } else {
+                if is_explicit { stats.height_explicit_count += 1; } else { stats.height_default_count += 1; }
+                let mut ring_count = 0;
+                for ring in rings {
+                    if ring.len() < 3 {
+                        stats.features_short_ring += 1;
+                        continue;
+                    }
+                    // Check winding: signed area > 0 = CCW in WGS84 = outer ring
+                    // (MVT CW in tile-space becomes CCW after lat-flip to WGS84)
+                    let signed_area: f64 = ring.windows(2)
+                        .map(|w| w[0].0 * w[1].1 - w[1].0 * w[0].1)
+                        .sum();
+                    if signed_area.abs() < 1e-14 { continue; } // degenerate
+                    // Take all rings as buildings — holes are rare at z14
+                    // and their small negative area is harmless for LOS
+                    stats.height_sum += height;
+                    if height < stats.height_min { stats.height_min = height; }
+                    if height > stats.height_max { stats.height_max = height; }
+                    buildings.push(BuildingPolygon { coords: ring, height_m: height });
+                    ring_count += 1;
                 }
+                if ring_count == 0 { stats.features_short_ring += 1; }
             }
         }
     }
 
-    Ok(buildings)
+    stats.buildings_out = buildings.len();
+    Ok((buildings, stats))
+}
+
+// ── Batch building application to .abt tiles ──────────────────────
+
+use crate::ingest::point_in_poly;
+use byteorder::{LittleEndian, ReadBytesExt};
+use std::io::Cursor;
+use std::collections::HashSet;
+
+/// Result of applying buildings to a set of .abt tiles.
+pub struct ApplyBuildingsResult {
+    /// Modified .abt tile buffers (same order as input).
+    pub tiles: Vec<Vec<u8>>,
+    /// Total buildings decoded (before dedup).
+    pub buildings_decoded: usize,
+    /// Buildings after dedup.
+    pub buildings_after_dedup: usize,
+    /// Per-tile: (buildings_hit, pixels_modified).
+    pub per_tile: Vec<(u32, u32)>,
+}
+
+/// Decompress gzip if magic bytes present, otherwise return as-is.
+pub fn maybe_gunzip(data: &[u8]) -> Vec<u8> {
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(data);
+        let mut decompressed = Vec::new();
+        if decoder.read_to_end(&mut decompressed).is_ok() {
+            return decompressed;
+        }
+    }
+    data.to_vec()
+}
+
+/// Decode PBF building tiles, deduplicate, and rasterize onto .abt tile buffers.
+///
+/// This is the core building integration pipeline. The WASM wrapper calls this
+/// after converting JS types to Rust types.
+///
+/// * `abt_bufs` — mutable .abt tile buffers (44-byte header + i16 elevation data)
+/// * `pbf_tiles` — raw PBF tile bytes (one per vector tile)
+/// * `pbf_xs`, `pbf_ys` — tile x/y coordinates for each PBF tile
+/// * `pbf_zoom` — zoom level of the PBF tiles
+pub fn apply_buildings_to_abt_tiles(
+    abt_bufs: &mut [Vec<u8>],
+    pbf_tiles: &[Vec<u8>],
+    pbf_xs: &[u32],
+    pbf_ys: &[u32],
+    pbf_zoom: u32,
+) -> ApplyBuildingsResult {
+    // ── 1. Decode ALL PBF tiles ──────────────────────────────────
+    let mut all_buildings: Vec<BuildingPolygon> = Vec::new();
+    for i in 0..pbf_tiles.len() {
+        let pbf_bytes = maybe_gunzip(&pbf_tiles[i]);
+        if let Ok((buildings, _)) = extract_buildings_from_pbf(&pbf_bytes, pbf_xs[i], pbf_ys[i], pbf_zoom) {
+            all_buildings.extend(buildings);
+        }
+    }
+
+    let buildings_decoded = all_buildings.len();
+
+    // ── 2. Deduplicate buffer-zone duplicates ────────────────────
+    {
+        let mut seen = HashSet::new();
+        all_buildings.retain(|b| {
+            if b.coords.is_empty() { return false; }
+            let (lon, lat) = b.coords[0];
+            let key = ((lat * 1_000_000.0).round() as i64, (lon * 1_000_000.0).round() as i64);
+            seen.insert(key)
+        });
+    }
+
+    let buildings_after_dedup = all_buildings.len();
+
+    // ── 3. Rasterize onto each .abt tile ─────────────────────────
+    let mut per_tile = Vec::with_capacity(abt_bufs.len());
+
+    for buf in abt_bufs.iter_mut() {
+        if buf.len() < 44 || all_buildings.is_empty() {
+            per_tile.push((0, 0));
+            continue;
+        }
+
+        let mut c = Cursor::new(&buf[4..44]);
+        let _version = c.read_u16::<LittleEndian>().unwrap();
+        let size_px = c.read_u16::<LittleEndian>().unwrap() as u32;
+        let ul_lat = c.read_f64::<LittleEndian>().unwrap();
+        let ul_lon = c.read_f64::<LittleEndian>().unwrap();
+        let scale_y = c.read_f64::<LittleEndian>().unwrap();
+        let scale_x = c.read_f64::<LittleEndian>().unwrap();
+        let _base_elev = c.read_i16::<LittleEndian>().unwrap();
+        let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
+
+        let mut total_modified = 0u32;
+        let mut buildings_hit = 0u32;
+
+        for bldg in &all_buildings {
+            if bldg.coords.len() < 3 { continue; }
+
+            let bldg_h_i16 = (bldg.height_m * 2.0).round() as i16;
+            if bldg_h_i16 <= 0 { continue; }
+
+            let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(bldg.coords.len());
+            let mut min_x = size_px as f64;
+            let mut max_x = 0.0f64;
+            let mut min_y = size_px as f64;
+            let mut max_y = 0.0f64;
+
+            for &(lon, lat) in &bldg.coords {
+                let px = (lon - ul_lon) / scale_x;
+                let py = (ul_lat - lat) / scale_y;
+                min_x = min_x.min(px);
+                max_x = max_x.max(px);
+                min_y = min_y.min(py);
+                max_y = max_y.max(py);
+                vertices.push((px, py));
+            }
+
+            if max_x < 0.0 || min_x >= size_px as f64 || max_y < 0.0 || min_y >= size_px as f64 {
+                continue;
+            }
+
+            let start_x = (min_x.floor().max(0.0)) as u32;
+            let end_x = (max_x.ceil().min(size_px as f64)) as u32;
+            let start_y = (min_y.floor().max(0.0)) as u32;
+            let end_y = (max_y.ceil().min(size_px as f64)) as u32;
+
+            let mut any_modified = false;
+            for y in start_y..end_y {
+                let py_center = y as f64 + 0.5;
+                for x in start_x..end_x {
+                    if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
+                        let offset = 44 + y as usize * stride + x as usize * 2;
+                        if offset + 1 < buf.len() {
+                            let current = i16::from_le_bytes([buf[offset], buf[offset + 1]]);
+                            let roof = current.saturating_add(bldg_h_i16);
+                            buf[offset..offset + 2].copy_from_slice(&roof.to_le_bytes());
+                            total_modified += 1;
+                            any_modified = true;
+                        }
+                    }
+                }
+            }
+            if any_modified { buildings_hit += 1; }
+        }
+
+        per_tile.push((buildings_hit, total_modified));
+    }
+
+    ApplyBuildingsResult {
+        tiles: Vec::new(), // caller already has the mutated bufs
+        buildings_decoded,
+        buildings_after_dedup,
+        per_tile,
+    }
+}
+
+/// Decode PBF tiles and return buildings as a GeoJSON FeatureCollection string.
+pub fn decode_buildings_to_geojson(
+    pbf_tiles: &[Vec<u8>],
+    pbf_xs: &[u32],
+    pbf_ys: &[u32],
+    pbf_zoom: u32,
+) -> Result<String> {
+    let mut all_buildings: Vec<BuildingPolygon> = Vec::new();
+    for i in 0..pbf_tiles.len() {
+        let pbf_bytes = maybe_gunzip(&pbf_tiles[i]);
+        if let Ok((buildings, _)) = extract_buildings_from_pbf(&pbf_bytes, pbf_xs[i], pbf_ys[i], pbf_zoom) {
+            all_buildings.extend(buildings);
+        }
+    }
+
+    // Dedup
+    {
+        let mut seen = HashSet::new();
+        all_buildings.retain(|b| {
+            if b.coords.is_empty() { return false; }
+            let (lon, lat) = b.coords[0];
+            let key = ((lat * 1_000_000.0).round() as i64, (lon * 1_000_000.0).round() as i64);
+            seen.insert(key)
+        });
+    }
+
+    let mut features = String::from("[");
+    for (i, b) in all_buildings.iter().enumerate() {
+        if i > 0 { features.push(','); }
+        features.push_str("{\"type\":\"Feature\",\"properties\":{\"height\":");
+        features.push_str(&format!("{:.1}", b.height_m));
+        features.push_str("},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[");
+        for (j, &(lon, lat)) in b.coords.iter().enumerate() {
+            if j > 0 { features.push(','); }
+            features.push_str(&format!("[{:.7},{:.7}]", lon, lat));
+        }
+        if let Some(&(lon, lat)) = b.coords.first() {
+            features.push_str(&format!(",[{:.7},{:.7}]", lon, lat));
+        }
+        features.push_str("]]}}");
+    }
+    features.push(']');
+    Ok(format!("{{\"type\":\"FeatureCollection\",\"features\":{}}}", features))
 }

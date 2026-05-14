@@ -34,6 +34,8 @@ futures = "0.3"
 png = "0.17"
 # MVT/PBF vector tile decoding (for building data from OpenFreeMap)
 prost = "0.13"
+# Gzip decompression (for PBF tiles that may be internally gzipped)
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"

@@ -509,7 +509,7 @@ fn process_geometry_wgs84(
     pixels_modified
 }
 
-fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
+pub fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
     let mut inside = false;
     let mut j = poly.len() - 1;
     for i in 0..poly.len() {
