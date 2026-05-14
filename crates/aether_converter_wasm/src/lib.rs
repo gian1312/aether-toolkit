@@ -311,13 +311,12 @@ pub fn apply_buildings(
     let ul_lat = c.read_f64::<LittleEndian>().unwrap();
     let ul_lon = c.read_f64::<LittleEndian>().unwrap();
     let scale_y = c.read_f64::<LittleEndian>().unwrap();
-    let _scale_x = c.read_f64::<LittleEndian>().unwrap();
+    let _scale_x_raw = c.read_f64::<LittleEndian>().unwrap();
     let _base_elev = c.read_i16::<LittleEndian>().unwrap();
     let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
 
-    let px_deg = scale_y; // degrees per pixel
-    let tile_south = ul_lat - px_deg * size_px as f64;
-    let tile_east = ul_lon + px_deg * size_px as f64;
+    // .abt header stores same pd for both scales. Compute correct lon scale.
+    let scale_x = scale_y / ul_lat.to_radians().cos();
 
     let mut total_modified: u32 = 0;
 
@@ -325,7 +324,6 @@ pub fn apply_buildings(
         let n_verts = bldg.coords.len() / 2;
         if n_verts < 3 { continue; }
 
-        // Convert to pixel coords + compute bbox
         let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(n_verts);
         let mut min_x = size_px as f64;
         let mut max_x = 0.0f64;
@@ -335,8 +333,8 @@ pub fn apply_buildings(
         for i in 0..n_verts {
             let lon = bldg.coords[i * 2];
             let lat = bldg.coords[i * 2 + 1];
-            let px = (lon - ul_lon) / px_deg;
-            let py = (ul_lat - lat) / px_deg;
+            let px = (lon - ul_lon) / scale_x;
+            let py = (ul_lat - lat) / scale_y;
             min_x = min_x.min(px);
             max_x = max_x.max(px);
             min_y = min_y.min(py);
@@ -436,66 +434,67 @@ pub fn apply_buildings_pbf(
     let ul_lat = c.read_f64::<LittleEndian>().unwrap();
     let ul_lon = c.read_f64::<LittleEndian>().unwrap();
     let scale_y = c.read_f64::<LittleEndian>().unwrap();
-    let _scale_x = c.read_f64::<LittleEndian>().unwrap();
+    let _scale_x_raw = c.read_f64::<LittleEndian>().unwrap();
     let _base_elev = c.read_i16::<LittleEndian>().unwrap();
     let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
 
-    let px_deg = scale_y;
-    let mut total_buildings = 0usize;
-    let mut total_modified = 0u32;
+    // .abt header stores same pd for both scales. Compute correct lon scale.
+    let scale_x = scale_y / ul_lat.to_radians().cos();
 
+    // Decode ALL PBF tiles once into a single building list.
+    let mut all_buildings: Vec<mvt::BuildingPolygon> = Vec::new();
     for i in 0..pbf_tiles.len() {
         let pbf_bytes = pbf_tiles[i].to_vec();
-        let buildings = match mvt::extract_buildings_from_pbf(&pbf_bytes, pbf_xs[i], pbf_ys[i], pbf_zoom) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        if let Ok(buildings) = mvt::extract_buildings_from_pbf(&pbf_bytes, pbf_xs[i], pbf_ys[i], pbf_zoom) {
+            all_buildings.extend(buildings);
+        }
+    }
 
-        total_buildings += buildings.len();
+    let total_buildings = all_buildings.len();
+    let mut total_modified = 0u32;
 
-        for bldg in &buildings {
-            if bldg.coords.len() < 3 { continue; }
+    // Rasterize decoded buildings onto this .abt tile.
+    for bldg in &all_buildings {
+        if bldg.coords.len() < 3 { continue; }
 
-            let bldg_h_i16 = (bldg.height_m * 2.0).round() as i16;
-            if bldg_h_i16 <= 0 { continue; }
+        let bldg_h_i16 = (bldg.height_m * 2.0).round() as i16;
+        if bldg_h_i16 <= 0 { continue; }
 
-            // Convert to pixel coords + compute bbox
-            let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(bldg.coords.len());
-            let mut min_x = size_px as f64;
-            let mut max_x = 0.0f64;
-            let mut min_y = size_px as f64;
-            let mut max_y = 0.0f64;
+        let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(bldg.coords.len());
+        let mut min_x = size_px as f64;
+        let mut max_x = 0.0f64;
+        let mut min_y = size_px as f64;
+        let mut max_y = 0.0f64;
 
-            for &(lon, lat) in &bldg.coords {
-                let px = (lon - ul_lon) / px_deg;
-                let py = (ul_lat - lat) / px_deg;
-                min_x = min_x.min(px);
-                max_x = max_x.max(px);
-                min_y = min_y.min(py);
-                max_y = max_y.max(py);
-                vertices.push((px, py));
-            }
+        for &(lon, lat) in &bldg.coords {
+            let px = (lon - ul_lon) / scale_x;
+            let py = (ul_lat - lat) / scale_y;
+            min_x = min_x.min(px);
+            max_x = max_x.max(px);
+            min_y = min_y.min(py);
+            max_y = max_y.max(py);
+            vertices.push((px, py));
+        }
 
-            if max_x < 0.0 || min_x >= size_px as f64 || max_y < 0.0 || min_y >= size_px as f64 {
-                continue;
-            }
+        if max_x < 0.0 || min_x >= size_px as f64 || max_y < 0.0 || min_y >= size_px as f64 {
+            continue;
+        }
 
-            let start_x = (min_x.floor().max(0.0)) as u32;
-            let end_x = (max_x.ceil().min(size_px as f64)) as u32;
-            let start_y = (min_y.floor().max(0.0)) as u32;
-            let end_y = (max_y.ceil().min(size_px as f64)) as u32;
+        let start_x = (min_x.floor().max(0.0)) as u32;
+        let end_x = (max_x.ceil().min(size_px as f64)) as u32;
+        let start_y = (min_y.floor().max(0.0)) as u32;
+        let end_y = (max_y.ceil().min(size_px as f64)) as u32;
 
-            for y in start_y..end_y {
-                let py_center = y as f64 + 0.5;
-                for x in start_x..end_x {
-                    if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
-                        let offset = 44 + y as usize * stride + x as usize * 2;
-                        if offset + 1 < buf.len() {
-                            let current = i16::from_le_bytes([buf[offset], buf[offset + 1]]);
-                            let with_building = current.saturating_add(bldg_h_i16);
-                            buf[offset..offset + 2].copy_from_slice(&with_building.to_le_bytes());
-                            total_modified += 1;
-                        }
+        for y in start_y..end_y {
+            let py_center = y as f64 + 0.5;
+            for x in start_x..end_x {
+                if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
+                    let offset = 44 + y as usize * stride + x as usize * 2;
+                    if offset + 1 < buf.len() {
+                        let current = i16::from_le_bytes([buf[offset], buf[offset + 1]]);
+                        let with_building = current.saturating_add(bldg_h_i16);
+                        buf[offset..offset + 2].copy_from_slice(&with_building.to_le_bytes());
+                        total_modified += 1;
                     }
                 }
             }
