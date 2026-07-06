@@ -108,6 +108,61 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+// Terrarium NODATA backfill ---------------------------------------------------
+//
+// Terrarium has NODATA voids at high zoom — whole or partial blank tiles
+// (RGB 0,0,0 -> -32768 m) where the COARSER parent tile still holds real data
+// (verified: 14/8646/5700 is blank but its 13/4323/2850 parent is full).
+// Passing those through bakes a -16 km pit that renders as a stripe. Instead,
+// replace only the void pixels with the correctly-mapped (upsampled) parent
+// pixel, climbing z-1, z-2, ... until filled or MIN_ZOOM is reached.
+
+const NODATA_M: f32 = -11000.0; // below the deepest ocean -> anything lower is a void
+const NODATA_FILL_MIN_ZOOM: u32 = 6;
+
+/// One fetch + decode of a single tile (no retry) -> 256x256 grid, or None.
+async fn fetch_decode_raw(
+    client: &reqwest::Client, url: &str, dec: fn(u8, u8, u8) -> f32,
+) -> Option<Vec<f32>> {
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.bytes().await.ok()?;
+    decode_png(&body, dec).ok()
+}
+
+/// Fill the NODATA pixels of a zoom-`z` tile from progressively coarser parents.
+async fn fill_from_parents(
+    client: &reqwest::Client, url_template: &str, z: u32, x: u32, y: u32,
+    dec: fn(u8, u8, u8) -> f32, mut grid: Vec<f32>,
+) -> Vec<f32> {
+    let mut missing: Vec<usize> =
+        (0..grid.len()).filter(|&i| grid[i] <= NODATA_M).collect();
+    let mut level = 1u32;
+    while !missing.is_empty() && z >= level + NODATA_FILL_MIN_ZOOM {
+        let (az, ax, ay) = (z - level, x >> level, y >> level);
+        let url = url_template
+            .replace("{z}", &az.to_string())
+            .replace("{x}", &ax.to_string())
+            .replace("{y}", &ay.to_string());
+        if let Some(anc) = fetch_decode_raw(client, &url, dec).await {
+            if anc.len() == 256 * 256 {
+                let (base_x, base_y) = (ax as u64 * 256, ay as u64 * 256);
+                missing.retain(|&i| {
+                    let (px, py) = ((i % 256) as u64, (i / 256) as u64);
+                    let apx = (((x as u64) * 256 + px) >> level) - base_x;
+                    let apy = (((y as u64) * 256 + py) >> level) - base_y;
+                    let v = anc[(apy * 256 + apx) as usize];
+                    if v > NODATA_M { grid[i] = v; false } else { true }
+                });
+            }
+        }
+        level += 1;
+    }
+    grid
+}
+
 // -- Download diagnostics -----------------------------------------------------
 
 struct DownloadStats {
@@ -354,17 +409,25 @@ async fn download_strip(
                 let cur_flight = stats.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
                 stats.peak_in_flight.fetch_max(cur_flight, Ordering::Relaxed);
 
-                // Retry loop: up to 3 retries with exponential backoff (1s, 2s, 4s).
-                // Retries on: timeout, connection error, HTTP 429, HTTP 5xx.
+                // Retry loop: up to 5 retries with capped exponential backoff.
+                // Retries on: timeout, connection error ("connection closed
+                // before message completed"), HTTP 429, HTTP 5xx.
                 // No retry on: HTTP 4xx (except 429), decode errors.
-                const MAX_RETRIES: u32 = 3;
+                // The extra attempts target the largest tiles: their first try
+                // fails under peak concurrency, but once the backoff elapses the
+                // strip has drained and a retry gets enough bandwidth to finish
+                // — clearing the deterministic stripe without lowering the
+                // connection count for the bulk download.
+                const MAX_RETRIES: u32 = 5;
                 let mut result: Result<Vec<f32>> = Err(anyhow::anyhow!("not started"));
                 let mut retryable;
 
                 for attempt in 0..=MAX_RETRIES {
                     if attempt > 0 {
                         stats.retries.fetch_add(1, Ordering::Relaxed);
-                        let delay_ms = 1000u64 << (attempt - 1); // 1s, 2s, 4s
+                        // 1s, 2s, 4s, 8s, 8s — capped so a late failure can't
+                        // stall the strip pipeline for the full 1+2+4+8+16s.
+                        let delay_ms = (1000u64 << (attempt - 1)).min(8000);
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     }
                     retryable = true;
@@ -407,6 +470,17 @@ async fn download_strip(
                     }
 
                     if !retryable { break; }
+                }
+
+                // Terrarium NODATA voids: if this tile came back with blank
+                // pixels, backfill only those from real (upsampled) data in the
+                // coarser parent tiles instead of leaving a -16 km pit / stripe.
+                if matches!(&result, Ok(g) if g.iter().any(|&v| v <= NODATA_M)) {
+                    if let Ok(g) = result {
+                        result = Ok(fill_from_parents(
+                            &client, url_template, zoom, tx, ty, dec, g,
+                        ).await);
+                    }
                 }
 
                 stats.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -1014,9 +1088,19 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     }
 
     // 3. Single HTTP client — reqwest handles connection pooling internally.
+    //
+    // "connection closed before message completed" (the deterministic stripe on
+    // the largest mountain tiles) comes from hyper reusing a pooled keep-alive
+    // socket the CDN has already closed. The old 60s idle window made that
+    // likely: the biggest tiles are slowest, so their connections sit idle
+    // longest between reuses and get reaped server-side, then reused blind.
+    // Keep the pool wide for throughput, but drop idle sockets fast so a stale
+    // one is never reused, and enable TCP keepalive so a dead socket is detected
+    // rather than reused. (The per-tile retry below recovers the rare race.)
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(conns)
-        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .pool_idle_timeout(std::time::Duration::from_secs(5))
+        .tcp_keepalive(std::time::Duration::from_secs(15))
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 

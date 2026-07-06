@@ -8,7 +8,7 @@ use serde::Deserialize;
 #[cfg(feature = "native")]
 use rayon::prelude::*;
 use byteorder::{LittleEndian, WriteBytesExt};
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 use anyhow::{Context, Result};
 use flatgeobuf::{FgbReader, GeometryType};
@@ -70,7 +70,11 @@ fn parse_swiss_filename(p: &Path) -> Option<(f64, f64)> {
 pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
     let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
     let reader = BufReader::with_capacity(1024 * 1024, file);
-    let mut decoder = Decoder::new(reader)?;
+    // The default tiff decode-buffer cap (~256 MB) rejects large rasters with
+    // "The Decoder limits are exceeded". Callers now hand us one small,
+    // per-tile GeoTIFF at a time (bounded by the plugin's warp size), so lift
+    // the limit and let the tile decode rather than silently failing.
+    let mut decoder = Decoder::new(reader)?.with_limits(Limits::unlimited());
     let (w, h) = decoder.dimensions()?;
 
     let model_trans = decoder.get_tag_f64_vec(Tag::ModelTransformationTag).unwrap_or_default();
@@ -148,6 +152,17 @@ pub fn process_tile_with_cache(
         if let Some(p) = &job.base_tif {
             base_image = cache.get(p).cloned();
         }
+    }
+    // A base DEM that was requested but could not be loaded must be fatal:
+    // otherwise the tile is written with no terrain (flat 0) and the whole run
+    // reports success with empty coverage. (The classic cause was the source
+    // exceeding the tiff decoder limit — see the earlier [Warn].)
+    if job.base_tif.is_some() && base_image.is_none() {
+        anyhow::bail!(
+            "base DEM {:?} was specified but could not be loaded; refusing to \
+             write a terrain-less tile",
+            job.base_tif
+        );
     }
     let base_image_ref = base_image.as_deref();
 

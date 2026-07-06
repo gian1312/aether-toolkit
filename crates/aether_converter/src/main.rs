@@ -115,12 +115,14 @@ fn main() -> anyhow::Result<()> {
 
                 let total = jobs.len();
                 let progress = AtomicUsize::new(0);
+                let failures = AtomicUsize::new(0);
 
                 // Run all jobs in parallel using the constrained pool
                 pool.install(|| {
                     jobs.into_par_iter().for_each(|job| {
                         if let Err(e) = ingest::process_tile_with_cache(job, texture_cache.clone()) {
                             println!("[Error] Failed to process tile: {}", e);
+                            failures.fetch_add(1, Ordering::Relaxed);
                         }
 
                         let curr = progress.fetch_add(1, Ordering::Relaxed) + 1;
@@ -142,6 +144,13 @@ fn main() -> anyhow::Result<()> {
                         }
                     });
                 });
+
+                // Fail loudly if any tile could not be produced, so callers
+                // don't treat a partial/terrain-less batch as success.
+                let n_failed = failures.load(Ordering::Relaxed);
+                if n_failed > 0 {
+                    anyhow::bail!("{} of {} tiles failed to convert", n_failed, total);
+                }
             }
             Ok(())
         },
