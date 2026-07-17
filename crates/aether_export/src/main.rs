@@ -515,16 +515,17 @@ struct TiledInput {
     /// Lookup: (tile_x, tile_y) → (byte_offset, byte_size) in the mmap.
     index: HashMap<(u32, u32), (u64, u32)>,
     src_tile_size: usize,
-    /// Bytes per source tile (depends on mode: 1-bit or 8-bit).
+    /// Bytes per source tile (depends on mode: 1-bit, 8-bit or 16-bit).
     src_tile_bytes: usize,
     width: usize,
     height: usize,
     is_8bit: bool,
+    is_16bit: bool, //[MIN_ALT]
 }
 
 impl TiledInput {
     /// Open a .tiles file by reading the footer, then the binary index.
-    fn open(path: &PathBuf, src_tile_size: usize, width: usize, height: usize, is_8bit: bool) -> io::Result<Self> {
+    fn open(path: &PathBuf, src_tile_size: usize, width: usize, height: usize, is_8bit: bool, is_16bit: bool) -> io::Result<Self> {
         let mut file = File::open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -563,13 +564,34 @@ impl TiledInput {
         let file_ro = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file_ro)? };
 
-        let src_tile_bytes = if is_8bit {
+        let src_tile_bytes = if is_16bit {
+            src_tile_size * src_tile_size * 2 //[MIN_ALT]
+        } else if is_8bit {
             src_tile_size * src_tile_size
         } else {
             (src_tile_size * src_tile_size) / 8
         };
 
-        Ok(TiledInput { mmap, index, src_tile_size, src_tile_bytes, width, height, is_8bit })
+        Ok(TiledInput { mmap, index, src_tile_size, src_tile_bytes, width, height, is_8bit, is_16bit })
+    }
+
+    //[MIN_ALT] Read a single u16 altitude pixel, or the 0xFFFF sentinel if the
+    // tile is missing/out of bounds. Coordinates are full-resolution pixel space.
+    #[inline]
+    fn get_pixel16(&self, x: usize, y: usize) -> u16 {
+        if x >= self.width || y >= self.height { return 0xFFFF; }
+        let tx = (x / self.src_tile_size) as u32;
+        let ty = (y / self.src_tile_size) as u32;
+        let lx = x % self.src_tile_size;
+        let ly = y % self.src_tile_size;
+        if let Some(tile_data) = self.read_tile(tx, ty) {
+            let idx = (ly * self.src_tile_size + lx) * 2;
+            if idx + 2 <= tile_data.len() {
+                u16::from_le_bytes([tile_data[idx], tile_data[idx + 1]])
+            } else { 0xFFFF }
+        } else {
+            0xFFFF
+        }
     }
 
     /// Read a single source tile. Returns None for empty/sparse tiles.
@@ -640,6 +662,42 @@ fn extract_overview_tile_1bit_from_tiled(
             if input.get_pixel(sx, sy) != 0 {
                 buf[py * tile_row_bytes + px / 8] |= 1 << (7 - (px & 7));
             }
+        }
+    }
+
+    buf
+}
+
+//[MIN_ALT] Extract a 16-bit overview tile by nearest-neighbor sampling.
+// Missing pixels are the 0xFFFF sentinel.
+fn extract_overview_tile_16bit_from_tiled(
+    input: &TiledInput,
+    ts: usize,
+    tx: usize,
+    ty: usize,
+    factor: usize,
+) -> Vec<u8> {
+    let tile_row_bytes = ts * 2;
+    let mut buf = vec![0xFFu8; tile_row_bytes * ts];
+
+    let ovr_w = (input.width + factor - 1) / factor;
+    let ovr_h = (input.height + factor - 1) / factor;
+    let x0 = tx * ts;
+    let y0 = ty * ts;
+
+    for py in 0..ts {
+        let oy = y0 + py;
+        if oy >= ovr_h { break; }
+        let sy = oy * factor;
+
+        for px in 0..ts {
+            let ox = x0 + px;
+            if ox >= ovr_w { break; }
+            let sx = ox * factor;
+
+            let v = input.get_pixel16(sx, sy);
+            let off = py * tile_row_bytes + px * 2;
+            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
         }
     }
 
@@ -773,8 +831,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let width = meta.dimensions.width;
     let height = meta.dimensions.height;
 
+    //[MIN_ALT] Detect the 16-bit minimum-altitude format first.
+    let is_16bit = meta.output_format == "16BIT_ALT";
     //[8-BIT MODE] Detect output format from sidecar
-    let is_8bit = meta.output_format != "1BIT_LOS";
+    let is_8bit = meta.output_format != "1BIT_LOS" && !is_16bit;
 
     //[TILED-OUTPUT] Detect input format from sidecar
     let is_tiled = meta.tile_format.as_deref() == Some("TILED");
@@ -787,13 +847,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let compress_code = if use_compression { COMPRESS_DEFLATE } else { COMPRESS_NONE };
 
     //[8-BIT MODE] Bits per sample depends on format
-    let bits_per_sample: u16 = if is_8bit { 8 } else { 1 };
+    let bits_per_sample: u16 = if is_16bit { 16 } else if is_8bit { 8 } else { 1 };
 
     if is_tiled {
         //[TILED-OUTPUT] Tiled input path
         eprintln!("[Export] TILED input: {}×{} | Source tile: {}px | Output tile: {} | Format: {} | Compress: {}",
                   width, height, src_tile_size, ts,
-                  if is_8bit { "8BIT_PROP" } else { "1BIT_LOS" },
+                  if is_16bit { "16BIT_ALT" } else if is_8bit { "8BIT_PROP" } else { "1BIT_LOS" },
                   if use_compression { format!("deflate-{}", args.level) } else { "none".into() }
         );
 
@@ -803,7 +863,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // ── 2. Open tiled input ──────────────────────────────────────────
-        let tiled_input = TiledInput::open(&args.bit_path, src_tile_size, width, height, is_8bit)?;
+        let tiled_input = TiledInput::open(&args.bit_path, src_tile_size, width, height, is_8bit, is_16bit)?;
         prof.lap("Setup (tiled)");
 
         // ── 3. Determine overview levels ─────────────────────────────────
@@ -846,7 +906,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         // ── 7-8. Write IFDs and fixup (same as flat path) ───────────────
         write_ifds_and_fixup(&mut w, &meta, &main_level, &ovr_levels,
-                             ts, compress_code, bits_per_sample, is_8bit, header_fixup)?;
+                             ts, compress_code, bits_per_sample, is_8bit, is_16bit, header_fixup)?;
 
         w.flush()?;
         prof.lap("IFDs written");
@@ -854,6 +914,10 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         print_summary(&args, width, height, &tiled_input.mmap, t_total);
 
     } else {
+        //[MIN_ALT] The 16-bit altitude map is only ever emitted in tiled form.
+        if is_16bit {
+            return Err("16BIT_ALT export requires the tiled (.bit) input format".into());
+        }
         //[TILED-OUTPUT] Legacy flat .bit input path (original code)
         let row_stride = meta.row_stride_bytes.unwrap_or_else(|| {
             if is_8bit {
@@ -914,7 +978,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         // ── 7-8. Write IFDs and fixup ───────────────────────────────────
         write_ifds_and_fixup(&mut w, &meta, &main_level, &ovr_levels,
-                             ts, compress_code, bits_per_sample, is_8bit, header_fixup)?;
+                             ts, compress_code, bits_per_sample, is_8bit, false, header_fixup)?;
 
         w.flush()?;
         prof.lap("IFDs written");
@@ -936,6 +1000,7 @@ fn write_ifds_and_fixup(
     compress_code: u16,
     bits_per_sample: u16,
     is_8bit: bool,
+    is_16bit: bool, //[MIN_ALT]
     header_fixup: u64,
 ) -> io::Result<()> {
     let mut next_ifd_offset: u64 = 0;
@@ -971,7 +1036,16 @@ fn write_ifds_and_fixup(
     main_entries.extend(build_geo_tags(meta));
 
     //[8-BIT MODE] Add GDAL offset/scale metadata
-    if is_8bit {
+    if is_16bit {
+        //[MIN_ALT] u16 altitude map: 0.5 m/step, sentinel 65535 = no data.
+        main_entries.push(TagEntry::ascii(TAG_GDAL_METADATA,
+                                          "<GDALMetadata>\n\
+             <Item name=\"OFFSET\" sample=\"0\" role=\"offset\">0.0</Item>\n\
+             <Item name=\"SCALE\" sample=\"0\" role=\"scale\">0.5</Item>\n\
+             </GDALMetadata>"
+        ));
+        main_entries.push(TagEntry::ascii(TAG_GDAL_NODATA, "65535"));
+    } else if is_8bit {
         main_entries.push(TagEntry::ascii(TAG_GDAL_METADATA,
                                           "<GDALMetadata>\n\
              <Item name=\"OFFSET\" sample=\"0\" role=\"offset\">-150.0</Item>\n\
@@ -1061,14 +1135,41 @@ fn write_tiles_from_tiled(
     let mut sparse_count = 0usize;
 
     let direct_passthrough = input.src_tile_size == ts;
+    let is_16bit = input.is_16bit; //[MIN_ALT]
 
-    let tile_bytes_expected = if is_8bit { ts * ts } else { (ts * ts) / 8 };
+    let tile_bytes_expected = if is_16bit {
+        ts * ts * 2 //[MIN_ALT]
+    } else if is_8bit {
+        ts * ts
+    } else {
+        (ts * ts) / 8
+    };
 
     for ty in 0..tiles_y {
         // Collect tile data for this row (sequential reads from mmap are fast)
         let row_data: Vec<Option<Vec<u8>>> = (0..tiles_x)
             .into_par_iter()
             .map(|tx| {
+                //[MIN_ALT] 16-bit altitude tiles are written densely (no sparse
+                // skip) with missing pixels filled by the 0xFFFF sentinel so the
+                // nodata value is explicit everywhere.
+                if is_16bit {
+                    let mut buf = vec![0xFFu8; tile_bytes_expected];
+                    let x0 = tx * ts;
+                    let y0 = ty * ts;
+                    for py in 0..ts {
+                        let sy = y0 + py;
+                        if sy >= height { break; }
+                        for px in 0..ts {
+                            let sx = x0 + px;
+                            if sx >= width { break; }
+                            let v = input.get_pixel16(sx, sy);
+                            let off = (py * ts + px) * 2;
+                            buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                    }
+                    return if use_compression { Some(compress_tile(&buf, level)) } else { Some(buf) };
+                }
                 if direct_passthrough {
                     // Direct passthrough: source tile matches output tile
                     if let Some(data) = input.read_tile(tx as u32, ty as u32) {
@@ -1181,10 +1282,17 @@ fn write_overview_tiles_from_tiled(
     let use_compression = level > 0;
     let mut sparse_count = 0usize;
 
+    let is_16bit = input.is_16bit; //[MIN_ALT]
+
     for ty in 0..tiles_y {
         let row_tiles: Vec<Option<Vec<u8>>> = (0..tiles_x)
             .into_par_iter()
             .map(|tx| {
+                //[MIN_ALT] 16-bit overviews are written densely (sentinel fill).
+                if is_16bit {
+                    let raw = extract_overview_tile_16bit_from_tiled(input, ts, tx, ty, factor);
+                    return if use_compression { Some(compress_tile(&raw, level)) } else { Some(raw) };
+                }
                 let raw = if is_8bit {
                     extract_overview_tile_8bit_from_tiled(input, ts, tx, ty, factor)
                 } else {
