@@ -1,3 +1,7 @@
+// This crate only targets wasm32 (run_download_mem's signature is cfg-dependent);
+// compile to an empty lib on native so `cargo build/test --workspace` works.
+#![cfg(target_arch = "wasm32")]
+
 use wasm_bindgen::prelude::*;
 use aether_converter::download::{
     DownloadJob, run_download_mem, lon2tx, lat2ty, ty2lat, tx2lon,
