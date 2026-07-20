@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waveshed.io/schemas/aether/sidecar.schema.json",
+  "title": "aether_core coverage sidecar (.json)",
+  "description": "Metadata sidecar written by aether_core beside a .bit/.tiles coverage output, and read by aether_export. Authoritative source: rust/aether_core/src/engines/coverage.rs.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["output_format", "tile_format", "tile_size", "dimensions", "geotransform", "projection"],
+  "properties": {
+    "job_id": { "type": "string", "description": "Equals output.filename." },
+    "type": { "type": "string", "description": "Constant 'LOS_BITMASK' for all modes (informational; use output_format for the pixel format)." },
+    "output_format": {
+      "type": "string",
+      "enum": ["1BIT_LOS", "8BIT_PROP", "16BIT_ALT"],
+      "description": "Pixel format of the payload."
+    },
+    "tile_format": { "type": "string", "const": "TILED", "description": "Selects the ATIL tiled reader path." },
+    "tile_size": { "type": "integer", "const": 512, "description": "OUTPUT_TILE_SIZE." },
+    "dimensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "geotransform": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 6,
+      "maxItems": 6,
+      "description": "GDAL order [ul_lon, scale_x, 0, ul_lat, 0, -scale_y]."
+    },
+    "projection": { "type": "string", "const": "EPSG:4326" },
+    "row_stride_bytes": { "type": "integer", "minimum": 1, "description": "Legacy flat .bit only; absent for TILED sidecars." },
+    "alt_step_m": { "type": "number", "description": "16BIT_ALT only: metres per stored step (0.5)." },
+    "alt_ref": { "type": "string", "description": "16BIT_ALT only: 'AGL_CLAMPED'." },
+    "alt_sentinel": { "type": "integer", "description": "16BIT_ALT only: no-data value (65535)." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "output_format": { "const": "16BIT_ALT" } }, "required": ["output_format"] },
+      "then": { "required": ["alt_step_m", "alt_ref", "alt_sentinel"] }
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waveshed.io/schemas/aether/ingest_job.schema.json",
+  "title": "aether_converter ingest job",
+  "description": "Job consumed by `aether_converter ingest --job-file <json>`. The file may be a single job object OR a JSON array of job objects (batch). Authoritative source: crates/aether_converter/src/ingest.rs (IngestJob).",
+  "oneOf": [
+    { "$ref": "#/$defs/ingestJob" },
+    { "type": "array", "items": { "$ref": "#/$defs/ingestJob" } }
+  ],
+  "$defs": {
+    "ingestJob": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["output_path", "ul_lat", "ul_lon", "resolution_m", "size_px", "swiss_tifs"],
+      "properties": {
+        "output_path": { "type": "string", "description": "Destination .abt file path." },
+        "format": { "type": ["string", "null"], "enum": ["r16sint", "bc6h", null], "description": "Tile payload format; defaults to r16sint behavior when absent." },
+        "ul_lat": { "type": "number", "description": "Upper-left latitude (WGS84)." },
+        "ul_lon": { "type": "number", "description": "Upper-left longitude (east-positive)." },
+        "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel." },
+        "size_px": { "type": "integer", "minimum": 1, "description": "Output tile side in pixels (u32)." },
+        "base_tif": { "type": ["string", "null"], "description": "Base DEM GeoTIFF to sample." },
+        "swiss_tifs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Higher-resolution swissALTI GeoTIFFs to overlay. REQUIRED field; may be an empty array."
+        },
+        "buildings_file": { "type": ["string", "null"], "description": "FlatGeobuf building footprints to burn in." }
+      }
+    }
+  }
+}

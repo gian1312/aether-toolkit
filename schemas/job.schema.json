@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waveshed.io/schemas/aether/job.schema.json",
+  "title": "aether_core job.json",
+  "description": "Job configuration consumed by `aether_core --config <job.json>`. Authoritative source: rust/aether_core/src/config.rs (JobConfig). Per the Aether engine contract, unknown fields must be tolerated (additionalProperties: true).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["tx", "analysis", "output"],
+  "properties": {
+    "tx": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Transmitter configuration (TxConfig).",
+      "required": ["freq_mhz"],
+      "properties": {
+        "lat": { "type": "number", "default": 0.0, "description": "WGS84 latitude. Ignored for P2P/BATCH_P2P and overridden per-waypoint for PATH." },
+        "lon": { "type": "number", "default": 0.0, "description": "WGS84 longitude, east-positive." },
+        "height_m": { "type": "number", "default": 0.0, "description": "Antenna height, interpreted per `mode`." },
+        "mode": { "type": "string", "enum": ["AGL", "AMSL"], "default": "AGL" },
+        "freq_mhz": { "type": "number", "exclusiveMinimum": 0, "description": "Frequency in MHz. REQUIRED — no default; omitting it is a parse error." },
+        "erp_watts": { "type": ["number", "null"], "description": "Effective radiated power in watts." },
+        "az_pattern_file": { "type": ["string", "null"] },
+        "el_pattern_file": { "type": ["string", "null"] },
+        "az_rotation": { "type": ["number", "null"], "description": "Azimuth pattern rotation in degrees." },
+        "az_pattern_data": {
+          "type": ["array", "null"],
+          "description": "Inline azimuth pattern as [angle_deg, gain] pairs (linear gain 0..1).",
+          "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+        },
+        "el_pattern_data": {
+          "type": ["array", "null"],
+          "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+        }
+      }
+    },
+    "rx": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Receiver configuration (RxConfig). Optional; defaults applied when absent.",
+      "properties": {
+        "height_m": { "type": "number", "default": 1.5 },
+        "mode": { "type": "string", "enum": ["AGL", "AMSL"], "default": "AGL" },
+        "az_pattern_file": { "type": ["string", "null"] },
+        "el_pattern_file": { "type": ["string", "null"] },
+        "az_pattern_data": { "type": ["array", "null"], "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } },
+        "el_pattern_data": { "type": ["array", "null"], "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 } }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["propagation_model", "max_range_km", "resolution_m"],
+      "properties": {
+        "task_type": {
+          "type": "string",
+          "default": "SINGLE",
+          "description": "Execution route. Values other than these four route to the coverage engine.",
+          "enum": ["SINGLE", "P2P", "BATCH_P2P", "PATH"]
+        },
+        "propagation_model": {
+          "type": "string",
+          "description": "Output/physics mode. Any unrecognized value maps to LOS (1BIT_LOS) in the engine.",
+          "enum": ["LOS", "SIMPLE_LOSS", "ITM", "MIN_ALT"]
+        },
+        "max_range_km": { "type": "integer", "minimum": 0, "description": "Maximum analysis range (u32)." },
+        "resolution_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Output pixel resolution (m). Engine enforces no enum; consumers conventionally use one of {2, 5, 10, 30}."
+        },
+        "azimuth_start_deg": { "type": "number", "default": 0.0 },
+        "azimuth_end_deg": { "type": "number", "default": 360.0 },
+        "path_file": { "type": ["string", "null"], "description": "Waypoint file; REQUIRED when task_type == PATH." },
+        "batch_file": { "type": ["string", "null"], "description": "batch_links.csv; REQUIRED when task_type == BATCH_P2P/P2P." },
+        "min_db": { "type": "number", "default": -140.0 },
+        "compute_backend": {
+          "type": "string",
+          "default": "AUTO",
+          "description": "AUTO/GPU/CPU are recognized by the native engine; GPU_ONLY is WASM-only.",
+          "enum": ["AUTO", "GPU", "CPU", "GPU_ONLY"]
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["directory", "filename"],
+      "properties": {
+        "directory": { "type": "string" },
+        "filename": { "type": "string", "description": "Base name without extension." }
+      }
+    },
+    "processing": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "max_ram_usage_gb": { "type": ["integer", "null"], "minimum": 0 },
+        "max_vram_usage_gb": { "type": ["integer", "null"], "minimum": 0 },
+        "terrain_dir": { "type": ["string", "null"] }
+      }
+    },
+    "propagation": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "eps_dielect": { "type": "number", "default": 15.0 },
+        "sgm_conductivity": { "type": "number", "default": 0.005 },
+        "eno_ns_surfref": { "type": "number", "default": 301.0 },
+        "radio_climate": { "type": "integer", "default": 5, "minimum": 1, "maximum": 7 },
+        "pol": { "type": "integer", "default": 0, "enum": [0, 1] },
+        "conf": { "type": "number", "default": 0.5 },
+        "rel": { "type": "number", "default": 0.5 },
+        "earth_radius_mode": { "type": "string", "default": "FOUR_THIRDS", "enum": ["FOUR_THIRDS", "ADVANCED"] },
+        "bwd_scan_interval": { "type": ["integer", "null"] },
+        "bwd_scan_min_range_m": { "type": ["number", "null"] },
+        "ltm_capacity": { "type": ["integer", "null"] }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "analysis": { "properties": { "task_type": { "const": "PATH" } }, "required": ["task_type"] } } },
+      "then": { "properties": { "analysis": { "required": ["path_file"] } } }
+    },
+    {
+      "if": { "properties": { "analysis": { "properties": { "task_type": { "const": "BATCH_P2P" } }, "required": ["task_type"] } } },
+      "then": { "properties": { "analysis": { "required": ["batch_file"] } } }
+    },
+    {
+      "if": { "properties": { "analysis": { "properties": { "task_type": { "const": "P2P" } }, "required": ["task_type"] } } },
+      "then": { "properties": { "analysis": { "required": ["batch_file"] } } }
+    }
+  ]
+}
