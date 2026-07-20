@@ -1,0 +1,16 @@
+{
+  "url_template": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+  "encoding": "terrarium",
+  "output_dir": "./data/cache_abt",
+  "zoom": 12,
+  "max_connections": 128,
+  "tiles": [
+    {
+      "filename": "tile_47_8.abt",
+      "ul_lat": 47.5,
+      "ul_lon": 8.0,
+      "size_px": 2048,
+      "resolution_m": 10.0
+    }
+  ]
+}

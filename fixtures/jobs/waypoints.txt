@@ -1,0 +1,6 @@
+# Waypoint file referenced by path.json (analysis.path_file).
+# Columns: lat_wgs84, lon_wgs84, altitude_m, alt_mode, flight_heading, sweep_min, sweep_max, max_range_km
+# Only the first three columns are required; the rest fall back to job defaults.
+47.3700, 8.5400, 100.0, AGL, 90.0, 45.0, 135.0, 40
+47.4000, 8.5800, 120.0, AGL, 90.0, 45.0, 135.0, 40
+47.4300, 8.6200, 100.0, AMSL, 80.0, 35.0, 125.0, 40

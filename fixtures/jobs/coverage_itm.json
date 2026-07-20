@@ -1,0 +1,44 @@
+{
+  "tx": {
+    "lat": 47.3700,
+    "lon": 8.5400,
+    "height_m": 30.0,
+    "mode": "AMSL",
+    "freq_mhz": 450.0,
+    "erp_watts": 100.0,
+    "az_rotation": 0.0
+  },
+  "rx": {
+    "height_m": 2.0,
+    "mode": "AGL"
+  },
+  "analysis": {
+    "task_type": "SINGLE",
+    "propagation_model": "ITM",
+    "max_range_km": 60,
+    "resolution_m": 10,
+    "azimuth_start_deg": 0.0,
+    "azimuth_end_deg": 360.0,
+    "min_db": -140.0,
+    "compute_backend": "GPU"
+  },
+  "output": {
+    "directory": "./out/coverage_itm",
+    "filename": "coverage_report"
+  },
+  "processing": {
+    "terrain_dir": "./data/cache_abt",
+    "max_ram_usage_gb": 32,
+    "max_vram_usage_gb": 12
+  },
+  "propagation": {
+    "eps_dielect": 15.0,
+    "sgm_conductivity": 0.005,
+    "eno_ns_surfref": 301.0,
+    "radio_climate": 5,
+    "pol": 0,
+    "conf": 0.50,
+    "rel": 0.50,
+    "earth_radius_mode": "FOUR_THIRDS"
+  }
+}

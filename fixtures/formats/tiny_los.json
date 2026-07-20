@@ -1,0 +1,20 @@
+{
+  "job_id": "tiny_los",
+  "type": "LOS_BITMASK",
+  "output_format": "1BIT_LOS",
+  "tile_format": "TILED",
+  "tile_size": 512,
+  "dimensions": {
+    "width": 512,
+    "height": 512
+  },
+  "geotransform": [
+    8.0,
+    9.000009000009e-05,
+    0.0,
+    47.5,
+    0.0,
+    -9.000009000009e-05
+  ],
+  "projection": "EPSG:4326"
+}

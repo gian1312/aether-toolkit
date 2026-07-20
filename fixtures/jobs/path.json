@@ -1,0 +1,31 @@
+{
+  "tx": {
+    "lat": 0.0,
+    "lon": 0.0,
+    "height_m": 100.0,
+    "mode": "AGL",
+    "freq_mhz": 145.0,
+    "erp_watts": 20.0
+  },
+  "rx": {
+    "height_m": 1.5,
+    "mode": "AGL"
+  },
+  "analysis": {
+    "task_type": "PATH",
+    "propagation_model": "LOS",
+    "max_range_km": 40,
+    "resolution_m": 10,
+    "min_db": -140.0,
+    "path_file": "./waypoints.txt"
+  },
+  "output": {
+    "directory": "./out/path",
+    "filename": "coverage_report"
+  },
+  "processing": {
+    "terrain_dir": "./data/cache_abt",
+    "max_ram_usage_gb": 16,
+    "max_vram_usage_gb": 8
+  }
+}

@@ -1,0 +1,4 @@
+# Type, ID_String, Latitude, Longitude, Altitude_meters, Mode
+S, Site_0, 47.3700, 8.5400, 30.0, AGL
+T, WP_0, 47.4200, 8.6100, 2.0, AGL
+T, WP_1, 47.3100, 8.4800, 2.0, AMSL
