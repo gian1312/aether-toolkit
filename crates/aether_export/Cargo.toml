@@ -2,6 +2,7 @@
 name = "aether_export"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 description = "Pure-Rust bitmask-to-GeoTIFF exporter for the AETHER engine. No GDAL."
 
 [[bin]]

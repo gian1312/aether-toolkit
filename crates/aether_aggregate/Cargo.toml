@@ -2,6 +2,7 @@
 name = "aether_aggregate"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 description = "Aggregate multiple raster files into max/count COG outputs (pure Rust, no GDAL)"
 
 [[bin]]

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aether_converter",
+    "crates/aether_export",
+    "crates/aether_aggregate",
+    "crates/aether_converter_wasm",
+    "crates/export_geotiff_wasm",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"

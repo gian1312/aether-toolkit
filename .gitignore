@@ -1,0 +1,14 @@
+# Rust build artifacts
+target/
+
+# Note: Cargo.lock IS committed — these are binary crates, so the lockfile
+# is intentionally tracked for reproducible builds.
+
+# IDE / editor / tooling
+.idea/
+.claude/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
