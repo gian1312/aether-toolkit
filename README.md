@@ -66,8 +66,22 @@ otherwise, any contribution you intentionally submit for inclusion shall be
 
 The Aether engine core (`aether_core`) is **proprietary** and is intentionally
 **not** included in this repository. The toolkit here is decoupled from it and
-communicates only through the stable on-disk formats (`.abt` inputs, `.bit` /
-`.tiles` outputs).
+communicates only through stable, versioned interfaces — CLI invocations, JSON
+files, environment variables, stdout/stderr text, and binary file formats. There
+is no shared library or in-process coupling.
 
-The format specification and the input/output contract these crates target are
-documented in [docs/CONTRACT.md](docs/CONTRACT.md) *(to be added)*.
+Those interfaces are specified in **[docs/CONTRACT.md](docs/CONTRACT.md)** — the
+canonical, versioned engine contract. It documents every CLI and its flags, the
+`job.json` input schema, the `.abt` terrain-tile and ATIL `.bit`/`.tiles` byte
+layouts, the coverage sidecar, the P2P CSV, the `.vix` visibility index, the
+license-key format, and the release manifest. Because `aether_core` also feeds
+two **private** consumers (the MPT_SIGMA KADAS plugin and the Waveshed QGIS
+plugin) that public contributors cannot see, the contract's compatibility policy
+is strict: **all changes must be additive**, consumers must tolerate unknown JSON
+fields, and any breaking change requires a major engine version bump plus a
+synchronized update to the contract, the JSON Schemas in
+[`schemas/`](schemas/), and the golden fixtures in [`fixtures/`](fixtures/).
+Machine-readable schemas live in [`schemas/`](schemas/); worked examples and
+byte-exact binary goldens live in [`fixtures/`](fixtures/) (validate them with
+`python3 tools/validate_fixtures.py`). Read the contract before changing anything
+a consumer can observe.
