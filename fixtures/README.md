@@ -31,11 +31,21 @@ fixtures/
 │   ├── waypoints.txt        # … with this waypoint file
 │   ├── ingest_job.json      # aether_converter ingest --job-file
 │   └── download_job.json    # aether_converter download --job-file
-└── formats/                 # binary goldens (generated, committed)
-    ├── tiny_16x16.abt       # .abt terrain tile, v1 R16SINT, 16x16 px (§6)
-    ├── tiny_los.bit         # ATIL container, 1 tile, 1BIT_LOS, 512x512 (§7)
-    └── tiny_los.json        # sidecar matching tiny_los.bit (§5a)
+├── formats/                 # binary goldens (generated, committed)
+│   ├── tiny_16x16.abt       # .abt terrain tile, v1 R16SINT, 16x16 px (§6)
+│   ├── tiny_los.bit         # ATIL container, 1 tile, 1BIT_LOS, 512x512 (§7)
+│   └── tiny_los.json        # sidecar matching tiny_los.bit (§5a)
+└── keys/                     # license-key structural goldens (generated) — see keys/README.md
+    ├── README.md            # byte layout + worked example + why no real key
+    ├── v1_unsigned.blob     # decoded v1 key blob, 84 B, zero signature (§10)
+    ├── v2_nodelock_unsigned.blob  # decoded v2 key, 116 B, non-zero fingerprint (§10)
+    └── v2_unlocked_unsigned.blob  # decoded v2 key, 116 B, all-zero fingerprint (§10)
 ```
+
+> **The `keys/` blobs are NOT valid license keys.** They are the *decoded*
+> (post-Base58) blobs with a **zero-filled signature**, so the validator can
+> check the v1/v2 byte layout without the vendor private key (which a public
+> repo must not contain). See [`keys/README.md`](keys/README.md).
 
 ## Tools
 

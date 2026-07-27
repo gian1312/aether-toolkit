@@ -8,11 +8,16 @@ Stdlib only — no ``jsonschema`` dependency. Two kinds of checks:
       ``docs/CONTRACT.md`` and mirrored in ``schemas/``.
   (b) Byte-by-byte parsing of the binary fixtures in ``fixtures/formats/``
       (magic, header offsets, index/footer widths, row strides) per §6/§7.
+  (c) Structure-only parsing of the license-key blobs in ``fixtures/keys/``
+      (length discriminator, payload offsets, all-zero-fingerprint rule) per
+      §10. The Ed25519 signature is deliberately NOT verified — that needs the
+      vendor private key, which is out of scope for public fixtures by design.
 
 Exit code 0 means every check passed. Any mismatch is reported loudly and the
 script exits 1. Nothing here is wired into CI yet.
 """
 
+import hashlib
 import json
 import os
 import struct
@@ -21,6 +26,7 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(REPO_ROOT, "fixtures", "jobs")
 FORMATS_DIR = os.path.join(REPO_ROOT, "fixtures", "formats")
+KEYS_DIR = os.path.join(REPO_ROOT, "fixtures", "keys")
 
 ERRORS = []
 
@@ -278,6 +284,86 @@ def validate_bit(path, sidecar_path, ctx):
     check(_get_bit(tile, row_bytes, 20, 5) == 0, f"{ctx}: off-pattern bit (20,5) unexpectedly set")
 
 
+# ── (c) License-key structural parsers (contract §10) ────────────────────────
+#
+# The committed blobs are *decoded* (post-Base58) and have a ZERO-FILLED 64-byte
+# signature region — a valid signature needs the vendor private key, which is by
+# design absent from a public repo. So these checks cover structure only (length
+# discriminator + payload offsets + the all-zero-fingerprint rule); they never
+# verify the signature. Values below mirror tools/make_fixtures.py and
+# fixtures/keys/README.md.
+
+KEY_EXP_DAYS = 730           # big-endian 0x02DA (expires 2028-01-01, epoch 2026-01-01)
+KEY_MAINT_DAYS = 365         # big-endian 0x016D (maintenance through 2027-01-01)
+KEY_SEED = b"SEEDSEEDSEEDSEED"                    # 16 bytes, synthetic
+KEY_MACHINE_ID = b"0123456789abcdef0123456789abcdef"
+KEY_FINGERPRINT = hashlib.sha256(KEY_MACHINE_ID).digest()   # 32 bytes
+
+
+def _parse_key_blob(data, ctx):
+    """Structure-only parse of a decoded license blob. Returns
+    ``(version, exp_days, maint_days, seed, fingerprint_or_None)`` or ``None``
+    on a length that is neither 84 (v1) nor 116 (v2)."""
+    n = len(data)
+    # Length discriminator: 84 => v1, 116 => v2, anything else => malformed (§10).
+    if n == 84:
+        version, payload_len = 1, 20
+    elif n == 116:
+        version, payload_len = 2, 52
+    else:
+        check(False, f"{ctx}: decoded blob length {n} is neither 84 (v1) nor 116 (v2)")
+        return None
+    exp_days = struct.unpack_from(">H", data, 0)[0]      # big-endian u16
+    maint_days = struct.unpack_from(">H", data, 2)[0]    # big-endian u16
+    seed = data[4:20]
+    check(len(seed) == 16, f"{ctx}: master_seed must be 16 bytes, got {len(seed)}")
+    fingerprint = data[20:52] if version == 2 else None
+    if version == 2:
+        check(len(fingerprint) == 32, f"{ctx}: v2 fingerprint must be 32 bytes, got {len(fingerprint)}")
+    # Signature is the final 64 bytes; present but intentionally NOT verified.
+    sig = data[payload_len:]
+    check(len(sig) == 64, f"{ctx}: Ed25519 signature region must be 64 bytes, got {len(sig)}")
+    return version, exp_days, maint_days, seed, fingerprint
+
+
+def validate_key_fixtures():
+    # (filename, expected_version, expected_node_locked)
+    cases = (
+        ("v1_unsigned.blob", 1, None),
+        ("v2_nodelock_unsigned.blob", 2, True),
+        ("v2_unlocked_unsigned.blob", 2, False),
+    )
+    for name, want_ver, want_locked in cases:
+        p = os.path.join(KEYS_DIR, name)
+        if not check(os.path.exists(p), f"missing key fixture {name}"):
+            continue
+        with open(p, "rb") as f:
+            data = f.read()
+        parsed = _parse_key_blob(data, name)
+        if parsed is None:
+            continue
+        version, exp_days, maint_days, seed, fingerprint = parsed
+        check(version == want_ver, f"{name}: decoded as v{version}, expected v{want_ver}")
+        check(exp_days == KEY_EXP_DAYS, f"{name}: exp_days {exp_days} != {KEY_EXP_DAYS}")
+        check(maint_days == KEY_MAINT_DAYS, f"{name}: maint_days {maint_days} != {KEY_MAINT_DAYS}")
+        check(seed == KEY_SEED, f"{name}: master_seed {seed!r} != {KEY_SEED!r}")
+        if version == 2:
+            is_locked = any(fingerprint)  # all-zero fingerprint => not node-locked (§10)
+            check(bool(is_locked) == want_locked,
+                  f"{name}: node-locked={bool(is_locked)}, expected {want_locked} "
+                  f"(all-zero fingerprint => runs anywhere)")
+            if want_locked:
+                check(fingerprint == KEY_FINGERPRINT,
+                      f"{name}: fingerprint != SHA-256(example machine-id)")
+            else:
+                check(fingerprint == b"\x00" * 32,
+                      f"{name}: unlocked fixture must have an all-zero fingerprint")
+        # Structure-only: the signature region must be the zero-filled placeholder.
+        check(data[-64:] == b"\x00" * 64,
+              f"{name}: signature region must be zero-filled (unsigned structural golden)")
+        print(f"  checked {name}")
+
+
 # ── Driver ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -315,6 +401,9 @@ def main():
         "tiny_los.bit",
     )
     print("  checked tiny_los.bit + tiny_los.json")
+
+    print("== (c) license-key structural fixtures ==")
+    validate_key_fixtures()
 
     print()
     if ERRORS:

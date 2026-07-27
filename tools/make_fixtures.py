@@ -12,11 +12,18 @@ Every byte is laid out exactly as documented in ``docs/CONTRACT.md``:
     converter's ``AbtWriter``).
   * ``tiny_los.bit`` + ``tiny_los.json`` — a single-tile ATIL container (see
     §7), 1BIT_LOS, 512x512, with a matching sidecar (see §5a).
+  * ``keys/v1_unsigned.blob`` / ``keys/v2_nodelock_unsigned.blob`` /
+    ``keys/v2_unlocked_unsigned.blob`` — *decoded* license-key blobs (see §10)
+    exercising the 84-vs-116 length discriminator and the all-zero-fingerprint
+    rule. **Their 64-byte signature region is zero-filled — they are NOT valid
+    keys** (a real key needs the vendor private seed, by design absent here).
+    See ``fixtures/keys/README.md``.
 
 These are *spec-derived* goldens, not engine-generated. See
 ``fixtures/README.md``.
 """
 
+import hashlib
 import json
 import os
 import struct
@@ -24,6 +31,7 @@ import struct
 # ── Paths (resolved relative to this file, not the CWD) ──────────────────────
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FORMATS_DIR = os.path.join(REPO_ROOT, "fixtures", "formats")
+KEYS_DIR = os.path.join(REPO_ROOT, "fixtures", "keys")
 
 # ── Shared geo constants (kept identical between .abt and sidecar) ───────────
 RESOLUTION_M = 10.0
@@ -139,8 +147,45 @@ def build_sidecar() -> dict:
     }
 
 
+# ── License-key structural goldens (contract §10) ────────────────────────────
+#
+# These are the *decoded* blobs (i.e. post-Base58), because §10's offsets index
+# the decoded blob. The 64-byte Ed25519 signature region is ZERO-FILLED: a valid
+# signature needs the vendor private key, which is by design not in a public
+# repo. So these goldens are structure-only — they exercise the length
+# discriminator and payload offsets, never signature verification.
+#
+# Worked-example values (kept identical in tools/validate_fixtures.py and
+# fixtures/keys/README.md). Epoch is 2026-01-01.
+KEY_EPOCH = "2026-01-01"
+KEY_EXP_DAYS = 730          # -> big-endian 0x02DA -> expires 2028-01-01
+KEY_MAINT_DAYS = 365        # -> big-endian 0x016D -> maintenance through 2027-01-01
+KEY_SEED = b"SEEDSEEDSEEDSEED"          # 16 bytes; obviously synthetic, not real key material
+# A synthetic Linux-style /etc/machine-id, hashed exactly as-is (no trailing newline).
+KEY_MACHINE_ID = b"0123456789abcdef0123456789abcdef"
+KEY_FINGERPRINT = hashlib.sha256(KEY_MACHINE_ID).digest()   # 32 bytes -> node-locked example
+KEY_ZERO_SIG = b"\x00" * 64             # placeholder signature (unsigned golden)
+KEY_ZERO_FP = b"\x00" * 32              # all-zero fingerprint => not node-locked
+
+
+def build_key_blob(version, fingerprint):
+    """Build a decoded license-key blob (§10) with a zero-filled signature.
+
+    ``version == 1`` -> 84-byte blob (no fingerprint).
+    ``version == 2`` -> 116-byte blob; ``fingerprint`` is the 32-byte field
+    (pass ``KEY_ZERO_FP`` for an unlocked v2 key)."""
+    payload = struct.pack(">HH", KEY_EXP_DAYS, KEY_MAINT_DAYS) + KEY_SEED  # 20 bytes
+    if version == 2:
+        assert fingerprint is not None and len(fingerprint) == 32
+        payload += fingerprint                                            # -> 52 bytes
+    blob = payload + KEY_ZERO_SIG
+    assert len(blob) == (84 if version == 1 else 116), len(blob)
+    return blob
+
+
 def main() -> None:
     os.makedirs(FORMATS_DIR, exist_ok=True)
+    os.makedirs(KEYS_DIR, exist_ok=True)
 
     abt_path = os.path.join(FORMATS_DIR, "tiny_16x16.abt")
     bit_path = os.path.join(FORMATS_DIR, "tiny_los.bit")
@@ -154,7 +199,19 @@ def main() -> None:
         json.dump(build_sidecar(), f, indent=2)
         f.write("\n")
 
-    for p in (abt_path, bit_path, sidecar_path):
+    # License-key structural goldens (§10).
+    key_v1_path = os.path.join(KEYS_DIR, "v1_unsigned.blob")
+    key_v2_lock_path = os.path.join(KEYS_DIR, "v2_nodelock_unsigned.blob")
+    key_v2_open_path = os.path.join(KEYS_DIR, "v2_unlocked_unsigned.blob")
+    with open(key_v1_path, "wb") as f:
+        f.write(build_key_blob(1, None))
+    with open(key_v2_lock_path, "wb") as f:
+        f.write(build_key_blob(2, KEY_FINGERPRINT))
+    with open(key_v2_open_path, "wb") as f:
+        f.write(build_key_blob(2, KEY_ZERO_FP))
+
+    for p in (abt_path, bit_path, sidecar_path,
+              key_v1_path, key_v2_lock_path, key_v2_open_path):
         print(f"wrote {os.path.relpath(p, REPO_ROOT)} ({os.path.getsize(p)} bytes)")
 
 

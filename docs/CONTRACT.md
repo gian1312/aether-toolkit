@@ -1,11 +1,17 @@
 # Aether engine contract
 
-**Status: Contract version 1.** This document is the canonical, versioned
+**Status: Contract version 1.1.** This document is the canonical, versioned
 description of the interface between the proprietary **`aether_core`** engine
 (which lives in the private `AETHER` repository and is *not* shipped here) and
 its consumers. It targets the current `aether_core` **0.x** engine line and the
 crates in this workspace (`aether_converter`, `aether_export`,
 `aether_aggregate`).
+
+> **Changelog — contract v1.1 (additive):** adds the **v2 node-locked license
+> key** format (§10) and the **`aether_core --fingerprint`** CLI (§1.1). Both are
+> additive under the compatibility policy below: v1 (84-byte) keys remain valid
+> indefinitely and every other surface is unchanged. v1.0 was the initial
+> contract.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -80,13 +86,22 @@ ships from the private repo; the other three are built from this workspace
 ### 1.1 `aether_core`
 
 ```
-aether_core --config <job.json>
+aether_core --config <job.json>   # run a job (the normal invocation)
+aether_core --fingerprint         # print this machine's node-lock fingerprint, then exit 0
 ```
 
-* `--config <path>` (short `-c`) is the **only** invocation form. It is a
-  required argument (`clap` `Parser`, field `config: PathBuf`,
-  `#[arg(short, long)]`). There are no positional arguments and no other
+* `--config <path>` (short `-c`) is the invocation form for **running a job**,
+  and is required to run one (`clap` `Parser`, field `config: PathBuf`,
+  `#[arg(short, long)]`). There are no positional arguments and no
   sub-commands.
+* `--fingerprint` (long flag; **output-only**) prints this machine's node-lock
+  fingerprint — the **lowercase hex** (64 chars) of `SHA-256(machine_id_string)`
+  (§10) — to **stdout** and exits `0`. It **needs no license** and
+  short-circuits *before* any license enforcement, so it works in both dev and
+  `proprietary` builds. The binary derives the value from the host OS only and
+  **never accepts a fingerprint as input** — no flag, env var, or job field
+  supplies one. Consumers call this to read the fingerprint they must send the
+  vendor to be issued a node-locked (v2) key.
 * **Exit code `0` = success.** Any failure prints `[E:<message>]` to stdout and
   exits `1` (`main.rs`: config-read failure, JSON-parse failure, and the
   top-level `Err` handler all `std::process::exit(1)`).
@@ -265,7 +280,7 @@ do **not** expose these on the CLI).
 
 | Variable | Read by | Purpose |
 |----------|---------|---------|
-| `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
+| `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key — **v1 or v2** (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
 | `RUST_LOG` | `aether_core`, toolkit CLIs | `env_logger` level filter. **Must be `info` (or lower)** for the log-line progress diagnostics of §1.1(b) to appear. Markers in §1.1(a) do not depend on it. |
 | `AETHER_BIN_DIR` | consumers only | Convention for locating the engine binaries. **Not read by any engine/toolkit code** — it is purely a consumer-side discovery hint. Do not add engine logic that depends on it. |
 | `PYTHONUNBUFFERED` | consumers only | Set by Python consumers so a child process's stdout markers/log lines arrive line-by-line rather than block-buffered. Not read by Rust code. |
@@ -287,6 +302,12 @@ let license_b58 = std::env::var("AETHER_LICENSE")
   locates itself (`workers/splat_worker.py`), sidestepping the CWD nuance.
 * License enforcement is compiled in only under the `proprietary` Cargo feature.
   Non-proprietary/dev builds do not require a license.
+* The supplied key may be a **v1 (84-byte)** or **v2 (116-byte, node-locked)**
+  blob (§10); both travel through `AETHER_LICENSE`/`license.key` identically —
+  the engine discriminates by decoded length. There is **no environment variable
+  (or job field) for the node-lock fingerprint**: the engine computes it from
+  the host OS and only ever *prints* it via `aether_core --fingerprint` (§1.1).
+  It is never taken as input.
 
 ---
 
@@ -780,11 +801,30 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 
 Authority: `python/utils/keygen.py` (issuer) and
 `rust/aether_core/src/crypto.rs` (verifier). Byte layout only — no key material.
+Worked byte-offset examples and structural goldens live in
+[`../fixtures/keys/`](../fixtures/keys/README.md).
 
-* An **84-byte blob**, **Base58-encoded** using the **Bitcoin alphabet**
-  (`base58` in Python / `bs58` in Rust, both default to that alphabet):
-  * **payload — 20 bytes** `[0:20]`
-  * **Ed25519 signature — 64 bytes** `[20:84]` over the 20-byte payload.
+There are **two key versions**. Both share the same envelope: a binary blob,
+**Base58-encoded** using the **Bitcoin alphabet** (`base58` in Python / `bs58`
+in Rust, both default to that alphabet), carrying a **payload** followed by a
+**64-byte Ed25519 signature** over exactly that payload. All multi-byte integers
+are **big-endian**, and all day counts are measured from the epoch
+**`2026-01-01`**.
+
+* **v1** — the original **general / unlocked** key. Decoded blob is **84 bytes**.
+* **v2** — the new **node-locked** key (binds a license to one machine). Decoded
+  blob is **116 bytes**.
+
+**Version discriminator — by decoded length.** After Base58-decoding, the blob
+length selects the version: **`84` ⇒ v1, `116` ⇒ v2**. Any other decoded length
+is **malformed** and must be rejected. There is no version byte; the **length is
+the discriminator**.
+
+### 10.1 v1 — general / unlocked (84 bytes, unchanged)
+
+* **84-byte blob** = `payload[0:20]` + `sig[20:84]`:
+  * **payload — 20 bytes** `[0:20]`.
+  * **Ed25519 signature — 64 bytes** `[20:84]`, over `payload[0:20]`.
 * **Payload layout (20 bytes):**
 
   | Offset | Size | Type | Field | Notes |
@@ -795,12 +835,85 @@ Authority: `python/utils/keygen.py` (issuer) and
 
   (Issuer: `struct.pack(">HH", exp_days, maint_days) + master_seed_bytes`.
   Verifier: `u16::from_be_bytes(payload[0..2])`, `payload[2..4]`, `payload[4..20]`.)
-* **Verification & enforcement (proprietary build):** the signature is checked
-  against the vendor public key; then `today_days > exp_days` ⇒
-  `[FATAL] License expired`, and `build_days > maint_days` ⇒ *"released after
-  your maintenance period ended"*. `today_days`/`build_days` are also counted
-  from `2026-01-01`.
-* Provide the key via `AETHER_LICENSE` or a `license.key` file (§2).
+
+**v1 keys remain valid indefinitely.** Adding v2 does not deprecate, shorten, or
+otherwise change v1: an already-issued v1 key keeps verifying exactly as before.
+
+### 10.2 v2 — node-locked (116 bytes, new)
+
+A v2 key extends the v1 payload with a 32-byte **machine fingerprint**, letting
+the vendor bind a license to a specific machine.
+
+* **116-byte blob** = `payload[0:52]` + `sig[52:116]`:
+  * **payload — 52 bytes** `[0:52]`.
+  * **Ed25519 signature — 64 bytes** `[52:116]`, over `payload[0:52]`.
+* **Payload layout (52 bytes):**
+
+  | Offset | Size | Type | Field | Notes |
+  |-------:|-----:|------|-------|-------|
+  | 0 | 2 | u16 **big-endian** | `exp_days` | Expiry, days since `2026-01-01` (as v1). |
+  | 2 | 2 | u16 **big-endian** | `maint_days` | Maintenance-window end, days since `2026-01-01` (as v1). |
+  | 4 | 16 | bytes | `master_seed` | Shader-decryption master seed (as v1). |
+  | 20 | 32 | bytes | `fingerprint` | Machine fingerprint = `SHA-256(machine_id_string)`. **All-zero ⇒ not node-locked** (runs on any machine). |
+
+  The first 20 payload bytes are byte-for-byte the v1 payload; v2 only **appends**
+  the 32-byte `fingerprint`, and the signature now covers all 52 payload bytes.
+
+**Fingerprint semantics.**
+
+* `fingerprint` = **`SHA-256(machine_id_string)`**, 32 bytes. The **user-facing
+  fingerprint** is the **lowercase hex** of those 32 bytes (**64 hex chars**) —
+  exactly the string `aether_core --fingerprint` prints (§1.1).
+* **An all-zero fingerprint (32 × `0x00`) means the key is *not* node-locked**
+  and runs anywhere. A vendor issues an unlocked v2 key by zero-filling this
+  field.
+* `machine_id_string` is read per-OS:
+
+  | OS | `machine_id_string` source |
+  |----|----------------------------|
+  | Windows | registry `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` |
+  | Linux | `/etc/machine-id` (fallback `/var/lib/dbus/machine-id`) |
+  | macOS | `IOPlatformUUID` (IOKit) |
+
+  The engine derives the fingerprint from the OS itself; it **never accepts a
+  fingerprint as input** (see `--fingerprint`, §1.1).
+
+### 10.3 Verification & enforcement (proprietary build)
+
+Enforcement is compiled in only under the `proprietary` Cargo feature; dev builds
+do not require a license (§2). Checks run in this order:
+
+1. **Signature** — verified against the vendor public key over the version's
+   payload (`payload[0:20]` for v1, `payload[0:52]` for v2). A bad signature is
+   fatal.
+2. **Expiry** — `today_days > exp_days` ⇒ `[FATAL] License expired`.
+3. **Maintenance** — `build_days > maint_days` ⇒ *"released after your
+   maintenance period ended"*.
+4. **Node-lock (v2 only)** — if the v2 `fingerprint` is **not** all-zero, require
+   `SHA-256(local machine_id) == fingerprint`; otherwise the engine fails with a
+   fatal *"locked to a different machine"* error. An all-zero fingerprint skips
+   this step (runs anywhere), and v1 keys have no fingerprint so never reach it.
+
+`today_days`/`build_days` are counted from `2026-01-01`. Provide the key via
+`AETHER_LICENSE` or a `license.key` file (§2). The `--fingerprint` query (§1.1)
+short-circuits **before** all of the above, so it needs no key.
+
+### 10.4 Compatibility & the one consumer requirement
+
+Adding v2 is an **additive** change under the compatibility policy (see the top
+of this document): v1 keys stay valid indefinitely, and the v2 length (`116`) is
+simply an *additional* accepted decoded length. Keys are a **binary blob, not
+JSON**, so no `schemas/` file applies — this section plus the `fixtures/keys/`
+goldens are the whole surface.
+
+**Load-bearing consumer requirement:** any consumer that length-checks the
+decoded blob **MUST accept both `84` and `116`.** The **Waveshed QGIS plugin**
+(`api_key.py`) previously asserted `len == 84` and was **updated** to accept
+both; the **pipeline GUI** `inspect_key` parses both lengths. A consumer that
+still hard-checks `== 84` will **reject every v2 (node-locked) key**. Consumers
+that treat the key as an **opaque** string and never length-check it are
+unaffected — **MPT_SIGMA** passes `AETHER_LICENSE` through verbatim
+(`workers/splat_worker.py`) and needs no change.
 
 ---
 
@@ -873,8 +986,9 @@ binary updates. It is served from waveshed.io.
 | P2P CSV + profiles | `AETHER/rust/aether_core/src/engines/p2p.rs` |
 | `.abt` reader | `AETHER/rust/aether_core/src/io/mod.rs` |
 | ATIL writer | `AETHER/rust/aether_core/src/io/tiled_buffer.rs` |
-| license verify | `AETHER/rust/aether_core/src/crypto.rs` |
-| license issue | `AETHER/python/utils/keygen.py` |
+| license verify (v1 + v2), node-lock enforcement, `--fingerprint` | `AETHER/rust/aether_core/src/{crypto.rs,main.rs}` |
+| license issue (v1 + v2 keygen) | `AETHER/python/utils/keygen.py` |
+| license-blob length check (must accept 84 **and** 116) | QGIS `…/api_key.py`; pipeline GUI `inspect_key` |
 | WASM backend selection | `AETHER/rust/aether_core_wasm/src/lib.rs` |
 | `.abt` writer, disk-space string, download job | `crates/aether_converter/src/{download.rs,ingest.rs}` |
 | ATIL reader, GeoTIFF export | `crates/aether_export/src/main.rs` |
