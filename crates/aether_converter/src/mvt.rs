@@ -7,6 +7,8 @@
 use anyhow::{anyhow, Result};
 use prost::Message;
 
+use crate::buildings::{Building, BuildingHeight, HeightSource};
+
 // ── Protobuf message definitions (MVT spec v2.1) ──────────────
 
 #[derive(Clone, Message)]
@@ -89,6 +91,22 @@ pub struct BuildingPolygon {
     pub coords: Vec<(f64, f64)>,
     /// Building height above ground in meters.
     pub height_m: f64,
+    /// Which rung of the height ladder `height_m` came from.
+    pub source: HeightSource,
+}
+
+impl BuildingPolygon {
+    /// Convert into the shared building model.
+    ///
+    /// Vector tiles always carry a height *above ground*, so the rasterizer has
+    /// to resolve it against the terrain under the footprint before writing.
+    pub fn to_building(&self) -> Building {
+        Building {
+            coords: self.coords.clone(),
+            height: BuildingHeight::AboveGround(self.height_m),
+            source: self.source,
+        }
+    }
 }
 
 /// Diagnostic stats from PBF building extraction.
@@ -208,9 +226,10 @@ fn resolve_height(feature: &Feature, layer: &Layer) -> f64 {
     resolve_height_detailed(feature, layer).0
 }
 
-/// Returns (height_m, is_explicit). `is_explicit` is true if render_height or
-/// building:levels was found, false if the default was used.
-fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, bool) {
+/// Returns (height_m, source). The ladder is: an explicit `render_height`, then
+/// a storey count via `building:levels`, then [`DEFAULT_HEIGHT`]. The source is
+/// carried out so callers can report how much of a result was guessed.
+fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, HeightSource) {
     let mut i = 0;
     while i + 1 < feature.tags.len() {
         let key_idx = feature.tags[i] as usize;
@@ -222,22 +241,22 @@ fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, bool) {
         let val = &layer.values[val_idx];
 
         if key == "render_height" {
-            if let Some(v) = val.float_val { if v > 0.0 { return (v as f64, true); } }
-            if let Some(v) = val.double_val { if v > 0.0 { return (v, true); } }
-            if let Some(v) = val.int_val { if v > 0 { return (v as f64, true); } }
-            if let Some(v) = val.uint_val { if v > 0 { return (v as f64, true); } }
-            if let Some(v) = val.sint_val { if v > 0 { return (v as f64, true); } }
+            if let Some(v) = val.float_val { if v > 0.0 { return (v as f64, HeightSource::ExplicitHeight); } }
+            if let Some(v) = val.double_val { if v > 0.0 { return (v, HeightSource::ExplicitHeight); } }
+            if let Some(v) = val.int_val { if v > 0 { return (v as f64, HeightSource::ExplicitHeight); } }
+            if let Some(v) = val.uint_val { if v > 0 { return (v as f64, HeightSource::ExplicitHeight); } }
+            if let Some(v) = val.sint_val { if v > 0 { return (v as f64, HeightSource::ExplicitHeight); } }
         }
         if key == "building:levels" {
-            if let Some(v) = val.int_val { if v > 0 { return (v as f64 * 3.0, true); } }
-            if let Some(v) = val.uint_val { if v > 0 { return (v as f64 * 3.0, true); } }
-            if let Some(v) = val.sint_val { if v > 0 { return (v as f64 * 3.0, true); } }
+            if let Some(v) = val.int_val { if v > 0 { return (v as f64 * 3.0, HeightSource::Levels); } }
+            if let Some(v) = val.uint_val { if v > 0 { return (v as f64 * 3.0, HeightSource::Levels); } }
+            if let Some(v) = val.sint_val { if v > 0 { return (v as f64 * 3.0, HeightSource::Levels); } }
             if let Some(ref s) = val.string_val {
-                if let Ok(n) = s.parse::<f64>() { if n > 0.0 { return (n * 3.0, true); } }
+                if let Ok(n) = s.parse::<f64>() { if n > 0.0 { return (n * 3.0, HeightSource::Levels); } }
             }
         }
     }
-    (DEFAULT_HEIGHT, false)
+    (DEFAULT_HEIGHT, HeightSource::Default)
 }
 
 /// Count building features using raw protobuf wire parsing (no prost).
@@ -351,7 +370,7 @@ pub fn extract_buildings_from_pbf(
             }
             stats.features_polygon += 1;
 
-            let (height, is_explicit) = resolve_height_detailed(feature, layer);
+            let (height, height_source) = resolve_height_detailed(feature, layer);
             let rings = decode_geometry(&feature.geometry, extent, tile_x, tile_y, z);
 
             // Each feature can be a multi-polygon: Planetiler merges individual
@@ -361,7 +380,11 @@ pub fn extract_buildings_from_pbf(
             if rings.is_empty() {
                 stats.features_no_rings += 1;
             } else {
-                if is_explicit { stats.height_explicit_count += 1; } else { stats.height_default_count += 1; }
+                if height_source == HeightSource::Default {
+                    stats.height_default_count += 1;
+                } else {
+                    stats.height_explicit_count += 1;
+                }
                 let mut ring_count = 0;
                 for ring in rings {
                     if ring.len() < 3 {
@@ -379,7 +402,7 @@ pub fn extract_buildings_from_pbf(
                     stats.height_sum += height;
                     if height < stats.height_min { stats.height_min = height; }
                     if height > stats.height_max { stats.height_max = height; }
-                    buildings.push(BuildingPolygon { coords: ring, height_m: height });
+                    buildings.push(BuildingPolygon { coords: ring, height_m: height, source: height_source });
                     ring_count += 1;
                 }
                 if ring_count == 0 { stats.features_short_ring += 1; }
@@ -393,7 +416,7 @@ pub fn extract_buildings_from_pbf(
 
 // ── Batch building application to .abt tiles ──────────────────────
 
-use crate::ingest::point_in_poly;
+use crate::buildings::{rasterize_buildings, AbtGrid, RasterOpts, TileRef};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Cursor;
 use std::collections::HashSet;
@@ -464,10 +487,17 @@ pub fn apply_buildings_to_abt_tiles(
     let buildings_after_dedup = all_buildings.len();
 
     // ── 3. Rasterize onto each .abt tile ─────────────────────────
+    // The write rule lives in `buildings::rasterize_buildings`, shared with the
+    // FlatGeobuf path: resolve each above-ground height against the terrain
+    // under its own footprint, then composite the resulting absolute roof with
+    // `max`. This replaced a per-pixel `+= height`, which draped roofs over
+    // slopes, stacked overlapping footprints and doubled on re-application.
+    let model: Vec<Building> = all_buildings.iter().map(|b| b.to_building()).collect();
+    let opts = RasterOpts::default();
     let mut per_tile = Vec::with_capacity(abt_bufs.len());
 
     for buf in abt_bufs.iter_mut() {
-        if buf.len() < 44 || all_buildings.is_empty() {
+        if buf.len() < 44 || model.is_empty() {
             per_tile.push((0, 0));
             continue;
         }
@@ -482,60 +512,11 @@ pub fn apply_buildings_to_abt_tiles(
         let _base_elev = c.read_i16::<LittleEndian>().unwrap();
         let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
 
-        let mut total_modified = 0u32;
-        let mut buildings_hit = 0u32;
+        let tile = TileRef { ul_lat, ul_lon, scale_x, scale_y, size_px };
+        let mut grid = AbtGrid { buf, size: size_px, stride };
+        let stats = rasterize_buildings(&mut grid, &tile, &model, &opts);
 
-        for bldg in &all_buildings {
-            if bldg.coords.len() < 3 { continue; }
-
-            let bldg_h_i16 = (bldg.height_m * 2.0).round() as i16;
-            if bldg_h_i16 <= 0 { continue; }
-
-            let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(bldg.coords.len());
-            let mut min_x = size_px as f64;
-            let mut max_x = 0.0f64;
-            let mut min_y = size_px as f64;
-            let mut max_y = 0.0f64;
-
-            for &(lon, lat) in &bldg.coords {
-                let px = (lon - ul_lon) / scale_x;
-                let py = (ul_lat - lat) / scale_y;
-                min_x = min_x.min(px);
-                max_x = max_x.max(px);
-                min_y = min_y.min(py);
-                max_y = max_y.max(py);
-                vertices.push((px, py));
-            }
-
-            if max_x < 0.0 || min_x >= size_px as f64 || max_y < 0.0 || min_y >= size_px as f64 {
-                continue;
-            }
-
-            let start_x = (min_x.floor().max(0.0)) as u32;
-            let end_x = (max_x.ceil().min(size_px as f64)) as u32;
-            let start_y = (min_y.floor().max(0.0)) as u32;
-            let end_y = (max_y.ceil().min(size_px as f64)) as u32;
-
-            let mut any_modified = false;
-            for y in start_y..end_y {
-                let py_center = y as f64 + 0.5;
-                for x in start_x..end_x {
-                    if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
-                        let offset = 44 + y as usize * stride + x as usize * 2;
-                        if offset + 1 < buf.len() {
-                            let current = i16::from_le_bytes([buf[offset], buf[offset + 1]]);
-                            let roof = current.saturating_add(bldg_h_i16);
-                            buf[offset..offset + 2].copy_from_slice(&roof.to_le_bytes());
-                            total_modified += 1;
-                            any_modified = true;
-                        }
-                    }
-                }
-            }
-            if any_modified { buildings_hit += 1; }
-        }
-
-        per_tile.push((buildings_hit, total_modified));
+        per_tile.push((stats.buildings_hit, stats.pixels_modified));
     }
 
     ApplyBuildingsResult {

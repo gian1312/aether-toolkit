@@ -12,6 +12,10 @@ use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 use anyhow::{Context, Result};
 use flatgeobuf::{FgbReader, GeometryType};
+use crate::buildings::{
+    rasterize_buildings, Building, BuildingHeight, HeightSource, I16Grid, RasterOpts, Rounding,
+    TileRef,
+};
 use fallible_streaming_iterator::FallibleStreamingIterator;
 #[cfg(feature = "bc6h")]
 use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
@@ -27,6 +31,14 @@ pub struct IngestJob {
     pub base_tif: Option<PathBuf>,
     pub swiss_tifs: Vec<PathBuf>,
     pub buildings_file: Option<PathBuf>,
+    /// Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf`
+    /// (gzipped or not), e.g. an OpenFreeMap planet fetch.
+    ///
+    /// Optional and absent from older jobs, so existing callers are unaffected.
+    /// Unlike `buildings_file`, these carry a height *above ground*, which the
+    /// rasterizer resolves against the terrain under each footprint.
+    #[serde(default)]
+    pub buildings_pbf_dir: Option<PathBuf>,
 }
 
 pub struct LoadedImage {
@@ -261,6 +273,11 @@ pub fn process_tile_with_cache(
             println!("[Warn] Failed to apply buildings: {}", e);
         }
     }
+    if let Some(pbf_dir) = &job.buildings_pbf_dir {
+        if let Err(e) = apply_buildings_pbf(&job, &mut buffer, pbf_dir, pixel_deg) {
+            println!("[Warn] Failed to apply PBF buildings: {}", e);
+        }
+    }
 
     let format_str = job.format.as_deref().unwrap_or("r16sint");
     let is_bc6h = format_str.eq_ignore_ascii_case("bc6h");
@@ -406,8 +423,7 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
     let min_lat = job.ul_lat.min(lr_lat) - pad_deg;
     let max_lat = job.ul_lat.max(lr_lat) + pad_deg;
 
-    let mut total_pixels_mod = 0;
-    let mut total_features = 0;
+    let mut all_buildings: Vec<Building> = Vec::new();
 
     for fgb_path in files_to_process {
         let file = File::open(&fgb_path)?;
@@ -424,104 +440,171 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
             if let Some(geo) = feature.geometry() {
                 let g_type = geo.type_();
                 if g_type == GeometryType::MultiPolygon || g_type == GeometryType::Polygon {
-                    total_features += 1;
-                    total_pixels_mod += process_geometry_wgs84(
-                        &geo, buffer, job.size_px,
-                        job.ul_lon, job.ul_lat, px_deg
-                    );
+                    collect_fgb_buildings(&geo, &mut all_buildings);
                 }
             }
         }
     }
 
+    if all_buildings.is_empty() {
+        return Ok(());
+    }
+
+    let tile = TileRef {
+        ul_lat: job.ul_lat,
+        ul_lon: job.ul_lon,
+        scale_x: px_deg,
+        scale_y: px_deg,
+        size_px: job.size_px,
+    };
+    let mut grid = I16Grid { buf: buffer, size: job.size_px };
+    // Truncation, not rounding: this path has always truncated `z * 2.0`, and
+    // keeping that keeps previously generated .abt tiles byte-identical.
+    let opts = RasterOpts { rounding: Rounding::Truncate, ..Default::default() };
+    let stats = rasterize_buildings(&mut grid, &tile, &all_buildings, &opts);
+
+    if stats.datum_suspect {
+        eprintln!(
+            "[WARN] buildings: roofs sit a median {:.1} m from the terrain — the \
+             source may be above-ground heights labelled as absolute, or use a \
+             different vertical datum than the terrain.",
+            stats.median_roof_above_terrain.unwrap_or(0.0)
+        );
+    }
+
     Ok(())
 }
 
-fn process_geometry_wgs84(
-    geo: &flatgeobuf::Geometry, buffer: &mut[i16], size: u32,
-    ul_lon: f64, ul_lat: f64, px_deg: f64
-) -> usize {
-    if let Some(parts) = geo.parts() {
-        if parts.len() > 0 {
-            let mut total_modified = 0;
-            for i in 0..parts.len() {
-                let part = parts.get(i);
-                total_modified += process_geometry_wgs84(&part, buffer, size, ul_lon, ul_lat, px_deg);
+/// Parse the `{z}_{x}_{y}.pbf` tile coordinates out of a file name.
+pub fn parse_pbf_tile_name(name: &str) -> Option<(u32, u32, u32)> {
+    let stem = name.strip_suffix(".pbf").or_else(|| name.strip_suffix(".mvt"))?;
+    let parts: Vec<&str> = stem.split('_').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+}
+
+/// Rasterize vector-tile buildings from *pbf_dir* onto an ingest tile buffer.
+///
+/// Shares the decoder and the write rule with the WASM pipeline, so the native
+/// converter and the browser produce the same surface from the same tiles.
+fn apply_buildings_pbf(
+    job: &IngestJob,
+    buffer: &mut [i16],
+    pbf_dir: &Path,
+    px_deg: f64,
+) -> Result<()> {
+    if !pbf_dir.is_dir() {
+        anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
+    }
+
+    let mut all: Vec<Building> = Vec::new();
+    let mut tiles_read = 0usize;
+    for entry in fs::read_dir(pbf_dir)?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some((z, x, y)) = parse_pbf_tile_name(name) else { continue };
+
+        let raw = fs::read(&path)?;
+        let bytes = crate::mvt::maybe_gunzip(&raw);
+        match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
+            Ok((buildings, _stats)) => {
+                tiles_read += 1;
+                all.extend(buildings.iter().map(|b| b.to_building()));
             }
-            return total_modified;
+            Err(e) => println!("[Warn] {name}: {e}"),
         }
     }
 
-    let xy = match geo.xy() { Some(v) => v, None => return 0 };
-    let z_vals = match geo.z() { Some(v) => v, None => return 0 };
+    if all.is_empty() {
+        println!("[Info] buildings_pbf_dir: {tiles_read} tile(s), no buildings in extent");
+        return Ok(());
+    }
+
+    // Tiles overlap at their buffer zones, so the same building can arrive more
+    // than once. The `max` write rule makes duplicates harmless, but dropping
+    // them up front saves rasterizing the same footprint repeatedly.
+    let before = all.len();
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|b| match b.coords.first() {
+        Some(&(lon, lat)) => seen.insert((
+            (lat * 1_000_000.0).round() as i64,
+            (lon * 1_000_000.0).round() as i64,
+        )),
+        None => false,
+    });
+
+    let tile = TileRef {
+        ul_lat: job.ul_lat,
+        ul_lon: job.ul_lon,
+        scale_x: px_deg,
+        scale_y: px_deg,
+        size_px: job.size_px,
+    };
+    let mut grid = I16Grid { buf: buffer, size: job.size_px };
+    let stats = rasterize_buildings(&mut grid, &tile, &all, &RasterOpts::default());
+
+    println!(
+        "[Info] buildings_pbf_dir: {tiles_read} tile(s), {before} building(s) \
+         ({} after dedup), {} drawn, {} pixel(s) raised",
+        all.len(), stats.buildings_hit, stats.pixels_modified
+    );
+    Ok(())
+}
+
+/// Collect building rings from a FlatGeobuf geometry into the shared model.
+///
+/// FlatGeobuf carries the roof as an absolute elevation in the geometry Z, so
+/// every ring becomes a [`BuildingHeight::Absolute`] at the geometry's maximum
+/// Z — which is what this path has always used.
+fn collect_fgb_buildings(geo: &flatgeobuf::Geometry, out: &mut Vec<Building>) {
+    if let Some(parts) = geo.parts() {
+        if parts.len() > 0 {
+            for i in 0..parts.len() {
+                collect_fgb_buildings(&parts.get(i), out);
+            }
+            return;
+        }
+    }
+
+    let xy = match geo.xy() { Some(v) => v, None => return };
+    let z_vals = match geo.z() { Some(v) => v, None => return };
 
     let mut max_z: f64 = -1000.0;
     for z in z_vals {
         if z > max_z { max_z = z; }
     }
 
-    let roof_val = (max_z * 2.0) as i16;
-    if roof_val < 0 { return 0; }
+    // Preserved from the original write loop: a roof that lands below zero in
+    // half-metre units is dropped rather than drawn.
+    if (max_z * 2.0).trunc() < 0.0 { return; }
 
-    let mut pixels_modified = 0;
-
-    let mut rasterize_ring = |stop_idx: usize, start_idx: usize| {
+    let mut push_ring = |stop_idx: usize, start_idx: usize, out: &mut Vec<Building>| {
         let count = (stop_idx - start_idx) / 2;
         if count < 3 { return; }
-
-        let mut vertices: Vec<(f64, f64)> = Vec::with_capacity(count);
-        let mut min_x = size as f64; let mut max_x = 0.0;
-        let mut min_y = size as f64; let mut max_y = 0.0;
-
+        let mut coords: Vec<(f64, f64)> = Vec::with_capacity(count);
         let mut i = start_idx;
         while i < stop_idx {
-            let lon = xy.get(i);
-            let lat = xy.get(i + 1);
-
-            let px = (lon - ul_lon) / px_deg;
-            let py = (ul_lat - lat) / px_deg;
-
-            if px < min_x { min_x = px; }
-            if px > max_x { max_x = px; }
-            if py < min_y { min_y = py; }
-            if py > max_y { max_y = py; }
-            vertices.push((px, py));
+            coords.push((xy.get(i), xy.get(i + 1)));
             i += 2;
         }
-
-        let start_x = min_x.floor().max(0.0) as u32;
-        let end_x = max_x.ceil().min(size as f64) as u32;
-        let start_y = min_y.floor().max(0.0) as u32;
-        let end_y = max_y.ceil().min(size as f64) as u32;
-
-        for y in start_y..end_y {
-            let py_center = y as f64 + 0.5;
-            for x in start_x..end_x {
-                if point_in_poly(x as f64 + 0.5, py_center, &vertices) {
-                    let idx = (y * size + x) as usize;
-                    if idx < buffer.len() {
-                        let current_h = buffer[idx];
-                        if roof_val > current_h {
-                            buffer[idx] = roof_val;
-                            pixels_modified += 1;
-                        }
-                    }
-                }
-            }
-        }
+        out.push(Building {
+            coords,
+            height: BuildingHeight::Absolute(max_z),
+            source: HeightSource::AbsoluteZ,
+        });
     };
 
     if let Some(ends_vec) = geo.ends() {
         let mut start = 0;
         for end in ends_vec {
-            rasterize_ring(end as usize, start);
+            push_ring(end as usize, start, out);
             start = end as usize;
         }
     } else {
-        rasterize_ring(xy.len(), 0);
+        push_ring(xy.len(), 0, out);
     }
-
-    pixels_modified
 }
 
 pub fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {

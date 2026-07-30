@@ -770,7 +770,26 @@ a **single object** or a **JSON array** of such objects (batch).
 | `size_px` | u32 | **required** | Output tile side (px). |
 | `base_tif` | string? | optional | Base DEM GeoTIFF to sample. |
 | `swiss_tifs` | array of string | **required (may be empty `[]`)** | Higher-resolution swissALTI GeoTIFFs to overlay. |
-| `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in. |
+| `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in. Height comes from the geometry Z, read as an **absolute roof elevation (AMSL)**. |
+| `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Height comes from `render_height`, then `building:levels × 3`, then a 6 m default, and is read as **above-ground**, resolved against the terrain under each footprint. |
+
+Both building fields are optional and additive; a job that omits them behaves
+exactly as before. They may be combined, in which case FlatGeobuf is applied
+first.
+
+**Building write rule (both sources).** Every height is normalised to an
+absolute roof elevation and composited with `max` against the surface —
+never added to it. Consequences callers can rely on:
+
+* a roof is **flat**, even where the terrain under the footprint slopes;
+* overlapping footprints do **not** accumulate;
+* re-applying an *absolute*-height source is a no-op.
+
+**Precondition.** Buildings must be burned into building-free terrain. An
+above-ground height is measured against the surface it is written onto, so
+re-applying one to a tile that already contains buildings measures from the
+previous roof and the building grows. Callers that cache `.abt` tiles must key
+"with buildings" separately from "without".
 
 ### 9b. Download job (`aether_converter download --job-file`)
 

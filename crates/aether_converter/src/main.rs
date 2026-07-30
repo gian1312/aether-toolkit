@@ -1,7 +1,9 @@
 // rust/aether_converter/src/main.rs
+mod buildings;
 mod download;
 mod geo;
 mod ingest;
+mod mvt;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
