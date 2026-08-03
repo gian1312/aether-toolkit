@@ -1,0 +1,36 @@
+# Normalise line endings: LF in the repository, native in the working tree.
+# Without this the Windows mount rewrites every file on checkout and git
+# reports the whole tree as modified, burying real diffs in CRLF churn.
+* text=auto
+
+# Scripts whose interpreter cannot tolerate the wrong ending.
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary formats — never line-ending convert, never diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.svgz binary
+*.zip  binary
+*.gz   binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.dylib binary
+*.pyc  binary
+*.pdf  binary
+
+# Aether/Waveshed data formats.
+*.abt  binary
+*.bit  binary
+*.pbf  binary
+*.fgb  binary
+*.tif  binary
+*.tiff binary
+*.hgt  binary
+*.dem  binary
+*.tiles binary
