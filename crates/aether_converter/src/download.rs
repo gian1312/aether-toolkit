@@ -47,6 +47,15 @@ pub struct DownloadJob {
     pub tiles: Vec<SubTileSpec>,
     pub zoom: u32,
     pub max_connections: Option<usize>,
+    /// Directory of `{z}_{x}_{y}.pbf` vector tiles to fuse onto the downloaded
+    /// terrain, in the same encoding `IngestJob::buildings_pbf_dir` accepts.
+    ///
+    /// Optional and absent from older jobs, so existing callers are unaffected.
+    /// Without it a caller that wants buildings has to abandon this downloader
+    /// entirely and route terrain through a GeoTIFF export + ingest, which is
+    /// one to two orders of magnitude slower.
+    #[serde(default)]
+    pub buildings_pbf_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1410,9 +1419,127 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         }
     }
 
+    if let Some(pbf_dir) = &job.buildings_pbf_dir {
+        apply_buildings_post_pass(pbf_dir, &abt_specs)?;
+    }
+
     let elapsed = start.elapsed().as_secs_f64();
     stats.log_summary(elapsed);
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
+    Ok(())
+}
+
+/// Fuse vector-tile buildings onto the `.abt` tiles the downloader just wrote.
+///
+/// The downloader streams each tile to disk row by row, so buildings cannot be
+/// applied mid-stream: resolving a footprint's roof needs the terrain under the
+/// whole footprint to be present. This runs as a post-pass over the finished
+/// files instead.
+///
+/// Cost is `O(pbf tiles + abt tiles)`, not their product — the PBF set is
+/// decoded **once** for the run and then rasterized per tile. Tiles are read,
+/// modified and written back one at a time, so peak memory stays at one `.abt`
+/// plus the decoded building model.
+#[cfg(feature = "native")]
+fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)]) -> Result<()> {
+    use crate::buildings::{rasterize_buildings, AbtGrid, Building, RasterOpts, TileRef};
+
+    if !pbf_dir.is_dir() {
+        anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
+    }
+
+    let t0 = Instant::now();
+
+    // 1. Decode every PBF tile once.
+    //
+    // `rasterize_buildings` resolves each above-ground height against the
+    // terrain it reads *before* it writes any roof, so one pass over a tile is
+    // self-consistent but a second pass would measure new roofs against the
+    // roofs the first pass laid down. Mixed zooms would need two passes, so
+    // they are refused rather than silently compounded.
+    let mut zoom: Option<u32> = None;
+    let mut all: Vec<Building> = Vec::new();
+    let mut tiles_read = 0usize;
+    for entry in fs::read_dir(pbf_dir)?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some((z, x, y)) = crate::ingest::parse_pbf_tile_name(name) else { continue };
+        match zoom {
+            None => zoom = Some(z),
+            Some(z0) if z0 != z => anyhow::bail!(
+                "buildings_pbf_dir mixes zoom levels ({z0} and {z}); expected exactly one"
+            ),
+            _ => {}
+        }
+        let raw = fs::read(&path)?;
+        let bytes = crate::mvt::maybe_gunzip(&raw);
+        match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
+            Ok((buildings, _)) => {
+                tiles_read += 1;
+                all.extend(buildings.iter().map(|b| b.to_building()));
+            }
+            Err(e) => eprintln!("[Warn] buildings {name}: {e}"),
+        }
+    }
+
+    // Tiles overlap in their buffer zones, so the same building arrives more
+    // than once. The `max` write rule makes that harmless, but dropping the
+    // duplicates saves rasterizing identical footprints repeatedly.
+    let before = all.len();
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|b| match b.coords.first() {
+        Some(&(lon, lat)) => seen.insert((
+            (lat * 1_000_000.0).round() as i64,
+            (lon * 1_000_000.0).round() as i64,
+        )),
+        None => false,
+    });
+
+    if all.is_empty() {
+        eprintln!("[Buildings] {tiles_read} pbf tile(s), no buildings in extent");
+        return Ok(());
+    }
+
+    // 2. Rasterize onto each finished tile, one at a time.
+    let opts = RasterOpts::default();
+    let (mut tiles_hit, mut px_total) = (0usize, 0u64);
+    for (spec, path) in abt_specs {
+        let mut buf = match fs::read(path) {
+            Ok(b) if b.len() >= 44 => b,
+            // A tile the download never produced is a download failure and is
+            // already reported as one; do not turn it into a buildings error.
+            _ => continue,
+        };
+
+        let pd = spec.resolution_m / 111_111.0;
+        let stride = (spec.size_px as usize * 2 + 255) & !255;
+        let tile = TileRef {
+            ul_lat: spec.ul_lat,
+            ul_lon: spec.ul_lon,
+            scale_x: pd,
+            scale_y: pd,
+            size_px: spec.size_px,
+        };
+        let mut grid = AbtGrid { buf: &mut buf, size: spec.size_px, stride };
+        let stats = rasterize_buildings(&mut grid, &tile, &all, &opts);
+
+        if stats.pixels_modified > 0 {
+            fs::write(path, &buf)?;
+            tiles_hit += 1;
+            px_total += stats.pixels_modified as u64;
+        }
+    }
+
+    eprintln!(
+        "[Buildings] {} pbf tile(s) → {} building(s) ({} dup dropped) → {}/{} abt tile(s), {} px in {:.1}s",
+        tiles_read,
+        all.len(),
+        before - all.len(),
+        tiles_hit,
+        abt_specs.len(),
+        px_total,
+        t0.elapsed().as_secs_f64(),
+    );
     Ok(())
 }
 

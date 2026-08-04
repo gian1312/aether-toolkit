@@ -802,6 +802,7 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
 | `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. |
+| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and height ladder as §9's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 
 `SubTileSpec`:
