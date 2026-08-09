@@ -115,6 +115,21 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // --- PBF DECODE HOIST ---
+                // A `buildings_pbf_dir` decodes to the same building set for
+                // every output tile, so scan and decode each directory once for
+                // the whole run. Doing it inside the loop below re-read and
+                // re-decoded the entire directory once per .abt.
+                let mut pbf_sets: HashMap<PathBuf, buildings::PbfBuildingSet> = HashMap::new();
+                for job in &jobs {
+                    if let Some(dir) = &job.buildings_pbf_dir {
+                        if !pbf_sets.contains_key(dir) {
+                            println!("[Rust] Decoding building tiles in {:?} (once for the run)...", dir);
+                            pbf_sets.insert(dir.clone(), buildings::load_pbf_building_dir(dir)?);
+                        }
+                    }
+                }
+
                 let total = jobs.len();
                 let progress = AtomicUsize::new(0);
                 let failures = AtomicUsize::new(0);
@@ -122,7 +137,11 @@ fn main() -> anyhow::Result<()> {
                 // Run all jobs in parallel using the constrained pool
                 pool.install(|| {
                     jobs.into_par_iter().for_each(|job| {
-                        if let Err(e) = ingest::process_tile_with_cache(job, texture_cache.clone()) {
+                        let pbf = match &job.buildings_pbf_dir {
+                            Some(dir) => pbf_sets.get(dir),
+                            None => None,
+                        };
+                        if let Err(e) = ingest::process_tile(job, texture_cache.clone(), pbf) {
                             println!("[Error] Failed to process tile: {}", e);
                             failures.fetch_add(1, Ordering::Relaxed);
                         }

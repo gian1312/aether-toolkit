@@ -13,6 +13,21 @@ crates in this workspace (`aether_converter`, `aether_export`,
 > indefinitely and every other surface is unchanged. v1.0 was the initial
 > contract.
 
+> **Unversioned behavior changes pending a version decision.** Three
+> `aether_converter` behaviors changed after v1.1 was written, each of them a
+> correction to output that was previously wrong rather than a new surface.
+> They are *not* additive and are recorded inline where they apply; the version
+> header above has deliberately **not** been bumped, because policy item 3 ties
+> a breaking change to a major **engine** version bump and the engine is not in
+> this repository. Decide the version before shipping these to a consumer:
+> 1. **`.abt` bytes** change for DEM inputs that used Float32-NaN or
+>    Int32-minimum no-data — those pixels were written as 0 m (sea level) and
+>    are now the `-9999` void sentinel (§6).
+> 2. **`download` exit code** — a run that lost more than half its terrain
+>    tiles now fails instead of exiting 0 (§1.2).
+> 3. **`ingest` exit code** — a mixed-zoom or unreadable `buildings_pbf_dir`
+>    now fails instead of warning and continuing (§9a).
+
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
 > `rust/aether_core/Cargo.toml` declares `version = "0.1.0"`, and
@@ -196,6 +211,34 @@ aether_converter download  --job-file <json>     # -j
   > If you must keep `not enough space` support in a consumer, do so *in
   > addition to*, not instead of, `insufficient disk`. Do not change the
   > `Insufficient disk space` prefix without a major bump.
+
+* **Tile-fetch failure — new failure mode.** When **more than half** of the
+  requested XYZ terrain tiles could not be fetched, `download` **fails**
+  (`anyhow::bail!`, non-zero exit) after emitting the usual `[Stats]` block.
+  The emitted string (`crates/aether_converter/src/download.rs`, guarded by
+  `fetch_failure_is_fatal`) is:
+
+  ```rust
+  anyhow::bail!(
+      "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
+       the output would be mostly flat 0 m, not terrain. Check that the tile \
+       source serves zoom {} over this area and that the network is reachable.",
+      failed, attempted, pct, job.zoom
+  );
+  ```
+
+  > **Behavior change for consumers.** Previously *every* download exited 0,
+  > including one where all tiles 404'd — the classic cause being a requested
+  > zoom the tile source does not serve. A tile that never arrives is not a
+  > hole: the assembly grid is zero-filled and the missing tile is simply never
+  > copied in, so it is written as **0 m, sea level**, and a fully-failed run
+  > produced a complete set of plausible-looking flat `.abt` files. Consumers
+  > that treated exit 0 as "tiles are usable" were wrong then and are right
+  > now; consumers that treated any non-zero exit as fatal need no change.
+  > Sparse 404s at the edge of a provider's coverage remain non-fatal — the
+  > threshold is deliberately a *majority*, and a minority loss is still only
+  > reported through `[Stats] ERRORS`. Match `Tile download failed:` if you
+  > need to distinguish this from the disk-space failure.
 
 ### 1.3 `aether_export`
 
@@ -626,6 +669,33 @@ at byte offset:
 
 (`io/mod.rs::sample_abt_at`, `engines/p2p.rs::sample_elevation_cached`.)
 
+**No-data pixels.** The ingest path writes **`-9999`** (i.e. -4999.5 m) for a
+pixel it found no terrain for, and treats any stored value **at or below
+`-5000`** (-2500 m) as no-data when it samples a source. Note both numbers are
+in the stored half-metre unit, so the real floor is **-2500 m**, not -5000 m;
+the deepest land depression on Earth is ~-430 m, so no genuine terrain is lost,
+but a bathymetric source below -2500 m would be discarded.
+
+> **Correction (previously undocumented).** This sentinel has always been
+> emitted — `crates/aether_converter/src/ingest.rs` (`VOID_ELEV`) — but no
+> earlier revision of this document mentioned it. It is recorded here as
+> existing behavior, not as a new field. A consumer that treats `-9999` as an
+> elevation reads a void as 4999.5 m below sea level.
+>
+> A void is **not** 0. Until the fix recorded here, a Float32 source whose no-data
+> was NaN (GDAL's default) and an Int32 source whose no-data was `-2147483648`
+> both decoded to **0 half-metres — sea level — and were written as valid
+> ground**, because `f32::NAN as i16` is defined to be 0 and the Int32 path
+> narrowed to `i16` (keeping only the low 16 bits, which are zero) before
+> scaling. Those pixels now decode to `-9999`. **`.abt` bytes therefore change
+> for any input that used Float32-NaN or Int32-minimum no-data**; every other
+> input is byte-for-byte unchanged. `download`-produced tiles are unaffected —
+> that path never had the bug.
+>
+> The `download` path has a different no-data convention on its *input* side: a
+> Terrarium tile pixel decoding below **-11000 m** is a void and is backfilled
+> from a coarser parent tile. That is an input rule and never reaches `.abt`.
+
 **Row stride details.**
 * `row_stride` is a stored `u16`, so it caps the maximum tile width at
   **≈ 32 000 px** (`row_stride ≤ 65535` bytes ⇒ ≤ ~32 640 px at 2 bytes/px).
@@ -771,11 +841,18 @@ a **single object** or a **JSON array** of such objects (batch).
 | `base_tif` | string? | optional | Base DEM GeoTIFF to sample. |
 | `swiss_tifs` | array of string | **required (may be empty `[]`)** | Higher-resolution swissALTI GeoTIFFs to overlay. |
 | `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in. Height comes from the geometry Z, read as an **absolute roof elevation (AMSL)**. |
-| `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Height comes from `render_height`, then `building:levels × 3`, then a 6 m default, and is read as **above-ground**, resolved against the terrain under each footprint. |
+| `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Height comes from `render_height`, then `building:levels × 3`, then a 6 m default, and is read as **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
 
 Both building fields are optional and additive; a job that omits them behaves
 exactly as before. They may be combined, in which case FlatGeobuf is applied
 first.
+
+> **Mixed zooms are refused on both paths.** `ingest` previously accepted a
+> mixed-zoom `buildings_pbf_dir` and drew every zoom's copy of the same
+> building, so each above-ground height was applied more than once and the
+> building grew (see the precondition below). It now refuses the directory with
+> the same message `download` has always used. A single-zoom directory — the
+> only kind that ever produced correct output — is unaffected.
 
 **Building write rule (both sources).** Every height is normalised to an
 absolute roof elevation and composited with `max` against the surface —

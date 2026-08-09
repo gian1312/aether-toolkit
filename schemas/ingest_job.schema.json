@@ -26,7 +26,7 @@
           "description": "Higher-resolution swissALTI GeoTIFFs to overlay. REQUIRED field; may be an empty array."
         },
         "buildings_file": { "type": ["string", "null"], "description": "FlatGeobuf building footprints to burn in. Roof height is read from geometry Z only; attribute heights are ignored." },
-        "buildings_pbf_dir": { "type": ["string", "null"], "description": "Directory of {z}_{x}_{y}.pbf vector tiles (gzip or plain) to burn in. Height ladder: render_height, then building:levels x 3, then a 6 m default, read as above-ground." }
+        "buildings_pbf_dir": { "type": ["string", "null"], "description": "Directory of {z}_{x}_{y}.pbf vector tiles (gzip or plain) to burn in. Height ladder: render_height, then building:levels x 3, then a 6 m default, read as above-ground. All tiles must share one zoom level." }
       }
     }
   }

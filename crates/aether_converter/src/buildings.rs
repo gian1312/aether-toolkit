@@ -18,6 +18,11 @@
 //! Heights that arrive above-ground are resolved against the terrain under
 //! their own footprint before anything is written.
 
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
+
 use crate::ingest::point_in_poly;
 
 /// How a source expresses a building's height.
@@ -377,8 +382,92 @@ pub fn rasterize_buildings<G: ElevGrid>(
     stats
 }
 
+/// Every building in a directory of `{z}_{x}_{y}.pbf` vector tiles, decoded once.
+///
+/// The set does not depend on which output tile it will be drawn onto, so both
+/// pipelines that consume such a directory — `ingest`'s per-tile rasterization
+/// and `download`'s post-pass — load it once per run and share it across tiles.
+#[derive(Debug, Default)]
+pub struct PbfBuildingSet {
+    /// Deduplicated buildings, in directory-scan order.
+    pub buildings: Vec<Building>,
+    /// PBF tiles that decoded successfully.
+    pub tiles_read: usize,
+    /// Buildings decoded, before duplicate footprints were dropped.
+    pub decoded: usize,
+    /// The zoom level every tile in the directory shared, or `None` when no
+    /// `{z}_{x}_{y}` file was found.
+    pub zoom: Option<u32>,
+}
+
+impl PbfBuildingSet {
+    /// How many decoded buildings were dropped as duplicates.
+    pub fn duplicates_dropped(&self) -> usize {
+        self.decoded - self.buildings.len()
+    }
+}
+
+/// Decode every `{z}_{x}_{y}.pbf` tile in *pbf_dir* into one shared building set.
+///
+/// Cost is `O(pbf tiles)` **per run**, not per output tile. Callers must load
+/// once and rasterize the same set onto every tile; re-reading the directory
+/// inside a tile loop turns one directory scan into one scan per `.abt` and
+/// produces exactly the same buildings.
+///
+/// # Mixed zooms are refused
+///
+/// [`rasterize_buildings`] resolves each above-ground height against the terrain
+/// it reads *before* it writes any roof, so one pass over a tile is
+/// self-consistent — but a second pass would measure new roofs against the roofs
+/// the first pass laid down. Two zoom levels covering the same ground are two
+/// passes over the same buildings, so a mixed-zoom directory is refused rather
+/// than silently compounded.
+pub fn load_pbf_building_dir(pbf_dir: &Path) -> Result<PbfBuildingSet> {
+    if !pbf_dir.is_dir() {
+        anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
+    }
+
+    let mut set = PbfBuildingSet::default();
+    for entry in fs::read_dir(pbf_dir)?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some((z, x, y)) = crate::ingest::parse_pbf_tile_name(name) else { continue };
+        match set.zoom {
+            None => set.zoom = Some(z),
+            Some(z0) if z0 != z => anyhow::bail!(
+                "buildings_pbf_dir mixes zoom levels ({z0} and {z}); expected exactly one"
+            ),
+            _ => {}
+        }
+        let raw = fs::read(&path)?;
+        let bytes = crate::mvt::maybe_gunzip(&raw);
+        match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
+            Ok((buildings, _)) => {
+                set.tiles_read += 1;
+                set.buildings.extend(buildings.iter().map(|b| b.to_building()));
+            }
+            Err(e) => eprintln!("[Warn] buildings {name}: {e}"),
+        }
+    }
+
+    // Tiles overlap in their buffer zones, so the same building arrives more
+    // than once. The `max` write rule makes that harmless, but dropping the
+    // duplicates saves rasterizing identical footprints repeatedly.
+    set.decoded = set.buildings.len();
+    let mut seen = std::collections::HashSet::new();
+    set.buildings.retain(|b| match b.coords.first() {
+        Some(&(lon, lat)) => seen.insert((
+            (lat * 1_000_000.0).round() as i64,
+            (lon * 1_000_000.0).round() as i64,
+        )),
+        None => false,
+    });
+
+    Ok(set)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn tile() -> TileRef {
@@ -712,6 +801,167 @@ mod tests {
         assert_eq!(parse_pbf_tile_name("readme.txt"), None);
         assert_eq!(parse_pbf_tile_name("a_b_c.pbf"), None);
         assert_eq!(parse_pbf_tile_name("-1_2_3.pbf"), None);
+    }
+
+    // ── Shared PBF directory loader ────────────────────────────────────────
+
+    /// MVT zig-zag encoding of one geometry delta.
+    fn zz(n: i32) -> u32 {
+        ((n << 1) ^ (n >> 31)) as u32
+    }
+
+    /// A minimal but real MVT tile: one `building` layer, one square polygon.
+    pub(crate) fn synthetic_building_tile() -> Vec<u8> {
+        use crate::mvt::{Feature, Layer, Tile, Value};
+        use prost::Message;
+
+        // MoveTo(1) then LineTo(3) then ClosePath, in 0..4096 tile space.
+        let geometry = vec![
+            (1 << 3) | 1,
+            zz(100),
+            zz(100), // MoveTo 100,100
+            (3 << 3) | 2,
+            zz(400),
+            zz(0), // LineTo +400,0
+            zz(0),
+            zz(400), // LineTo 0,+400
+            zz(-400),
+            zz(0), // LineTo -400,0
+            (1 << 3) | 7, // ClosePath
+        ];
+
+        Tile {
+            layers: vec![Layer {
+                name: "building".into(),
+                features: vec![Feature {
+                    id: Some(1),
+                    tags: vec![0, 0],
+                    r#type: Some(3), // Polygon
+                    geometry,
+                }],
+                keys: vec!["render_height".into()],
+                values: vec![Value { double_val: Some(12.0), ..Default::default() }],
+                extent: Some(4096),
+                version: Some(2),
+            }],
+        }
+        .encode_to_vec()
+    }
+
+    /// A `TileRef` covering exactly the XYZ tile *(z, x, y)*, at `size` px.
+    fn tile_ref_for(z: u32, x: u32, y: u32, size: u32) -> TileRef {
+        use crate::download::{tx2lon, ty2lat};
+        let (ul_lon, ul_lat) = (tx2lon(x, z), ty2lat(y, z));
+        let (lr_lon, lr_lat) = (tx2lon(x + 1, z), ty2lat(y + 1, z));
+        TileRef {
+            ul_lat,
+            ul_lon,
+            scale_x: (lr_lon - ul_lon) / size as f64,
+            scale_y: (ul_lat - lr_lat) / size as f64,
+            size_px: size,
+        }
+    }
+
+    /// Two same-zoom tiles with one building each, plus a file the scan ignores.
+    fn pbf_dir_with_two_tiles() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("14_8531_5752.pbf"), synthetic_building_tile()).unwrap();
+        std::fs::write(dir.path().join("14_8532_5752.pbf"), synthetic_building_tile()).unwrap();
+        std::fs::write(dir.path().join("README.txt"), b"not a tile").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_pbf_directory_decodes_to_buildings() {
+        let dir = pbf_dir_with_two_tiles();
+        let set = load_pbf_building_dir(dir.path()).unwrap();
+        assert_eq!(set.tiles_read, 2, "the non-tile file must be skipped, not read");
+        assert_eq!(set.zoom, Some(14));
+        assert_eq!(set.buildings.len(), 2);
+        // The height ladder's top rung: an explicit render_height, above ground.
+        assert_eq!(set.buildings[0].height, BuildingHeight::AboveGround(12.0));
+        assert_eq!(set.duplicates_dropped(), 0);
+    }
+
+    #[test]
+    fn mixed_zoom_pbf_directories_are_refused() {
+        // Two zooms covering the same ground would apply every above-ground
+        // height twice — the second pass measuring from the first pass's roofs.
+        // Ingest used to accept this silently; both paths now refuse it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("14_8531_5752.pbf"), synthetic_building_tile()).unwrap();
+        std::fs::write(dir.path().join("15_17062_11504.pbf"), synthetic_building_tile()).unwrap();
+
+        let err = load_pbf_building_dir(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("buildings_pbf_dir mixes zoom levels"),
+            "the contract freezes this message; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_pbf_directory_is_an_error_not_an_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load_pbf_building_dir(&dir.path().join("nope")).unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "got {err:?}");
+    }
+
+    #[test]
+    fn loading_a_pbf_directory_is_deterministic() {
+        // The hoist in E1 is only safe if the decode is a pure function of the
+        // directory — same files in, same buildings in the same order out.
+        let dir = pbf_dir_with_two_tiles();
+        let a = load_pbf_building_dir(dir.path()).unwrap();
+        let b = load_pbf_building_dir(dir.path()).unwrap();
+
+        let key = |s: &PbfBuildingSet| -> Vec<(Vec<(f64, f64)>, BuildingHeight)> {
+            s.buildings.iter().map(|b| (b.coords.clone(), b.height)).collect()
+        };
+        assert_eq!(key(&a), key(&b));
+        assert_eq!((a.tiles_read, a.decoded, a.zoom), (b.tiles_read, b.decoded, b.zoom));
+    }
+
+    #[test]
+    fn hoisting_the_pbf_decode_out_of_the_tile_loop_is_pixel_identical() {
+        // E1: `apply_buildings_pbf` used to re-scan and re-decode the whole PBF
+        // directory once per output .abt. This pins that moving the decode out
+        // of that loop changes nothing but the number of decodes.
+        let dir = pbf_dir_with_two_tiles();
+        let size = 64u32;
+        let opts = RasterOpts::default();
+        let tiles: Vec<TileRef> = (0..3)
+            .map(|i| tile_ref_for(14, 8531 + i % 2, 5752, size))
+            .collect();
+
+        // Old shape: decode inside the loop, once per output tile.
+        let per_tile: Vec<Vec<i16>> = tiles
+            .iter()
+            .map(|t| {
+                let set = load_pbf_building_dir(dir.path()).unwrap();
+                let mut buf = vec![200i16; (size * size) as usize];
+                let mut g = I16Grid { buf: &mut buf, size };
+                rasterize_buildings(&mut g, t, &set.buildings, &opts);
+                buf
+            })
+            .collect();
+
+        // New shape: decode once for the run, share the set across tiles.
+        let shared = load_pbf_building_dir(dir.path()).unwrap();
+        let hoisted: Vec<Vec<i16>> = tiles
+            .iter()
+            .map(|t| {
+                let mut buf = vec![200i16; (size * size) as usize];
+                let mut g = I16Grid { buf: &mut buf, size };
+                rasterize_buildings(&mut g, t, &shared.buildings, &opts);
+                buf
+            })
+            .collect();
+
+        assert_eq!(per_tile, hoisted);
+        assert!(
+            per_tile[0].iter().any(|&v| v != 200),
+            "the fixture must actually draw a building, or this proves nothing"
+        );
     }
 
     #[test]

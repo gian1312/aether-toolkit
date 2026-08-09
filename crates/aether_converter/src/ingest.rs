@@ -13,8 +13,8 @@ use tiff::tags::Tag;
 use anyhow::{Context, Result};
 use flatgeobuf::{FgbReader, GeometryType};
 use crate::buildings::{
-    rasterize_buildings, Building, BuildingHeight, HeightSource, I16Grid, RasterOpts, Rounding,
-    TileRef,
+    load_pbf_building_dir, rasterize_buildings, Building, BuildingHeight, HeightSource, I16Grid,
+    PbfBuildingSet, RasterOpts, Rounding, TileRef,
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
 #[cfg(feature = "bc6h")]
@@ -39,6 +39,50 @@ pub struct IngestJob {
     /// rasterizer resolves against the terrain under each footprint.
     #[serde(default)]
     pub buildings_pbf_dir: Option<PathBuf>,
+}
+
+/// The value written for a pixel with no terrain under it.
+///
+/// Elevations are stored in **half-metres**, so this is -4999.5 m — far below
+/// any real ground, and below the `-5000` half-metre (-2500 m) floor the
+/// samplers in this file use to tell "no data" from "very low ground". A void
+/// must never be confused with 0 (sea level): a reader that treats it as ground
+/// gets flat terrain at mean sea level instead of a hole it can fill from
+/// another source.
+pub const VOID_ELEV: i16 = -9999;
+
+/// Convert one Float32 DEM sample to the `.abt` half-metre unit.
+///
+/// `f32 as i16` is defined to produce **0** for NaN, and NaN is GDAL's default
+/// Float32 nodata — so a Float32 DEM's voids used to arrive as 0 half-metres,
+/// pass the `> -5000` validity test, and get written as sea level. Non-finite
+/// samples now become the void sentinel instead. Finite samples are unchanged:
+/// the cast already truncates toward zero and saturates at the i16 bounds.
+#[inline]
+pub fn f32_sample_to_half_metres(x: f32) -> i16 {
+    if !x.is_finite() {
+        return VOID_ELEV;
+    }
+    (x * 2.0) as i16
+}
+
+/// Convert one Int32 DEM sample to the `.abt` half-metre unit.
+///
+/// The old `(x as i16).saturating_mul(2)` narrowed **before** the multiply, so
+/// the cast kept only the low 16 bits: the classic Int32 nodata `i32::MIN` has
+/// them all zero and arrived as 0 half-metres — sea level again. Widen first,
+/// then saturate over the full range, and map anything that saturates low to
+/// the void sentinel.
+#[inline]
+pub fn i32_sample_to_half_metres(x: i32) -> i16 {
+    let half_metres = x as i64 * 2;
+    if half_metres < VOID_ELEV as i64 {
+        VOID_ELEV
+    } else if half_metres > i16::MAX as i64 {
+        i16::MAX
+    } else {
+        half_metres as i16
+    }
 }
 
 pub struct LoadedImage {
@@ -105,9 +149,9 @@ pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
 
     let result = decoder.read_image()?;
     let data: Vec<i16> = match result {
-        DecodingResult::F32(v) => v.iter().map(|&x| (x * 2.0) as i16).collect(),
+        DecodingResult::F32(v) => v.iter().map(|&x| f32_sample_to_half_metres(x)).collect(),
         DecodingResult::I16(v) => v.iter().map(|&x| x.saturating_mul(2)).collect(),
-        DecodingResult::I32(v) => v.iter().map(|&x| (x as i16).saturating_mul(2)).collect(),
+        DecodingResult::I32(v) => v.iter().map(|&x| i32_sample_to_half_metres(x)).collect(),
         _ => return Err(anyhow::anyhow!("Unsupported TIF format")),
     };
 
@@ -122,9 +166,32 @@ pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
     }))
 }
 
+/// Convert one tile, decoding this job's `buildings_pbf_dir` (if any) for it.
+///
+/// Convenient for a one-tile run. A batch must not use this: the PBF decode is
+/// a whole-directory scan whose result is the same for every output tile, so
+/// doing it here runs it once per `.abt`. Batch callers load the set once with
+/// [`load_pbf_building_dir`] and call [`process_tile`].
 pub fn process_tile_with_cache(
     job: IngestJob,
     cache_arc: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>
+) -> Result<()> {
+    let pbf_buildings = match &job.buildings_pbf_dir {
+        Some(dir) => Some(load_pbf_building_dir(dir)?),
+        None => None,
+    };
+    process_tile(job, cache_arc, pbf_buildings.as_ref())
+}
+
+/// Convert one tile, drawing *pbf_buildings* (decoded once per run) onto it.
+///
+/// *pbf_buildings* must be `Some` whenever the job carries a
+/// `buildings_pbf_dir`; passing `None` for such a job is a caller bug and is
+/// refused rather than quietly producing a building-less tile.
+pub fn process_tile(
+    job: IngestJob,
+    cache_arc: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>,
+    pbf_buildings: Option<&PbfBuildingSet>,
 ) -> Result<()> {
 
     // 1. Identify missing files inside a lock
@@ -229,7 +296,7 @@ pub fn process_tile_with_cache(
         for (x, out_pixel) in row_buffer.iter_mut().enumerate() {
             let e = e_start + (step_e * x as f64);
             let n = n_start + (step_n * x as f64);
-            let mut val = -9999i16;
+            let mut val = VOID_ELEV;
 
             for img in &row_images {
                 if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
@@ -273,10 +340,15 @@ pub fn process_tile_with_cache(
             println!("[Warn] Failed to apply buildings: {}", e);
         }
     }
-    if let Some(pbf_dir) = &job.buildings_pbf_dir {
-        if let Err(e) = apply_buildings_pbf(&job, &mut buffer, pbf_dir, pixel_deg) {
-            println!("[Warn] Failed to apply PBF buildings: {}", e);
-        }
+    match (&job.buildings_pbf_dir, pbf_buildings) {
+        (Some(_), Some(set)) => apply_buildings_pbf(&job, &mut buffer, set, pixel_deg),
+        (Some(dir), None) => anyhow::bail!(
+            "buildings_pbf_dir {:?} was requested but no decoded building set was \
+             supplied for {:?}; refusing to write a building-less tile",
+            dir,
+            job.output_path
+        ),
+        (None, _) => {}
     }
 
     let format_str = job.format.as_deref().unwrap_or("r16sint");
@@ -485,55 +557,26 @@ pub fn parse_pbf_tile_name(name: &str) -> Option<(u32, u32, u32)> {
     Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
 }
 
-/// Rasterize vector-tile buildings from *pbf_dir* onto an ingest tile buffer.
+/// Rasterize an already-decoded vector-tile building set onto an ingest tile.
 ///
 /// Shares the decoder and the write rule with the WASM pipeline, so the native
 /// converter and the browser produce the same surface from the same tiles.
+///
+/// *set* is decoded once per run by [`load_pbf_building_dir`]: it is a whole
+/// directory scan plus a PBF decode of every file in it, and its result is the
+/// same for every output tile. This function is what runs per tile.
 fn apply_buildings_pbf(
     job: &IngestJob,
     buffer: &mut [i16],
-    pbf_dir: &Path,
+    set: &PbfBuildingSet,
     px_deg: f64,
-) -> Result<()> {
-    if !pbf_dir.is_dir() {
-        anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
-    }
+) {
+    let tiles_read = set.tiles_read;
 
-    let mut all: Vec<Building> = Vec::new();
-    let mut tiles_read = 0usize;
-    for entry in fs::read_dir(pbf_dir)?.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        let Some((z, x, y)) = parse_pbf_tile_name(name) else { continue };
-
-        let raw = fs::read(&path)?;
-        let bytes = crate::mvt::maybe_gunzip(&raw);
-        match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
-            Ok((buildings, _stats)) => {
-                tiles_read += 1;
-                all.extend(buildings.iter().map(|b| b.to_building()));
-            }
-            Err(e) => println!("[Warn] {name}: {e}"),
-        }
-    }
-
-    if all.is_empty() {
+    if set.buildings.is_empty() {
         println!("[Info] buildings_pbf_dir: {tiles_read} tile(s), no buildings in extent");
-        return Ok(());
+        return;
     }
-
-    // Tiles overlap at their buffer zones, so the same building can arrive more
-    // than once. The `max` write rule makes duplicates harmless, but dropping
-    // them up front saves rasterizing the same footprint repeatedly.
-    let before = all.len();
-    let mut seen = std::collections::HashSet::new();
-    all.retain(|b| match b.coords.first() {
-        Some(&(lon, lat)) => seen.insert((
-            (lat * 1_000_000.0).round() as i64,
-            (lon * 1_000_000.0).round() as i64,
-        )),
-        None => false,
-    });
 
     let tile = TileRef {
         ul_lat: job.ul_lat,
@@ -543,14 +586,13 @@ fn apply_buildings_pbf(
         size_px: job.size_px,
     };
     let mut grid = I16Grid { buf: buffer, size: job.size_px };
-    let stats = rasterize_buildings(&mut grid, &tile, &all, &RasterOpts::default());
+    let stats = rasterize_buildings(&mut grid, &tile, &set.buildings, &RasterOpts::default());
 
     println!(
-        "[Info] buildings_pbf_dir: {tiles_read} tile(s), {before} building(s) \
+        "[Info] buildings_pbf_dir: {tiles_read} tile(s), {} building(s) \
          ({} after dedup), {} drawn, {} pixel(s) raised",
-        all.len(), stats.buildings_hit, stats.pixels_modified
+        set.decoded, set.buildings.len(), stats.buildings_hit, stats.pixels_modified
     );
-    Ok(())
 }
 
 /// Collect building rings from a FlatGeobuf geometry into the shared model.
@@ -618,4 +660,191 @@ pub fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
         j = i;
     }
     inside
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DEM sample decoding ────────────────────────────────────────────────
+
+    #[test]
+    fn the_casts_that_used_to_decode_dem_samples_map_nodata_to_zero() {
+        // Not a test of our code — a test of the language rule the bug rested
+        // on, so the reason for the two helpers stays visible. Both of these
+        // are 0, i.e. sea level, and both used to reach the .abt that way.
+        assert_eq!(f32::NAN as i16, 0, "NaN is GDAL's default Float32 nodata");
+        assert_eq!(i32::MIN as i16, 0, "an int-to-int cast keeps the low 16 bits");
+        assert_eq!(65536i32 as i16, 0);
+    }
+
+    #[test]
+    fn float32_nodata_becomes_a_void_not_sea_level() {
+        assert_eq!(f32_sample_to_half_metres(f32::NAN), VOID_ELEV);
+        assert_eq!(f32_sample_to_half_metres(f32::INFINITY), VOID_ELEV);
+        assert_eq!(f32_sample_to_half_metres(f32::NEG_INFINITY), VOID_ELEV);
+    }
+
+    #[test]
+    fn float32_elevations_decode_exactly_as_before() {
+        // Half-metre units, truncating toward zero, saturating at the bounds —
+        // unchanged for every finite sample, so real terrain keeps its bytes.
+        assert_eq!(f32_sample_to_half_metres(0.0), 0);
+        assert_eq!(f32_sample_to_half_metres(100.0), 200);
+        assert_eq!(f32_sample_to_half_metres(-430.5), -861); // Dead Sea shore
+        assert_eq!(f32_sample_to_half_metres(8848.9), 17697); // 17697.8 truncates
+        assert_eq!(f32_sample_to_half_metres(-0.4), 0);
+        assert_eq!(f32_sample_to_half_metres(1.0e9), i16::MAX);
+        assert_eq!(f32_sample_to_half_metres(-1.0e9), i16::MIN);
+    }
+
+    #[test]
+    fn int32_nodata_becomes_a_void_not_sea_level() {
+        // i32::MIN is the classic Int32 nodata. Its low 16 bits are zero, so
+        // the old `(x as i16)` narrowing produced 0 m.
+        assert_eq!(i32_sample_to_half_metres(i32::MIN), VOID_ELEV);
+        assert_eq!(i32_sample_to_half_metres(-32768), VOID_ELEV);
+        assert_eq!(i32_sample_to_half_metres(-9999), VOID_ELEV);
+        // 65536 m is not an elevation either, but the truncating cast made it 0.
+        assert_ne!(i32_sample_to_half_metres(65536), 0);
+    }
+
+    #[test]
+    fn int32_elevations_saturate_instead_of_truncating() {
+        assert_eq!(i32_sample_to_half_metres(0), 0);
+        assert_eq!(i32_sample_to_half_metres(100), 200);
+        assert_eq!(i32_sample_to_half_metres(-430), -860);
+        assert_eq!(i32_sample_to_half_metres(8849), 17698);
+        assert_eq!(i32_sample_to_half_metres(i32::MAX), i16::MAX);
+        // The whole i16 range is reachable and nothing wraps.
+        for m in [-4000i32, -2000, -1, 1, 16000, 16383] {
+            assert_eq!(i32_sample_to_half_metres(m), (m * 2) as i16, "m = {m}");
+        }
+    }
+
+    #[test]
+    fn a_void_is_rejected_by_the_validity_test_that_a_zero_would_pass() {
+        // This is why the fix matters: the samplers in this file accept any
+        // value above -5000 *half-metres* (-2500 m) as real ground.
+        assert!(VOID_ELEV <= -5000, "the sentinel must read as no-data");
+        assert!(0 > -5000, "sea level reads as valid ground — as it should");
+    }
+
+    // ── .abt writer ────────────────────────────────────────────────────────
+
+    fn empty_job(out: PathBuf) -> IngestJob {
+        IngestJob {
+            output_path: out,
+            format: None,
+            ul_lat: 47.5,
+            ul_lon: 8.25,
+            resolution_m: 10.0,
+            size_px: 8,
+            base_tif: None,
+            swiss_tifs: Vec::new(),
+            buildings_file: None,
+            buildings_pbf_dir: None,
+        }
+    }
+
+    #[test]
+    fn the_abt_writer_emits_the_44_byte_header_and_padded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("tile.abt");
+        let job = empty_job(out.clone());
+        let pixel_deg = job.resolution_m / 111111.0;
+        let size = job.size_px as usize;
+
+        process_tile_with_cache(job, Arc::new(std::sync::Mutex::new(HashMap::new()))).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        let stride = ((size * 2) + 255) & !255;
+        assert_eq!(bytes.len(), 44 + stride * size);
+
+        let u16at = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        let f64at = |o: usize| f64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        assert_eq!(&bytes[0..4], b"AETH");
+        assert_eq!(u16at(4), 1, "version 1 = R16SINT");
+        assert_eq!(u16at(6), 8, "width");
+        assert_eq!(f64at(8), 47.5);
+        assert_eq!(f64at(16), 8.25);
+        assert_eq!(f64at(24), pixel_deg);
+        assert_eq!(f64at(32), pixel_deg);
+        assert_eq!(i16::from_le_bytes([bytes[40], bytes[41]]), 0, "base_elev");
+        assert_eq!(u16at(42) as usize, stride);
+    }
+
+    #[test]
+    fn a_tile_with_no_terrain_source_is_all_void_not_all_sea_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("tile.abt");
+        let job = empty_job(out.clone());
+        let size = job.size_px as usize;
+
+        process_tile_with_cache(job, Arc::new(std::sync::Mutex::new(HashMap::new()))).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        let stride = ((size * 2) + 255) & !255;
+        for y in 0..size {
+            for x in 0..size {
+                let o = 44 + y * stride + x * 2;
+                assert_eq!(
+                    i16::from_le_bytes([bytes[o], bytes[o + 1]]),
+                    VOID_ELEV,
+                    "pixel ({x},{y})"
+                );
+            }
+            // Row padding is zero-filled, per the 256-byte alignment rule.
+            assert!(bytes[44 + y * stride + size * 2..44 + (y + 1) * stride].iter().all(|&b| b == 0));
+        }
+    }
+
+    #[test]
+    fn a_job_with_a_pbf_dir_but_no_decoded_set_is_refused() {
+        // Guards the E1 hoist: a batch caller that forgets to pass the set gets
+        // an error, not silently building-less tiles.
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = empty_job(dir.path().join("tile.abt"));
+        job.buildings_pbf_dir = Some(dir.path().to_path_buf());
+
+        let err = process_tile(job, Arc::new(std::sync::Mutex::new(HashMap::new())), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no decoded building set"), "got {err:?}");
+    }
+
+    // ── Point-in-polygon ───────────────────────────────────────────────────
+
+    #[test]
+    fn point_in_poly_classifies_inside_outside_and_the_edges() {
+        let sq = [(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)];
+        assert!(point_in_poly(2.0, 2.0, &sq));
+        assert!(!point_in_poly(5.0, 2.0, &sq));
+        assert!(!point_in_poly(-1.0, 2.0, &sq));
+        assert!(!point_in_poly(2.0, -1.0, &sq));
+        assert!(!point_in_poly(2.0, 5.0, &sq));
+        // Half-open on purpose: the low edge is in, the high edge is out, so
+        // pixel centres on a shared boundary belong to exactly one polygon.
+        assert!(point_in_poly(0.0, 2.0, &sq));
+        assert!(!point_in_poly(4.0, 2.0, &sq));
+    }
+
+    #[test]
+    fn point_in_poly_handles_a_concave_ring() {
+        // A "U": the notch between the arms must read as outside.
+        let u = [
+            (0.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 6.0),
+            (4.0, 6.0),
+            (4.0, 2.0),
+            (2.0, 2.0),
+            (2.0, 6.0),
+            (0.0, 6.0),
+        ];
+        assert!(point_in_poly(1.0, 4.0, &u));
+        assert!(point_in_poly(5.0, 4.0, &u));
+        assert!(!point_in_poly(3.0, 4.0, &u), "the notch is outside");
+        assert!(point_in_poly(3.0, 1.0, &u), "the base is inside");
+    }
 }

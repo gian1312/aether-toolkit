@@ -1035,6 +1035,24 @@ pub fn run_download(job_file: &Path) -> Result<()> {
     rt.block_on(run_download_async(job))
 }
 
+/// Whether losing *failed* of *attempted* XYZ tiles must fail the whole run.
+///
+/// A tile that never arrived is not a hole in the output — it is written as
+/// 0 m, sea level, because the assembly grid is zero-filled and the failed tile
+/// is simply never copied in. So a download that 404s everything (the classic
+/// cause: a max zoom the tile source does not serve) still produces a full set
+/// of plausible-looking flat `.abt` files, and `run_download` used to return
+/// `Ok(())` for it.
+///
+/// Sparse 404s at the edge of a provider's coverage are normal and must stay
+/// non-fatal, so the line is drawn at a **majority** of the requested tiles:
+/// below that the output is still mostly real terrain and the `[Stats] ERRORS`
+/// summary is the right response; above it there is nothing worth keeping.
+#[cfg(feature = "native")]
+fn fetch_failure_is_fatal(failed: usize, attempted: usize) -> bool {
+    attempted > 0 && failed * 2 > attempted
+}
+
 #[cfg(feature = "native")]
 async fn run_download_async(job: DownloadJob) -> Result<()> {
     let start = Instant::now();
@@ -1419,6 +1437,26 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         }
     }
 
+    // A run that fetched almost nothing is not a successful run. A tile that
+    // never arrived is never copied into the just-`fill(0.0)`-ed mini-grid, so
+    // it is written out as 0 m — flat terrain at sea level, indistinguishable
+    // downstream from real data. Report it as the failure it is instead of
+    // exiting 0 with an ocean-flat .abt.
+    let failed = stats.total_errors();
+    let attempted = stats.total_tiles();
+    if fetch_failure_is_fatal(failed, attempted) {
+        stats.log_summary(start.elapsed().as_secs_f64());
+        anyhow::bail!(
+            "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
+             the output would be mostly flat 0 m, not terrain. Check that the tile \
+             source serves zoom {} over this area and that the network is reachable.",
+            failed,
+            attempted,
+            failed * 100 / attempted.max(1),
+            job.zoom
+        );
+    }
+
     if let Some(pbf_dir) = &job.buildings_pbf_dir {
         apply_buildings_post_pass(pbf_dir, &abt_specs)?;
     }
@@ -1442,61 +1480,17 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
 /// plus the decoded building model.
 #[cfg(feature = "native")]
 fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)]) -> Result<()> {
-    use crate::buildings::{rasterize_buildings, AbtGrid, Building, RasterOpts, TileRef};
-
-    if !pbf_dir.is_dir() {
-        anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
-    }
+    use crate::buildings::{load_pbf_building_dir, rasterize_buildings, AbtGrid, RasterOpts, TileRef};
 
     let t0 = Instant::now();
 
-    // 1. Decode every PBF tile once.
-    //
-    // `rasterize_buildings` resolves each above-ground height against the
-    // terrain it reads *before* it writes any roof, so one pass over a tile is
-    // self-consistent but a second pass would measure new roofs against the
-    // roofs the first pass laid down. Mixed zooms would need two passes, so
-    // they are refused rather than silently compounded.
-    let mut zoom: Option<u32> = None;
-    let mut all: Vec<Building> = Vec::new();
-    let mut tiles_read = 0usize;
-    for entry in fs::read_dir(pbf_dir)?.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        let Some((z, x, y)) = crate::ingest::parse_pbf_tile_name(name) else { continue };
-        match zoom {
-            None => zoom = Some(z),
-            Some(z0) if z0 != z => anyhow::bail!(
-                "buildings_pbf_dir mixes zoom levels ({z0} and {z}); expected exactly one"
-            ),
-            _ => {}
-        }
-        let raw = fs::read(&path)?;
-        let bytes = crate::mvt::maybe_gunzip(&raw);
-        match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
-            Ok((buildings, _)) => {
-                tiles_read += 1;
-                all.extend(buildings.iter().map(|b| b.to_building()));
-            }
-            Err(e) => eprintln!("[Warn] buildings {name}: {e}"),
-        }
-    }
+    // 1. Decode every PBF tile once. The shared loader also refuses a
+    //    mixed-zoom directory, which would apply every above-ground height
+    //    twice — see `load_pbf_building_dir`.
+    let set = load_pbf_building_dir(pbf_dir)?;
 
-    // Tiles overlap in their buffer zones, so the same building arrives more
-    // than once. The `max` write rule makes that harmless, but dropping the
-    // duplicates saves rasterizing identical footprints repeatedly.
-    let before = all.len();
-    let mut seen = std::collections::HashSet::new();
-    all.retain(|b| match b.coords.first() {
-        Some(&(lon, lat)) => seen.insert((
-            (lat * 1_000_000.0).round() as i64,
-            (lon * 1_000_000.0).round() as i64,
-        )),
-        None => false,
-    });
-
-    if all.is_empty() {
-        eprintln!("[Buildings] {tiles_read} pbf tile(s), no buildings in extent");
+    if set.buildings.is_empty() {
+        eprintln!("[Buildings] {} pbf tile(s), no buildings in extent", set.tiles_read);
         return Ok(());
     }
 
@@ -1521,7 +1515,7 @@ fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)
             size_px: spec.size_px,
         };
         let mut grid = AbtGrid { buf: &mut buf, size: spec.size_px, stride };
-        let stats = rasterize_buildings(&mut grid, &tile, &all, &opts);
+        let stats = rasterize_buildings(&mut grid, &tile, &set.buildings, &opts);
 
         if stats.pixels_modified > 0 {
             fs::write(path, &buf)?;
@@ -1532,9 +1526,9 @@ fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)
 
     eprintln!(
         "[Buildings] {} pbf tile(s) → {} building(s) ({} dup dropped) → {}/{} abt tile(s), {} px in {:.1}s",
-        tiles_read,
-        all.len(),
-        before - all.len(),
+        set.tiles_read,
+        set.buildings.len(),
+        set.duplicates_dropped(),
         tiles_hit,
         abt_specs.len(),
         px_total,
@@ -1863,4 +1857,241 @@ pub async fn run_download_mem(
     stats.log_summary(elapsed);
     eprintln!("[DownloadMem] TOTAL: {:.1}s", elapsed);
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Tile math ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tile_x_and_longitude_are_inverses() {
+        assert_eq!(tx2lon(0, 0), -180.0);
+        assert_eq!(tx2lon(1, 1), 0.0);
+        assert_eq!(lon2tx(-180.0, 0), 0);
+        assert_eq!(lon2tx(-180.0, 1), 0);
+        assert_eq!(lon2tx(0.0, 1), 1);
+        assert_eq!(lon2tx(179.999, 1), 1);
+
+        for z in 0..=14u32 {
+            for x in [0u32, 1, 3, (1u32 << z) - 1] {
+                // A point just inside the tile must land back on it.
+                let lon = tx2lon(x, z) + (tx2lon(x + 1, z) - tx2lon(x, z)) * 0.5;
+                assert_eq!(lon2tx(lon, z), x, "z={z} x={x}");
+            }
+        }
+    }
+
+    #[test]
+    fn tile_y_and_latitude_are_inverses() {
+        // The Web-Mercator cutoff, and the equator at the middle row.
+        assert!((ty2lat(0, 0) - 85.051_128_779_806_6).abs() < 1e-9);
+        assert!(ty2lat(1, 1).abs() < 1e-12);
+
+        for z in 0..=14u32 {
+            for y in [0u32, 1, 3, (1u32 << z) - 1] {
+                let lat = (ty2lat(y, z) + ty2lat(y + 1, z)) * 0.5;
+                assert_eq!(lat2ty(lat, z), y, "z={z} y={y}");
+            }
+        }
+    }
+
+    #[test]
+    fn latitude_decreases_as_tile_y_increases() {
+        let z = 5u32;
+        let mut prev = f64::MAX;
+        for y in 0..(1u32 << z) {
+            let lat = ty2lat(y, z);
+            assert!(lat < prev, "y={y} is not south of y={}", y.saturating_sub(1));
+            prev = lat;
+        }
+    }
+
+    #[test]
+    fn out_of_range_coordinates_clamp_to_zero_rather_than_wrapping() {
+        // `.max(0.0) as u32` — a negative index would otherwise wrap to ~4e9.
+        assert_eq!(lon2tx(-181.0, 4), 0);
+        assert_eq!(lat2ty(89.0, 4), 0);
+    }
+
+    // ── Terrain PNG decoding ───────────────────────────────────────────────
+
+    #[test]
+    fn the_terrarium_and_mapbox_decoders_match_their_specs() {
+        // Terrarium: (r*256 + g + b/256) - 32768.
+        assert_eq!(dec_terrarium(128, 0, 0), 0.0);
+        assert_eq!(dec_terrarium(0, 0, 0), -32768.0);
+        assert_eq!(dec_terrarium(128, 100, 128), 100.5);
+        // Mapbox: -10000 + (r*65536 + g*256 + b) * 0.1.
+        assert!((dec_mapbox(0, 0, 0) - -10000.0).abs() < 1e-3);
+        assert!((dec_mapbox(1, 134, 160) - 0.0).abs() < 1e-2, "100000 * 0.1 - 10000 = 0 m");
+        assert!((dec_mapbox(1, 173, 176) - 1000.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn a_blank_terrarium_tile_decodes_below_the_nodata_floor() {
+        // The void backfill keys off this: RGB 0,0,0 is -32768 m, not ground.
+        assert!(dec_terrarium(0, 0, 0) <= NODATA_M);
+        assert!(dec_terrarium(128, 0, 0) > NODATA_M);
+    }
+
+    // ── .abt writer ────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_abt_writer_emits_the_44_byte_header_from_the_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.abt");
+        let (size, ul_lat, ul_lon, pd) = (300u32, 47.25, 8.5, 9.0e-5);
+
+        AbtWriter::create(&path, size, ul_lat, ul_lon, pd).unwrap().finish().unwrap();
+
+        let b = fs::read(&path).unwrap();
+        assert_eq!(b.len(), 44, "the header is written up front, rows follow");
+        assert_eq!(&b[0..4], b"AETH");
+        assert_eq!(u16::from_le_bytes([b[4], b[5]]), 1);
+        assert_eq!(u16::from_le_bytes([b[6], b[7]]), size as u16);
+        assert_eq!(f64::from_le_bytes(b[8..16].try_into().unwrap()), ul_lat);
+        assert_eq!(f64::from_le_bytes(b[16..24].try_into().unwrap()), ul_lon);
+        assert_eq!(f64::from_le_bytes(b[24..32].try_into().unwrap()), pd);
+        assert_eq!(f64::from_le_bytes(b[32..40].try_into().unwrap()), pd);
+        assert_eq!(i16::from_le_bytes([b[40], b[41]]), 0);
+        // 300*2 = 600 bytes/row, aligned up to 768.
+        assert_eq!(u16::from_le_bytes([b[42], b[43]]), 768);
+    }
+
+    #[test]
+    fn written_rows_land_where_the_reader_looks_for_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.abt");
+        let size = 6u32;
+        let mut w = AbtWriter::create(&path, size, 47.0, 8.0, 1e-4).unwrap();
+        for y in 0..size {
+            let row: Vec<i16> = (0..size).map(|x| (y * 100 + x) as i16).collect();
+            w.write_row(y, &row).unwrap();
+        }
+        w.finish().unwrap();
+
+        // Read it back through the same addressing the engine and the building
+        // post-pass use: 44 + row * row_stride + col * 2.
+        let mut buf = fs::read(&path).unwrap();
+        let stride = u16::from_le_bytes([buf[42], buf[43]]) as usize;
+        assert_eq!(stride, 256, "6*2 = 12 bytes, aligned up to 256");
+        assert_eq!(buf.len(), 44 + stride * size as usize);
+        let mut grid = crate::buildings::AbtGrid { buf: &mut buf, size, stride };
+        use crate::buildings::ElevGrid;
+        for y in 0..size {
+            for x in 0..size {
+                assert_eq!(grid.get(x, y), Some((y * 100 + x) as i16), "({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn the_abt_size_estimate_matches_what_the_writer_produces() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SubTileSpec {
+            filename: "t.abt".into(),
+            ul_lat: 47.0,
+            ul_lon: 8.0,
+            size_px: 100,
+            resolution_m: 10.0,
+        };
+        let path = dir.path().join(&spec.filename);
+        let mut w = AbtWriter::create(&path, spec.size_px, spec.ul_lat, spec.ul_lon, 1e-4).unwrap();
+        let row = vec![0i16; spec.size_px as usize];
+        for y in 0..spec.size_px {
+            w.write_row(y, &row).unwrap();
+        }
+        w.finish().unwrap();
+
+        assert_eq!(
+            estimate_abt_bytes(std::slice::from_ref(&spec)),
+            fs::metadata(&path).unwrap().len()
+        );
+    }
+
+    // ── Buildings post-pass ────────────────────────────────────────────────
+
+    #[test]
+    fn the_buildings_post_pass_raises_roofs_on_finished_abt_tiles() {
+        use crate::buildings::tests::synthetic_building_tile;
+
+        let (z, x, y) = (14u32, 8531u32, 5752u32);
+        let dir = tempfile::tempdir().unwrap();
+        let pbf_dir = dir.path().join("pbf");
+        fs::create_dir(&pbf_dir).unwrap();
+        fs::write(pbf_dir.join(format!("{z}_{x}_{y}.pbf")), synthetic_building_tile()).unwrap();
+
+        // One .abt covering exactly that vector tile, on flat 200 m terrain.
+        let size = 128u32;
+        let (ul_lon, ul_lat) = (tx2lon(x, z), ty2lat(y, z));
+        let pd = (tx2lon(x + 1, z) - ul_lon) / size as f64;
+        let spec = SubTileSpec {
+            filename: "t.abt".into(),
+            ul_lat,
+            ul_lon,
+            size_px: size,
+            resolution_m: pd * 111_111.0,
+        };
+        let path = dir.path().join(&spec.filename);
+        let mut w = AbtWriter::create(&path, size, ul_lat, ul_lon, pd).unwrap();
+        for row in 0..size {
+            w.write_row(row, &vec![400i16; size as usize]).unwrap();
+        }
+        w.finish().unwrap();
+
+        apply_buildings_post_pass(&pbf_dir, &[(spec, path.clone())]).unwrap();
+
+        // 200 m ground + a 12 m render_height = 212 m = 424 half-metres.
+        let buf = fs::read(&path).unwrap();
+        let stride = u16::from_le_bytes([buf[42], buf[43]]) as usize;
+        let mut raised = 0usize;
+        for row in 0..size as usize {
+            for col in 0..size as usize {
+                let o = 44 + row * stride + col * 2;
+                match i16::from_le_bytes([buf[o], buf[o + 1]]) {
+                    400 => {}
+                    424 => raised += 1,
+                    v => panic!("unexpected elevation {v} at ({col},{row})"),
+                }
+            }
+        }
+        assert!(raised > 0, "the building must have been drawn");
+    }
+
+    #[test]
+    fn the_buildings_post_pass_refuses_a_mixed_zoom_directory() {
+        use crate::buildings::tests::synthetic_building_tile;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("14_8531_5752.pbf"), synthetic_building_tile()).unwrap();
+        fs::write(dir.path().join("15_17062_11504.pbf"), synthetic_building_tile()).unwrap();
+
+        let err = apply_buildings_post_pass(dir.path(), &[]).unwrap_err().to_string();
+        assert!(err.contains("buildings_pbf_dir mixes zoom levels"), "got {err:?}");
+    }
+
+    // ── Download failure threshold ─────────────────────────────────────────
+
+    #[test]
+    fn a_near_total_fetch_failure_fails_the_run() {
+        // The case this exists for: a max zoom the source does not serve, so
+        // every tile 404s and every .abt is written as flat 0 m.
+        assert!(fetch_failure_is_fatal(1369, 1369));
+        assert!(fetch_failure_is_fatal(1000, 1369));
+        assert!(fetch_failure_is_fatal(1, 1), "a one-tile job that fetched nothing");
+    }
+
+    #[test]
+    fn sparse_edge_failures_do_not_fail_the_run() {
+        // 404s at the edge of a provider's coverage are normal.
+        assert!(!fetch_failure_is_fatal(0, 1369));
+        assert!(!fetch_failure_is_fatal(1, 1369));
+        assert!(!fetch_failure_is_fatal(137, 1369), "10% lost is still terrain");
+        assert!(!fetch_failure_is_fatal(684, 1369), "exactly half is not a majority");
+        assert!(fetch_failure_is_fatal(685, 1369), "one past half is");
+        // Nothing attempted is not a failure — an empty job is caught elsewhere.
+        assert!(!fetch_failure_is_fatal(0, 0));
+    }
 }
