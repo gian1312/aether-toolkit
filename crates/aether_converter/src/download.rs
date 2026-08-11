@@ -129,6 +129,166 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
 const NODATA_M: f32 = -11000.0; // below the deepest ocean -> anything lower is a void
 const NODATA_FILL_MIN_ZOOM: u32 = 6;
 
+// Assembly resampling ---------------------------------------------------------
+//
+// An output cell covers `resolution_m / (tile ground sample distance)` source
+// samples, and `tile_zoom` picks a zoom slightly FINER than the target, so that
+// ratio sits just above 1 — a footprint of one or two samples per axis. Taking
+// one of them and dropping the rest (what the nearest-neighbour lookup here used
+// to do) aliases the discarded samples into the tile as speckle, so the cell is
+// area-averaged over its whole footprint instead.
+
+/// The half-open span of source samples whose **centres** fall inside `[lo, hi)`,
+/// in source-sample units, clipped to `[0, n)`.
+///
+/// Sample `i` covers `[i, i+1)` and is centred at `i + 0.5`, so the cell owns
+/// `round(lo) .. round(hi)`. An empty span means the output cell is finer than
+/// the source: it falls back to the single sample **containing** the cell's
+/// centre, which is the continuous limit of the same rule — at ratio 1 the one
+/// sample whose centre is inside the cell is the one containing the cell's
+/// centre, so nothing jumps as the ratio crosses 1.
+///
+/// The old lookup rounded the centre's grid coordinate to an index instead
+/// (`((lon - gul_lon) / gpx).round()`), which reads a grid whose samples are
+/// centred on integers. The assembly grid is not that grid — column `i` covers
+/// `[i, i+1)` — so that lookup sat half a source sample east of, and south of,
+/// where it belonged. Correcting it moves the sampled point, so `.abt` bytes
+/// change for that reason as well as for the averaging.
+#[inline]
+fn grid_span(lo: f64, hi: f64, n: usize) -> (usize, usize) {
+    // The nudge decides a sample centre that lands exactly on a cell edge the
+    // same way every time, instead of leaving it to the last bit of the
+    // coordinate arithmetic; adjacent cells share the edge, so the spans still
+    // tile. A billionth of a sample is far below any real geometry.
+    const EPS: f64 = 1e-9;
+    let start = (lo + 0.5 + EPS) as usize;
+    let end = ((hi + 0.5 + EPS) as usize).min(n);
+    if start < end {
+        return (start, end);
+    }
+    let c = (lo + hi) * 0.5;
+    if c >= 0.0 {
+        let i = c as usize;
+        if i < n {
+            return (i, i + 1);
+        }
+    }
+    (0, 0)
+}
+
+/// The source rows of a 256-row tile-row that one output row covers.
+///
+/// Callers only reach this for an output row whose centre lies inside the
+/// tile-row, so an empty span is a floating-point edge case at the boundary;
+/// it resolves to the clamped nearest row, as the old `.round().min(255)` did.
+/// A footprint that reaches past the tile-row is clipped to it — the row is
+/// averaged over the part of its footprint this tile-row holds, because the
+/// assembly only ever has one tile-row of the grid in memory.
+#[inline]
+fn tile_row_span(lo: f64, hi: f64) -> (usize, usize) {
+    let (a, b) = grid_span(lo, hi, 256);
+    if a < b {
+        (a, b)
+    } else {
+        let c = (((lo + hi) * 0.5) as usize).min(255);
+        (c, c + 1)
+    }
+}
+
+/// Per-output-column source spans into the assembly grid, built once per tile.
+///
+/// Column `x` covers `[ul_lon + x*pd, ul_lon + (x+1)*pd)`; `gul_lon`/`gpx` place
+/// and scale the grid. A column whose footprint misses the grid entirely gets an
+/// empty span, which [`avg_cell`] writes as 0 m — what a missing tile already
+/// produces.
+fn x_span_table(
+    sz: usize, ul_lon: f64, pd: f64, gul_lon: f64, gpx: f64, gw: usize,
+) -> Vec<(u32, u32)> {
+    (0..sz)
+        .map(|x| {
+            let lo = (ul_lon + x as f64 * pd - gul_lon) / gpx;
+            let hi = (ul_lon + (x + 1) as f64 * pd - gul_lon) / gpx;
+            let (a, b) = grid_span(lo, hi, gw);
+            (a as u32, b as u32)
+        })
+        .collect()
+}
+
+/// Metres to the `.abt` half-metre unit, rounding half away from zero.
+///
+/// The same value `(v * 2.0).round() as i16` produces, without the libm call
+/// `f32::round` lowers to on a baseline x86-64 target — this runs once per
+/// output pixel of every tile. Adding the half is exact here: an elevation in
+/// half-metres is far below the 2^24 at which an `f32` stops holding integers.
+#[inline(always)]
+fn half_metres(v: f32) -> i16 {
+    let t = v * 2.0;
+    (t + if t >= 0.0 { 0.5 } else { -0.5 }) as i16
+}
+
+/// Area-average one output cell out of the assembly grid, in half-metres.
+///
+/// Voids are excluded from the mean rather than averaged into it: a Terrarium
+/// pixel the parent-tile backfill could not repair is ~-32768 m, and letting one
+/// into a mean would drag the whole cell into a pit. A cell with nothing but
+/// voids under it passes one through, exactly as the point sample did, and a
+/// cell whose footprint misses the grid entirely stays 0 m — what a tile that
+/// failed to download already writes.
+///
+/// One-sample cells (the target finer than the source) skip the accumulator
+/// entirely, so they cost what the nearest-neighbour lookup cost.
+#[inline(always)]
+fn avg_cell(grid: &[f32], gw: usize, c0: usize, c1: usize, r0: usize, r1: usize) -> i16 {
+    if c0 >= c1 {
+        return 0;
+    }
+    if c1 - c0 == 1 && r1 - r0 == 1 {
+        return half_metres(grid[r0 * gw + c0]);
+    }
+    // Sum and track the minimum in one branchless pass. A void is far below any
+    // terrain, so the minimum alone says whether one is present, and the
+    // exclusion pass then runs only for the handful of cells that touch one.
+    let mut sum = 0.0f32;
+    let mut lo = f32::MAX;
+    for r in r0..r1 {
+        let off = r * gw;
+        for &v in &grid[off + c0..off + c1] {
+            sum += v;
+            lo = lo.min(v);
+        }
+    }
+    let n = (r1 - r0) * (c1 - c0);
+    if lo > NODATA_M {
+        return half_metres(sum * recip(n));
+    }
+    let mut vsum = 0.0f32;
+    let mut cnt = 0u32;
+    for r in r0..r1 {
+        let off = r * gw;
+        for &v in &grid[off + c0..off + c1] {
+            if v > NODATA_M {
+                vsum += v;
+                cnt += 1;
+            }
+        }
+    }
+    if cnt == 0 {
+        return half_metres(grid[r0 * gw + c0]);
+    }
+    half_metres(vsum * recip(cnt as usize))
+}
+
+/// `1.0 / n`, from a table for the small counts a footprint actually has.
+#[inline(always)]
+fn recip(n: usize) -> f32 {
+    const R: [f32; 17] = [
+        0.0, 1.0, 1.0 / 2.0, 1.0 / 3.0, 1.0 / 4.0, 1.0 / 5.0, 1.0 / 6.0, 1.0 / 7.0,
+        1.0 / 8.0, 1.0 / 9.0, 1.0 / 10.0, 1.0 / 11.0, 1.0 / 12.0, 1.0 / 13.0,
+        1.0 / 14.0, 1.0 / 15.0, 1.0 / 16.0,
+    ];
+    if n < R.len() { R[n] } else { 1.0 / n as f32 }
+}
+
 /// One fetch + decode of a single tile (no retry) -> 256x256 grid, or None.
 async fn fetch_decode_raw(
     client: &reqwest::Client, url: &str, dec: fn(u8, u8, u8) -> f32,
@@ -1291,18 +1451,10 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                         }
                     }
 
-                    let x_luts: Vec<Vec<usize>> = specs.iter().map(|(spec, _)| {
+                    let x_luts: Vec<Vec<(u32, u32)>> = specs.iter().map(|(spec, _)| {
                         let pd = spec.resolution_m / 111_111.0;
                         let sz = spec.size_px as usize;
-                        (0..sz).map(|x| {
-                            let gc = ((spec.ul_lon + (x as f64 + 0.5) * pd - gul_lon)
-                                / gpx).round() as isize;
-                            if gc >= 0 && (gc as usize) < gw {
-                                gc as usize
-                            } else {
-                                usize::MAX
-                            }
-                        }).collect()
+                        x_span_table(sz, spec.ul_lon, pd, gul_lon, gpx, gw)
                     }).collect();
 
                     let strides: Vec<usize> = specs.iter().map(|(spec, _)| {
@@ -1363,16 +1515,17 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                                 (0..sz).filter_map(|y| {
                                     let lat = spec.ul_lat - (y as f64 + 0.5) * pd;
                                     if lat > tr_top || lat <= tr_bot { return None; }
-                                    let gr = (((tr_top - lat) / tr_spy).round() as usize).min(255);
+                                    let (r0, r1) = tile_row_span(
+                                        (tr_top - (spec.ul_lat - y as f64 * pd)) / tr_spy,
+                                        (tr_top - (spec.ul_lat - (y + 1) as f64 * pd)) / tr_spy,
+                                    );
 
-                                    let row_off = gr * gw;
                                     let mut row_data = vec![0i16; sz];
                                     for x in 0..sz {
-                                        let gc = x_lut[x];
-                                        if gc < gw {
-                                            row_data[x] = (grid_ref[row_off + gc] * 2.0)
-                                                .round() as i16;
-                                        }
+                                        let (c0, c1) = x_lut[x];
+                                        row_data[x] = avg_cell(
+                                            grid_ref, gw, c0 as usize, c1 as usize, r0, r1,
+                                        );
                                     }
                                     Some((y as u32, row_data))
                                 }).collect()
@@ -1631,14 +1784,9 @@ pub async fn run_download_mem(
         });
     }
 
-    // 4. Pre-compute x-lookup tables (pixel x → global grid column).
-    let x_luts: Vec<Vec<usize>> = abt_bufs.iter().map(|abt| {
-        let sz = abt.size_px as usize;
-        (0..sz).map(|x| {
-            let gc = ((abt.ul_lon + (x as f64 + 0.5) * abt.pd - gul_lon)
-                / gpx).round() as isize;
-            if gc >= 0 && (gc as usize) < gw { gc as usize } else { usize::MAX }
-        }).collect()
+    // 4. Pre-compute x-lookup tables (pixel x → source column span).
+    let x_luts: Vec<Vec<(u32, u32)>> = abt_bufs.iter().map(|abt| {
+        x_span_table(abt.size_px as usize, abt.ul_lon, abt.pd, gul_lon, gpx, gw)
     }).collect();
 
     // 5. Build strip ranges.
@@ -1813,19 +1961,19 @@ pub async fn run_download_mem(
                 for y in 0..sz {
                     let lat = abt.ul_lat - (y as f64 + 0.5) * abt.pd;
                     if lat > tr_top || lat <= tr_bot { continue; }
-                    let gr = (((tr_top - lat) / tr_spy).round() as usize).min(255);
+                    let (r0, r1) = tile_row_span(
+                        (tr_top - (abt.ul_lat - y as f64 * abt.pd)) / tr_spy,
+                        (tr_top - (abt.ul_lat - (y + 1) as f64 * abt.pd)) / tr_spy,
+                    );
 
-                    let row_off = gr * gw;
                     let buf_offset = 44 + y * abt.stride;
 
                     // Write i16 elevation values directly into the buffer.
                     for x in 0..sz {
-                        let gc = x_lut[x];
-                        let val: i16 = if gc < gw {
-                            (mini_grid[row_off + gc] * 2.0).round() as i16
-                        } else {
-                            0
-                        };
+                        let (c0, c1) = x_lut[x];
+                        let val = avg_cell(
+                            &mini_grid, gw, c0 as usize, c1 as usize, r0, r1,
+                        );
                         let byte_off = buf_offset + x * 2;
                         abt.buf[byte_off..byte_off + 2]
                             .copy_from_slice(&val.to_le_bytes());
@@ -1934,6 +2082,86 @@ mod tests {
         // The void backfill keys off this: RGB 0,0,0 is -32768 m, not ground.
         assert!(dec_terrarium(0, 0, 0) <= NODATA_M);
         assert!(dec_terrarium(128, 0, 0) > NODATA_M);
+    }
+
+    // ── Assembly resampling ────────────────────────────────────────────────
+
+    #[test]
+    fn a_cell_owns_the_samples_whose_centres_fall_inside_it() {
+        // Two source samples per output cell.
+        assert_eq!(grid_span(0.0, 2.0, 8), (0, 2));
+        assert_eq!(grid_span(2.0, 4.0, 8), (2, 4));
+
+        // The ratio the downloader actually produces (a zoom slightly finer
+        // than the target) is not an integer. The spans must still tile the
+        // source: every sample counted once, none skipped — which is exactly
+        // what the nearest-neighbour lookup did not do.
+        let mut next = 0;
+        for x in 0..7usize {
+            let (a, b) = grid_span(x as f64 * 1.14, (x + 1) as f64 * 1.14, 8);
+            assert_eq!(a, next, "gap or overlap at cell {x}");
+            assert!(b > a, "cell {x} came out empty");
+            next = b;
+        }
+    }
+
+    #[test]
+    fn an_output_cell_finer_than_the_source_takes_the_sample_it_sits_in() {
+        // Ratio 0.5 — nothing to average, so both cells inside sample 0 take
+        // sample 0 rather than dividing by zero.
+        assert_eq!(grid_span(0.0, 0.5, 4), (0, 1));
+        assert_eq!(grid_span(0.5, 1.0, 4), (0, 1));
+        assert_eq!(grid_span(1.0, 1.5, 4), (1, 2));
+        // Off the grid entirely: empty, which `avg_cell` writes as 0 m — what a
+        // tile that failed to download already produces.
+        assert_eq!(grid_span(-4.0, -3.5, 4), (0, 0));
+        assert_eq!(grid_span(9.0, 9.5, 4), (0, 0));
+    }
+
+    #[test]
+    fn an_output_row_is_clipped_to_the_tile_row_held_in_memory() {
+        // Assembly only ever has one 256-row tile-row of the grid, so a
+        // footprint reaching past it is clipped — but never to nothing.
+        for (lo, hi) in [(0.0, 1.2), (127.4, 128.6), (254.5, 256.5), (255.6, 256.4)] {
+            let (a, b) = tile_row_span(lo, hi);
+            assert!(a < b && b <= 256, "{lo}..{hi} gave {a}..{b}");
+        }
+    }
+
+    #[test]
+    fn the_column_table_covers_the_grid_without_gaps() {
+        // 8 grid samples under 4 output columns of the same total width.
+        let spans = x_span_table(4, 0.0, 2.0, 0.0, 1.0, 8);
+        assert_eq!(spans, vec![(0, 2), (2, 4), (4, 6), (6, 8)]);
+    }
+
+    #[test]
+    fn avg_cell_averages_its_footprint_and_leaves_one_sample_alone() {
+        let grid = vec![
+            100.0f32, 200.0, 0.0, 0.0, //
+            300.0, 400.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        // 2x2: mean 250 m = 500 half-metres.
+        assert_eq!(avg_cell(&grid, 4, 0, 2, 0, 2), 500);
+        // One sample: the value the point sample wrote, unchanged.
+        assert_eq!(avg_cell(&grid, 4, 1, 2, 0, 1), 400);
+        // A footprint off the grid stays 0 m.
+        assert_eq!(avg_cell(&grid, 4, 0, 0, 0, 1), 0);
+    }
+
+    #[test]
+    fn a_terrarium_void_is_not_averaged_into_the_terrain_beside_it() {
+        // A blank Terrarium pixel the parent backfill could not repair is
+        // -32768 m. Averaging it in would put this 1000 m cell at 235 m.
+        let grid = vec![1000.0f32, -32768.0, 1000.0, 1000.0];
+        assert_eq!(avg_cell(&grid, 2, 0, 2, 0, 2), 2000);
+
+        // Nothing but voids: the pit passes through rather than becoming
+        // invented ground, exactly as the point sample passed it through.
+        let all_void = vec![-32768.0f32; 4];
+        assert_eq!(avg_cell(&all_void, 2, 0, 2, 0, 2), half_metres(-32768.0));
     }
 
     // ── .abt writer ────────────────────────────────────────────────────────
@@ -2095,3 +2323,4 @@ mod tests {
         assert!(!fetch_failure_is_fatal(0, 0));
     }
 }
+

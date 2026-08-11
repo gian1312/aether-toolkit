@@ -29,7 +29,7 @@
         "ul_lat": { "type": "number", "description": "Upper-left latitude." },
         "ul_lon": { "type": "number", "description": "Upper-left longitude (east-positive)." },
         "size_px": { "type": "integer", "minimum": 1, "description": "Tile side in pixels (u32)." },
-        "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel; writer sets scale = resolution_m / 111111." }
+        "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel; writer sets scale = resolution_m / 111111. XYZ samples are area-averaged over each output pixel's footprint (voids excluded from the mean); where a pixel is finer than the source zoom it takes the sample it sits in. See CONTRACT.md section 6." }
       }
     }
   }

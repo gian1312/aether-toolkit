@@ -97,6 +97,123 @@ pub struct LoadedImage {
     pub name: String,
 }
 
+/// Nudge that decides a source-pixel centre landing exactly on a cell edge.
+///
+/// Grids that line up exactly are the common case — the plugin warps its base
+/// DEM onto the analysis grid — and then every cell edge falls on a pixel
+/// centre, where a 1-ulp difference in the coordinate arithmetic would decide
+/// which cell owns the pixel. This resolves it the same way every time (the
+/// low edge belongs to the cell above, the high edge to this one), which keeps
+/// the spans tiling and keeps a 3-to-1 average symmetric about its cell instead
+/// of leaning half a pixel whichever way the last rounding went. A billionth of
+/// a pixel is far below any real geometry and far above the arithmetic's noise.
+const SPAN_EPS: f64 = 1e-9;
+
+/// The half-open source-pixel span whose **centres** fall inside one output
+/// cell, along one axis.
+///
+/// `lo`/`hi` are the cell's leading and trailing edges in source-pixel units
+/// (`lo < hi`) and `dim` is the source raster's extent on that axis. Source
+/// pixel `i` covers `[i, i+1)` with its centre at `i + 0.5`, so the cell
+/// `[lo, hi)` owns the indices `i` with `lo <= i + 0.5 < hi`, clipped to the
+/// raster. That is `round(lo) .. round(hi)`, with [`SPAN_EPS`] settling an edge
+/// that lands exactly on a pixel centre. (`(v + 0.5) as u32` truncates and
+/// saturates, so it costs one instruction and maps negatives to 0; `f64::ceil`
+/// would lower to a libm call on a baseline x86-64 target, twice per axis per
+/// output pixel.)
+///
+/// **Upsampling degrades to the old behaviour.** When the output cell is finer
+/// than a source pixel the span can be empty — no source centre lands in it.
+/// Rather than divide by zero or leave the cell void it falls back to the pixel
+/// containing the cell's *centre*, and callers centre the cell on the point the
+/// old code sampled, so an upsampling job keeps its exact bytes. It is also the
+/// continuous limit of the span rule: at ratio 1 the one pixel whose centre is
+/// inside the cell is the one containing the cell's centre, so nothing jumps
+/// half a pixel as the ratio crosses 1.
+#[inline]
+fn sample_span(lo: f64, hi: f64, dim: u32) -> (u32, u32) {
+    if dim == 0 {
+        return (0, 0);
+    }
+    let start = (lo + 0.5 + SPAN_EPS) as u32;
+    let end = ((hi + 0.5 + SPAN_EPS) as u32).min(dim);
+    if start < end {
+        (start, end)
+    } else {
+        // `as u32` truncates and saturates, so a negative midpoint lands on 0.
+        let p = (((lo + hi) * 0.5) as u32).min(dim - 1);
+        (p, p + 1)
+    }
+}
+
+/// Sample one output cell out of one source image: the area-average of the
+/// source pixels its footprint covers, in half-metres.
+///
+/// A cell covering exactly one source pixel — every cell of a source at or
+/// coarser than the target, which is the whole of the warped-base-DEM path —
+/// reads that pixel straight, with none of the accumulator's machinery, so the
+/// common one-sample case costs what the old point sample cost.
+#[inline(always)]
+fn sample_cell(img: &LoadedImage, px0: u32, px1: u32, py0: u32, py1: u32) -> Option<i16> {
+    let w = img.width as usize;
+    let a = px0 as usize;
+    if px1 - px0 == 1 && py1 - py0 == 1 {
+        let v = img.data[py0 as usize * w + a];
+        return if v > -5000 { Some(v) } else { None };
+    }
+    mean_valid(&img.data, w, a, px1 as usize, py0 as usize, py1 as usize)
+}
+
+/// Mean of the **valid** samples of one source-pixel rectangle, in half-metres.
+///
+/// Voids are excluded from the mean, never averaged into it: a cell beside a
+/// coastline or a DEM edge must not be dragged toward -4999.5 m by the no-data
+/// pixels next to it. A rectangle holding no valid sample at all returns `None`,
+/// and the caller falls through to its next source exactly as a void point
+/// sample used to.
+///
+/// The inner pass is branchless and sums into an `i32`, which is what makes it
+/// vectorize — an `i64` accumulator measured 44% slower on a 60×60 footprint.
+/// `32768 * 32768` is `i32::MAX + 1`, so the run is split at 32768 samples and
+/// widened into `i64` between runs; no real DEM has a row that long, but it
+/// splits rather than wraps if one ever does. The division rounds once at the
+/// end — accumulating in `i16` would overflow after two mountain pixels.
+#[inline]
+fn mean_valid(data: &[i16], w: usize, a: usize, b: usize, y0: usize, y1: usize) -> Option<i16> {
+    let mut sum: i64 = 0;
+    let mut cnt: u32 = 0;
+    for py in y0..y1 {
+        let row = py * w;
+        for run in data[row + a..row + b].chunks(1 << 15) {
+            let mut rsum: i32 = 0;
+            let mut rcnt: u32 = 0;
+            for &v in run {
+                let ok = v > -5000;
+                rsum += if ok { v as i32 } else { 0 };
+                rcnt += ok as u32;
+            }
+            sum += rsum as i64;
+            cnt += rcnt;
+        }
+    }
+    match cnt {
+        0 => None,
+        // Single-sample cells keep the exact source value — no divide, and no
+        // rounding drift on the upsampling path.
+        1 => Some(sum as i16),
+        // Round half away from zero, integer-only.
+        _ => {
+            let c = cnt as i64;
+            let r = if sum >= 0 {
+                (2 * sum + c) / (2 * c)
+            } else {
+                (2 * sum - c) / (2 * c)
+            };
+            Some(r as i16)
+        }
+    }
+}
+
 #[inline(always)]
 fn wgs84_to_lv95_fast(lat: f64, lon: f64) -> (f64, f64) {
     let phi = (lat * 3600.0 - 169028.66) / 10000.0;
@@ -251,6 +368,28 @@ pub fn process_tile(
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
 
+    // Per-column source spans for the base DEM, computed once for the whole
+    // tile: the base is axis-aligned in degrees, so a column's footprint is the
+    // same on every row. `(0, 0)` means the column falls outside the base.
+    let base_x_spans: Vec<(u32, u32)> = match base_image_ref {
+        Some(base) => {
+            let half = 0.5 * pixel_deg / base.scale;
+            (0..out_size)
+                .map(|x| {
+                    let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
+                    if pixel_lon >= base.origin_e && pixel_lon < base.limit_e {
+                        let px_f = (pixel_lon - base.origin_e) / base.scale;
+                        if px_f >= 0.0 && (px_f as u32) < base.width {
+                            return sample_span(px_f - half, px_f + half, base.width);
+                        }
+                    }
+                    (0, 0)
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
     // Terrain Rasterization
     #[cfg(feature = "native")]
     let iter = buffer.par_chunks_mut(out_size);
@@ -260,7 +399,7 @@ pub fn process_tile(
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
 
         let mut base_row_valid = false;
-        let mut base_py = 0;
+        let mut base_py = (0u32, 0u32);
         if let Some(base) = base_image_ref {
             if row_lat <= base.origin_n && row_lat >= base.limit_n {
                 let py_f = (base.origin_n - row_lat) / base.scale;
@@ -268,7 +407,10 @@ pub fn process_tile(
                     let py = py_f as u32;
                     if py < base.height {
                         base_row_valid = true;
-                        base_py = py;
+                        // The cell's own row band, hoisted: it is the same for
+                        // every pixel of this output row.
+                        let half = 0.5 * pixel_deg / base.scale;
+                        base_py = sample_span(py_f - half, py_f + half, base.height);
                     }
                 }
             }
@@ -276,20 +418,31 @@ pub fn process_tile(
 
         let (e_start, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
         let (e_end, n_end) = wgs84_to_lv95_fast(row_lat, job.ul_lon + (out_size as f64 * pixel_deg));
+        // The same two points one output row further down: the cell's south
+        // edge. Area-averaging needs the cell's footprint, not just the corner
+        // the old point sample read, and the LV95 northing of a WGS84 parallel
+        // drifts along the row, so the south edge needs its own row.
+        let (_, n_lo_start) = wgs84_to_lv95_fast(row_lat - pixel_deg, job.ul_lon);
+        let (_, n_lo_end) =
+            wgs84_to_lv95_fast(row_lat - pixel_deg, job.ul_lon + (out_size as f64 * pixel_deg));
 
         let step_e = (e_end - e_start) / out_size as f64;
         let step_n = (n_end - n_start) / out_size as f64;
+        let step_n_lo = (n_lo_end - n_lo_start) / out_size as f64;
+        let half_step_e = step_e * 0.5;
 
         let row_min_n = n_start.min(n_end);
         let row_max_n = n_start.max(n_end);
         let row_min_e = e_start.min(e_end);
         let row_max_e = e_start.max(e_end);
 
+        // Carries 1/scale so the per-pixel footprint maths is multiplies, not a
+        // division per pixel per candidate image.
         let mut row_images = Vec::with_capacity(5);
         for img in &swiss_images {
             if img.origin_n >= row_min_n && img.limit_n <= row_max_n &&
                 img.limit_e >= row_min_e && img.origin_e <= row_max_e {
-                row_images.push(img.as_ref());
+                row_images.push((img.as_ref(), 1.0 / img.scale));
             }
         }
 
@@ -298,34 +451,43 @@ pub fn process_tile(
             let n = n_start + (step_n * x as f64);
             let mut val = VOID_ELEV;
 
-            for img in &row_images {
+            for &(img, inv) in &row_images {
+                // The cell this output pixel stands for, centred on the point
+                // the old code point-sampled: one output pixel wide and one
+                // output row tall. Centring it there is what keeps a source at
+                // or below the target resolution on the pixel it already used —
+                // the average is taken *around* the old sample, never offset
+                // from it. (Inside the loop so a tile with no candidate image
+                // under this row does not pay for it.)
+                let e_lo = e - half_step_e;
+                let e_hi = e + half_step_e;
+                let half_n = (n - (n_lo_start + step_n_lo * x as f64)) * 0.5;
+                let n_hi = n + half_n;
+                let n_lo = n - half_n;
                 if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
-                    let px = ((e - img.origin_e) / img.scale) as u32;
-                    let py = ((img.origin_n - n) / img.scale) as u32;
-                    if px < img.width && py < img.height {
-                        let v = unsafe { *img.data.get_unchecked((py * img.width + px) as usize) };
-                        if v > -5000 {
-                            val = v;
-                            break;
-                        }
+                    let (px0, px1) =
+                        sample_span((e_lo - img.origin_e) * inv, (e_hi - img.origin_e) * inv, img.width);
+                    let (py0, py1) =
+                        sample_span((img.origin_n - n_hi) * inv, (img.origin_n - n_lo) * inv, img.height);
+                    // First image that has real ground under the cell wins, as
+                    // before. The footprint is clipped to that one image, so a
+                    // cell straddling two source tiles averages the part inside
+                    // the tile its corner landed in — still an average of real
+                    // terrain, and still better than the single pixel it took
+                    // before.
+                    if let Some(v) = sample_cell(img, px0, px1, py0, py1) {
+                        val = v;
+                        break;
                     }
                 }
             }
 
             if val <= -5000 && base_row_valid {
                 let base = base_image_ref.unwrap();
-                let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
-
-                if pixel_lon >= base.origin_e && pixel_lon < base.limit_e {
-                    let px_f = (pixel_lon - base.origin_e) / base.scale;
-                    if px_f >= 0.0 {
-                        let px = px_f as u32;
-                        if px < base.width {
-                            let v = unsafe { *base.data.get_unchecked((base_py * base.width + px) as usize) };
-                            if v > -5000 {
-                                val = v;
-                            }
-                        }
+                let (px0, px1) = base_x_spans[x];
+                if px0 < px1 {
+                    if let Some(v) = sample_cell(base, px0, px1, base_py.0, base_py.1) {
+                        val = v;
                     }
                 }
             }
@@ -728,6 +890,217 @@ mod tests {
         // value above -5000 *half-metres* (-2500 m) as real ground.
         assert!(VOID_ELEV <= -5000, "the sentinel must read as no-data");
         assert!(0 > -5000, "sea level reads as valid ground — as it should");
+    }
+
+    // ── Area-averaged resampling ───────────────────────────────────────────
+
+    /// A source image in the base DEM's frame: degrees, origin at the tile's
+    /// upper-left, `scale` degrees per pixel.
+    fn img(w: u32, h: u32, origin_e: f64, origin_n: f64, scale: f64, data: Vec<i16>) -> LoadedImage {
+        assert_eq!(data.len(), (w * h) as usize);
+        LoadedImage {
+            width: w,
+            height: h,
+            data,
+            origin_e,
+            origin_n,
+            limit_e: origin_e + w as f64 * scale,
+            limit_n: origin_n - h as f64 * scale,
+            scale,
+            name: "test".into(),
+        }
+    }
+
+    /// Convert one tile from an in-memory base DEM and read the payload back.
+    fn convert_with_base(mut job: IngestJob, base: LoadedImage) -> Vec<Vec<i16>> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.tif");
+        job.output_path = dir.path().join("tile.abt");
+        job.base_tif = Some(path.clone());
+        let mut cache = HashMap::new();
+        cache.insert(path, Arc::new(base));
+        let out = job.output_path.clone();
+        let size = job.size_px as usize;
+        process_tile(job, Arc::new(std::sync::Mutex::new(cache)), None).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        let stride = ((size * 2) + 255) & !255;
+        (0..size)
+            .map(|y| {
+                (0..size)
+                    .map(|x| {
+                        let o = 44 + y * stride + x * 2;
+                        i16::from_le_bytes([bytes[o], bytes[o + 1]])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn ramp(w: u32, h: u32) -> Vec<i16> {
+        (0..w * h).map(|i| (i % w) as i16 * 10 + (i / w) as i16).collect()
+    }
+
+    #[test]
+    fn an_output_cell_is_the_mean_of_the_source_block_under_it() {
+        // Base three times finer than the target: every interior output pixel
+        // owns a clean 3x3 block, centred on the pixel the old code point-
+        // sampled. 3x3 = 9 samples of which the old code kept one.
+        let mut job = empty_job(PathBuf::new());
+        job.size_px = 4;
+        let pixel_deg = job.resolution_m / 111111.0;
+        let src = img(12, 12, job.ul_lon, job.ul_lat, pixel_deg / 3.0, ramp(12, 12));
+
+        let block_mean = |cx: usize, cy: usize| -> i16 {
+            let mut s = 0i32;
+            for y in cy - 1..=cy + 1 {
+                for x in cx - 1..=cx + 1 {
+                    s += src.data[y * 12 + x] as i32;
+                }
+            }
+            ((s * 2 + 9) / 18) as i16 // round half away from zero, 9 samples
+        };
+        let expect: Vec<(usize, usize, i16)> = (1..4)
+            .flat_map(|y| (1..4).map(move |x| (x, y, 0)))
+            .map(|(x, y, _)| (x, y, block_mean(3 * x, 3 * y)))
+            .collect();
+
+        let out = convert_with_base(job, src);
+        for (x, y, want) in expect {
+            assert_eq!(out[y][x], want, "pixel ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn voids_are_left_out_of_the_average_instead_of_dragging_the_cell_down() {
+        // The DEM-edge / coastline case: averaging the sentinel in would pull a
+        // 1000 m cell to -1200 m and bury the coast.
+        let src = &[
+            2000, 2000, 2000, //
+            2000, VOID_ELEV, 2000, //
+            2000, 2000, VOID_ELEV,
+        ];
+        // 7 valid samples of 2000, 2 voids -> exactly 2000, not 2000*7/9.
+        assert_eq!(mean_valid(src, 3, 0, 3, 0, 3), Some(2000));
+
+        // A mixed block averages only the real ground in it.
+        let src = &[10i16, 20, VOID_ELEV, 40];
+        assert_eq!(mean_valid(src, 4, 0, 4, 0, 1), Some(23)); // (10+20+40)/3 = 23.33
+    }
+
+    #[test]
+    fn a_cell_with_nothing_but_voids_under_it_stays_void() {
+        let src = &[VOID_ELEV; 9];
+        assert_eq!(mean_valid(src, 3, 0, 3, 0, 3), None);
+
+        // End to end: a base DEM of pure voids must not become sea level.
+        let mut job = empty_job(PathBuf::new());
+        job.size_px = 4;
+        let pixel_deg = job.resolution_m / 111111.0;
+        let src = img(12, 12, job.ul_lon, job.ul_lat, pixel_deg / 3.0, vec![VOID_ELEV; 144]);
+        let out = convert_with_base(job, src);
+        for row in &out {
+            for &v in row {
+                assert_eq!(v, VOID_ELEV);
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_coarser_than_the_target_still_gives_every_cell_a_value() {
+        // Ratio < 1: the cell holds no source-pixel centre at all, so there is
+        // nothing to average. It must not divide by zero or fall through as a
+        // void — it takes the pixel it sits in, exactly as before.
+        let mut job = empty_job(PathBuf::new());
+        job.size_px = 8;
+        let pixel_deg = job.resolution_m / 111111.0;
+        // One source pixel per four output pixels.
+        let scale = pixel_deg * 4.0;
+        let src = img(4, 4, job.ul_lon, job.ul_lat, scale, ramp(4, 4));
+        // What the point sampler this replaced would have written, spelled the
+        // way it spelled it — including the truncation, so the comparison holds
+        // on the cells where the arithmetic lands a hair either side of a
+        // source-pixel boundary.
+        let expect: Vec<Vec<i16>> = (0..8)
+            .map(|y| {
+                let py = ((job.ul_lat - (job.ul_lat - y as f64 * pixel_deg)) / scale) as usize;
+                (0..8)
+                    .map(|x| {
+                        let px = ((job.ul_lon + x as f64 * pixel_deg - job.ul_lon) / scale) as usize;
+                        src.data[py * 4 + px]
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let out = convert_with_base(job, src);
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn the_span_never_empties_and_never_divides_by_zero_at_any_ratio() {
+        for &ratio in &[0.01f64, 0.5, 0.999, 1.0, 1.001, 3.26, 60.0] {
+            for step in 0..7 {
+                let centre = 3.0 + step as f64 * 0.137;
+                let (a, b) = sample_span(centre - ratio / 2.0, centre + ratio / 2.0, 16);
+                assert!(a < b, "ratio {ratio} centre {centre} gave an empty span");
+                assert!(b <= 16);
+            }
+        }
+        // A cell entirely off the low edge still resolves to a real pixel.
+        let (a, b) = sample_span(-8.0, -7.0, 16);
+        assert!(a < b && b <= 16);
+    }
+
+    #[test]
+    fn a_non_integer_ratio_uses_every_source_pixel_exactly_once() {
+        // 3.26 source pixels per output cell — the ratio that exposed the bug.
+        // Nearest-neighbour keeps pixel `int(3.26 * x)` and drops the other
+        // 2.26, so a feature in a dropped pixel is invisible and which pixels
+        // survive follows a 3,3,3,4 beat. The spans must instead tile the
+        // source: contiguous, no gaps, no pixel counted twice.
+        const RATIO: f64 = 3.26;
+        let n = 326u32;
+        let mut next = None;
+        // From 1: cell 0's footprint runs off the raster's edge and is clipped.
+        for x in 1..99u32 {
+            let centre = RATIO * x as f64;
+            let (a, b) = sample_span(centre - RATIO / 2.0, centre + RATIO / 2.0, n);
+            assert!(b - a >= 3 && b - a <= 4, "x={x} took {} pixels", b - a);
+            if let Some(prev_end) = next {
+                assert_eq!(a, prev_end, "gap or overlap before output cell {x}");
+            }
+            next = Some(b);
+        }
+    }
+
+    #[test]
+    fn a_feature_the_old_sampler_skipped_now_reaches_the_output() {
+        // The same 3.26 ratio, end to end. A spike sits on a source pixel the
+        // truncating index never reads; with area-averaging it lifts its cell.
+        let mut job = empty_job(PathBuf::new());
+        job.size_px = 8;
+        let pixel_deg = job.resolution_m / 111111.0;
+        let w = 40u32;
+        let flat = vec![1000i16; (w * w) as usize];
+
+        let out_flat = convert_with_base(job.clone(), img(w, w, job.ul_lon, job.ul_lat, pixel_deg / 3.26, flat.clone()));
+        assert_eq!(out_flat[4][4], 1000);
+
+        // Pixel (4*3.26 = 13.04 -> the old code read column 13); put the spike
+        // on column 14, which it never reads, and keep row 13 so only the
+        // column moves.
+        let mut spiked = flat.clone();
+        spiked[13 * w as usize + 14] = 1000 + 900; // +450 m mast
+        let old_sample = spiked[13 * w as usize + 13];
+        assert_eq!(old_sample, 1000, "the old point sample is blind to the spike");
+
+        let out = convert_with_base(job.clone(), img(w, w, job.ul_lon, job.ul_lat, pixel_deg / 3.26, spiked));
+        assert!(
+            out[4][4] > out_flat[4][4],
+            "the spike must raise the cell it stands in: {} vs {}",
+            out[4][4], out_flat[4][4]
+        );
     }
 
     // ── .abt writer ────────────────────────────────────────────────────────

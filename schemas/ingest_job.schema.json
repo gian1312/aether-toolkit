@@ -17,9 +17,9 @@
         "format": { "type": ["string", "null"], "enum": ["r16sint", "bc6h", null], "description": "Tile payload format; defaults to r16sint behavior when absent." },
         "ul_lat": { "type": "number", "description": "Upper-left latitude (WGS84)." },
         "ul_lon": { "type": "number", "description": "Upper-left longitude (east-positive)." },
-        "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel." },
+        "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel. Sources finer than this are area-averaged over each output pixel's footprint (no-data excluded from the mean); a source at or coarser than this is taken as-is, never interpolated. See CONTRACT.md section 6." },
         "size_px": { "type": "integer", "minimum": 1, "description": "Output tile side in pixels (u32)." },
-        "base_tif": { "type": ["string", "null"], "description": "Base DEM GeoTIFF to sample." },
+        "base_tif": { "type": ["string", "null"], "description": "Base DEM GeoTIFF to sample, where no swiss_tifs cover the pixel. Area-averaged like every other source." },
         "swiss_tifs": {
           "type": "array",
           "items": { "type": "string" },

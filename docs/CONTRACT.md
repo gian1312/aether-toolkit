@@ -13,7 +13,7 @@ crates in this workspace (`aether_converter`, `aether_export`,
 > indefinitely and every other surface is unchanged. v1.0 was the initial
 > contract.
 
-> **Unversioned behavior changes pending a version decision.** Three
+> **Unversioned behavior changes pending a version decision.** Four
 > `aether_converter` behaviors changed after v1.1 was written, each of them a
 > correction to output that was previously wrong rather than a new surface.
 > They are *not* additive and are recorded inline where they apply; the version
@@ -27,6 +27,12 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    tiles now fails instead of exiting 0 (§1.2).
 > 3. **`ingest` exit code** — a mixed-zoom or unreadable `buildings_pbf_dir`
 >    now fails instead of warning and continuing (§9a).
+> 4. **`.abt` payload bytes** change for nearly every input: terrain is now
+>    **area-averaged** over each output pixel's footprint instead of taking one
+>    source sample per pixel (§6). This is the largest of the four — it moves
+>    pixel values for any source finer than the target grid, which is the normal
+>    case — and it deliberately voids any "pixel-identical" expectation a
+>    consumer held.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -695,6 +701,47 @@ but a bathymetric source below -2500 m would be discarded.
 > The `download` path has a different no-data convention on its *input* side: a
 > Terrarium tile pixel decoding below **-11000 m** is a void and is backfilled
 > from a coarser parent tile. That is an input rule and never reaches `.abt`.
+
+**Resampling — how a source elevation becomes a pixel.** Both converter paths
+**area-average**. An output pixel is the mean of every source sample whose
+*centre* falls inside the ground footprint that pixel stands for, accumulated in
+a wider type (`i32`/`i64` half-metres for `ingest`, `f32` metres for `download`)
+and rounded once at the end. Two rules qualify it:
+
+* **No-data is excluded from the mean, never averaged into it.** A footprint
+  that mixes ground and no-data averages only the ground; a footprint that holds
+  nothing but no-data stays no-data (`ingest` falls through to its next source
+  and ultimately writes `-9999`; `download` passes the void through).
+* **A source at or coarser than the target is not interpolated.** The footprint
+  then holds no source-sample centre at all, and the pixel takes the single
+  source sample it sits inside — the same sample the previous point sampler took.
+  Nothing is invented between source samples, at any ratio.
+
+> **Correction (changes `.abt` payload bytes for most inputs).** Until this
+> change both paths took **one** source sample per output pixel and discarded
+> the rest of the footprint — `ingest.rs` with a truncating index, `download.rs`
+> with a rounded column/row lookup. At swissALTI3D's 0.5 m onto a 30 m grid that
+> keeps 1 sample in 3600. The discarded relief does not disappear: it aliases
+> into pixel-to-pixel jitter, which the engine's LOS test renders as
+> checkerboard speckle. **`.abt` payload bytes therefore change for every input
+> whose source is finer than the target**, which is most of them; the 44-byte
+> header, the stride rule and the no-data sentinel are untouched.
+>
+> Two narrower consequences are worth stating separately:
+> * `download` also had its source lookup half a sample too far east and south
+>   (it rounded a grid *coordinate* to an index, but the assembly grid's sample
+>   `i` covers `[i, i+1)`). That is corrected here, so `download` tiles move by
+>   up to half a source sample as well as being averaged.
+> * `ingest` at a ratio of exactly 1 (a base DEM warped onto the analysis grid)
+>   used to pick between two adjacent source pixels depending on which side of
+>   the integer the floating-point column landed on — a per-column coin flip on
+>   arithmetic noise. It now resolves that consistently, which changes those
+>   pixels by one source sample.
+>
+> Any consumer that pinned expected `.abt` bytes — including the "pixel-identical
+> output" claim made for the earlier E1 building/ingest work — must re-baseline.
+> The fixtures in `fixtures/formats/` are **unaffected**: `tiny_16x16.abt` is
+> synthesized by `tools/make_fixtures.py`, not produced by the converter.
 
 **Row stride details.**
 * `row_stride` is a stored `u16`, so it caps the maximum tile width at
