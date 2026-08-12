@@ -125,16 +125,43 @@ def validate_ingest(obj, ctx):
         check(isinstance(j, dict), f"{c}: must be object")
         if not isinstance(j, dict):
             continue
-        for k in ("output_path", "ul_lat", "ul_lon", "resolution_m", "size_px", "swiss_tifs"):
+        for k in ("output_path", "ul_lat", "ul_lon", "resolution_m", "size_px"):
             _req(j, k, c)
         check(isinstance(j.get("output_path"), str), f"{c}.output_path: string")
         check(_is_num(j.get("ul_lat")), f"{c}.ul_lat: number")
         check(_is_num(j.get("ul_lon")), f"{c}.ul_lon: number")
         check(_is_num(j.get("resolution_m")) and j.get("resolution_m", 0) > 0, f"{c}.resolution_m: positive number")
         check(isinstance(j.get("size_px"), int) and not isinstance(j.get("size_px"), bool), f"{c}.size_px: integer")
-        check(isinstance(j.get("swiss_tifs"), list), f"{c}.swiss_tifs: array (may be empty)")
         if "format" in j and j["format"] is not None:
             _enum(j, "format", {"r16sint", "bc6h"}, c)
+
+        # Contract v2.0: terrain inputs are sources[]; base_tif/swiss_tifs are
+        # deprecated aliases and combining the two surfaces is a hard error.
+        sources = j.get("sources")
+        has_legacy = bool(j.get("base_tif")) or bool(j.get("swiss_tifs"))
+        if sources:
+            check(isinstance(sources, list), f"{c}.sources: array")
+            check(not has_legacy,
+                  f"{c}: sources[] must not be combined with deprecated base_tif/swiss_tifs")
+            if isinstance(sources, list):
+                for si, s in enumerate(sources):
+                    sc = f"{c}.sources[{si}]"
+                    check(isinstance(s, dict), f"{sc}: must be object")
+                    if not isinstance(s, dict):
+                        continue
+                    check(isinstance(s.get("path"), str), f"{sc}.path: required string")
+                    if s.get("crs") is not None:
+                        crs = s["crs"]
+                        check(isinstance(crs, str) and (crs.upper().startswith("EPSG:") or crs.startswith("+")),
+                              f"{sc}.crs: 'EPSG:nnnn' or a proj string starting with '+', got {crs!r}")
+                    if s.get("nodata") is not None:
+                        check(_is_num(s["nodata"]), f"{sc}.nodata: number")
+        else:
+            # Legacy form: swiss_tifs must at least be an array when present.
+            if "swiss_tifs" in j:
+                check(isinstance(j.get("swiss_tifs"), list), f"{c}.swiss_tifs: array (may be empty)")
+        if j.get("void_fill_m") is not None:
+            check(_is_num(j["void_fill_m"]), f"{c}.void_fill_m: number")
 
 
 def validate_download(obj, ctx):
@@ -374,6 +401,7 @@ def main():
         "batch_p2p.json": validate_job,
         "path.json": validate_job,
         "ingest_job.json": validate_ingest,
+        "ingest_job_legacy.json": validate_ingest,
         "download_job.json": validate_download,
     }
     for name, fn in job_files.items():

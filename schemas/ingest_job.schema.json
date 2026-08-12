@@ -2,16 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://waveshed.io/schemas/aether/ingest_job.schema.json",
   "title": "aether_converter ingest job",
-  "description": "Job consumed by `aether_converter ingest --job-file <json>`. The file may be a single job object OR a JSON array of job objects (batch). Authoritative source: crates/aether_converter/src/ingest.rs (IngestJob).",
+  "description": "Job consumed by `aether_converter ingest --job-file <json>`. The file may be a single job object OR a JSON array of job objects (batch). Authoritative source: crates/aether_converter/src/ingest.rs (IngestJob). Contract v2.0: terrain inputs are the `sources` array; `base_tif`/`swiss_tifs` are deprecated aliases.",
   "oneOf": [
     { "$ref": "#/$defs/ingestJob" },
     { "type": "array", "items": { "$ref": "#/$defs/ingestJob" } }
   ],
   "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "description": "GeoTIFF to sample. Must carry a geotransform (ModelTransformation, or ModelTiepoint+ModelPixelScale); a file without one is a hard error — georeferencing is never derived from file names." },
+        "crs": { "type": ["string", "null"], "description": "\"EPSG:nnnn\" or a proj string starting with '+'. Optional: when absent the converter reads the file's GeoKeyDirectory (ProjectedCSTypeGeoKey 3072, else GeographicTypeGeoKey 2048); an absent or user-defined (32767) key is a hard error naming the file. Geographic CRSs are sampled directly as lon/lat degrees; projected CRSs are sampled through a WGS84->source transform." },
+        "nodata": { "type": ["number", "null"], "description": "No-data value in source units. Optional: when absent the file's GDAL_NODATA ascii tag applies (if present). Matching samples become the -9999 void sentinel at load time." }
+      }
+    },
     "ingestJob": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["output_path", "ul_lat", "ul_lon", "resolution_m", "size_px", "swiss_tifs"],
+      "required": ["output_path", "ul_lat", "ul_lon", "resolution_m", "size_px"],
       "properties": {
         "output_path": { "type": "string", "description": "Destination .abt file path." },
         "format": { "type": ["string", "null"], "enum": ["r16sint", "bc6h", null], "description": "Tile payload format; defaults to r16sint behavior when absent." },
@@ -19,11 +29,17 @@
         "ul_lon": { "type": "number", "description": "Upper-left longitude (east-positive)." },
         "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel. Sources finer than this are area-averaged over each output pixel's footprint (no-data excluded from the mean); a source at or coarser than this is taken as-is, never interpolated. See CONTRACT.md section 6." },
         "size_px": { "type": "integer", "minimum": 1, "description": "Output tile side in pixels (u32)." },
-        "base_tif": { "type": ["string", "null"], "description": "Base DEM GeoTIFF to sample, where no swiss_tifs cover the pixel. Area-averaged like every other source." },
+        "sources": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/source" },
+          "description": "Prioritised terrain inputs: array order is priority, first source with a valid sample wins per pixel. Mutually exclusive with the deprecated base_tif/swiss_tifs — supplying both is a hard error."
+        },
+        "void_fill_m": { "type": ["number", "null"], "description": "Optional. A pixel no source covers is written as round(void_fill_m * 2) half-metres (saturating i16) instead of the -9999 void sentinel. Buildings rasterize after, unchanged. Absent keeps the sentinel." },
+        "base_tif": { "type": ["string", "null"], "description": "DEPRECATED (contract v2.0): alias for a trailing sources[] entry with crs \"EPSG:4326\". Accepted for older callers; slated for removal in the next major version. Do not combine with sources." },
         "swiss_tifs": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Higher-resolution swissALTI GeoTIFFs to overlay. REQUIRED field; may be an empty array."
+          "description": "DEPRECATED (contract v2.0): alias for leading sources[] entries with crs \"EPSG:2056\" (in order). Accepted for older callers; slated for removal in the next major version. Do not combine with sources. No longer required."
         },
         "buildings_file": { "type": ["string", "null"], "description": "FlatGeobuf building footprints to burn in. Roof height is read from geometry Z only; attribute heights are ignored." },
         "buildings_pbf_dir": { "type": ["string", "null"], "description": "Directory of {z}_{x}_{y}.pbf vector tiles (gzip or plain) to burn in. Height ladder: render_height, then building:levels x 3, then a 6 m default, read as above-ground. All tiles must share one zoom level." }

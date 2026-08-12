@@ -11,6 +11,8 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 use anyhow::{Context, Result};
+use proj4rs::Proj;
+use proj4rs::transform::transform;
 use flatgeobuf::{FgbReader, GeometryType};
 use crate::buildings::{
     load_pbf_building_dir, rasterize_buildings, Building, BuildingHeight, HeightSource, I16Grid,
@@ -20,6 +22,23 @@ use fallible_streaming_iterator::FallibleStreamingIterator;
 #[cfg(feature = "bc6h")]
 use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
 
+/// One terrain input of an ingest job.
+///
+/// `sources` is ordered by priority: for every output pixel the first source
+/// with real ground under it wins. `crs` is either `"EPSG:nnnn"` or a raw proj
+/// string starting with `+`; when absent the GeoTIFF's GeoKeyDirectory must
+/// carry a usable EPSG code, else the job fails naming this file. `nodata`
+/// overrides the file's `GDAL_NODATA` tag; matching samples become the void
+/// sentinel at load time.
+#[derive(Deserialize, Debug, Clone)]
+pub struct SourceSpec {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub crs: Option<String>,
+    #[serde(default)]
+    pub nodata: Option<f64>,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct IngestJob {
     pub output_path: PathBuf,
@@ -28,7 +47,22 @@ pub struct IngestJob {
     pub ul_lon: f64,
     pub resolution_m: f64,
     pub size_px: u32,
+    /// Prioritised terrain inputs (first-valid-wins per pixel). The modern
+    /// surface; mutually exclusive with the deprecated `base_tif`/`swiss_tifs`.
+    #[serde(default)]
+    pub sources: Vec<SourceSpec>,
+    /// If set, a pixel no source covers is written as `round(void_fill_m * 2)`
+    /// half-metres (saturating) instead of the `-9999` void sentinel.
+    #[serde(default)]
+    pub void_fill_m: Option<f64>,
+    /// DEPRECATED alias: normalized to a trailing `sources` entry with
+    /// `crs = "EPSG:4326"`. Slated for removal in the next major version.
+    #[serde(default)]
     pub base_tif: Option<PathBuf>,
+    /// DEPRECATED alias: normalized to leading `sources` entries with
+    /// `crs = "EPSG:2056"` (in order). Slated for removal in the next major
+    /// version.
+    #[serde(default)]
     pub swiss_tifs: Vec<PathBuf>,
     pub buildings_file: Option<PathBuf>,
     /// Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf`
@@ -39,6 +73,88 @@ pub struct IngestJob {
     /// rasterizer resolves against the terrain under each footprint.
     #[serde(default)]
     pub buildings_pbf_dir: Option<PathBuf>,
+}
+
+impl IngestJob {
+    /// The job's terrain inputs in priority order, with the deprecated
+    /// `base_tif`/`swiss_tifs` aliases normalized into `sources` form.
+    ///
+    /// Legacy shim: each `swiss_tifs` entry becomes a source with
+    /// `crs = "EPSG:2056"` (in order), then `base_tif` is appended with
+    /// `crs = "EPSG:4326"` — which preserves the old per-pixel priority
+    /// (the high-resolution stack first, the base DEM as fallback). After
+    /// this call there is exactly ONE code path.
+    pub fn effective_sources(&self) -> Result<Vec<SourceSpec>> {
+        let has_legacy = self.base_tif.is_some() || !self.swiss_tifs.is_empty();
+        if !self.sources.is_empty() && has_legacy {
+            anyhow::bail!(
+                "ingest job for {:?}: 'sources' cannot be combined with the deprecated \
+                 'base_tif'/'swiss_tifs' fields — the priority order would be ambiguous. \
+                 Move every input into 'sources' (array order = priority) and delete the \
+                 legacy fields.",
+                self.output_path
+            );
+        }
+        if !self.sources.is_empty() {
+            return Ok(self.sources.clone());
+        }
+        let mut out = Vec::with_capacity(self.swiss_tifs.len() + 1);
+        for p in &self.swiss_tifs {
+            out.push(SourceSpec { path: p.clone(), crs: Some("EPSG:2056".into()), nodata: None });
+        }
+        if let Some(base) = &self.base_tif {
+            out.push(SourceSpec { path: base.clone(), crs: Some("EPSG:4326".into()), nodata: None });
+        }
+        Ok(out)
+    }
+}
+
+/// Key under which a loaded source is cached.
+///
+/// The decoded pixels depend on the *explicit* per-source `nodata` override
+/// (it is applied at load time), so the same file requested with two different
+/// overrides must occupy two cache slots. The override's f64 bit pattern keeps
+/// the key hashable.
+pub type CacheKey = (PathBuf, Option<u64>);
+
+/// Shared cache of loaded sources, keyed by [`CacheKey`].
+pub type ImageCache = Arc<std::sync::Mutex<HashMap<CacheKey, Arc<LoadedImage>>>>;
+
+/// The [`CacheKey`] for one source spec.
+pub fn cache_key(spec: &SourceSpec) -> CacheKey {
+    (spec.path.clone(), spec.nodata.map(f64::to_bits))
+}
+
+/// Per-path in-flight load guard, process-global.
+///
+/// The cache check and the (slow) TIFF decode cannot share one lock, so
+/// without this a source used by many parallel tiles — but below the batch
+/// preloader's 100 MB threshold — would be decoded by every rayon thread at
+/// once, holding N transient copies in RAM (the pre-sources[] code preloaded
+/// every shared `base_tif` unconditionally, so legacy callers relied on that
+/// protection). Only one thread decodes a given path; the others wait on the
+/// condvar and re-check the cache. Pure `std::sync`, so the wasm/non-native
+/// build compiles unchanged — and being single-threaded it never waits.
+static INFLIGHT: std::sync::OnceLock<(std::sync::Mutex<std::collections::HashSet<PathBuf>>, std::sync::Condvar)> =
+    std::sync::OnceLock::new();
+
+fn inflight() -> &'static (std::sync::Mutex<std::collections::HashSet<PathBuf>>, std::sync::Condvar) {
+    INFLIGHT.get_or_init(|| (std::sync::Mutex::new(std::collections::HashSet::new()), std::sync::Condvar::new()))
+}
+
+/// Removes the path from the in-flight set and wakes waiters on drop, so the
+/// mark is released on success, error, and panic alike (a leaked mark would
+/// hang every waiter forever).
+struct InflightMark {
+    path: PathBuf,
+}
+
+impl Drop for InflightMark {
+    fn drop(&mut self) {
+        let (set, cv) = inflight();
+        set.lock().unwrap().remove(&self.path);
+        cv.notify_all();
+    }
 }
 
 /// The value written for a pixel with no terrain under it.
@@ -95,6 +211,10 @@ pub struct LoadedImage {
     pub limit_n: f64,
     pub scale: f64,
     pub name: String,
+    /// CRS read from the file's GeoKeyDirectory as `"EPSG:nnnn"`, if the file
+    /// carries a usable (non-user-defined) code. A per-source explicit `crs`
+    /// always wins over this.
+    pub embedded_crs: Option<String>,
 }
 
 /// Nudge that decides a source-pixel centre landing exactly on a cell edge.
@@ -214,33 +334,105 @@ fn mean_valid(data: &[i16], w: usize, a: usize, b: usize, y0: usize, y1: usize) 
     }
 }
 
-#[inline(always)]
-fn wgs84_to_lv95_fast(lat: f64, lon: f64) -> (f64, f64) {
-    let phi = (lat * 3600.0 - 169028.66) / 10000.0;
-    let lam = (lon * 3600.0 - 26782.5) / 10000.0;
-    let e = 2600072.37 + 211455.93 * lam - 10938.51 * lam * phi - 0.36 * lam * phi * phi - 44.54 * lam * lam * lam;
-    let n = 1200147.07 + 308807.95 * phi + 3745.25 * lam * lam + 76.63 * phi * phi - 194.56 * lam * lam * phi + 119.79 * phi * phi * phi;
-    (e, n)
-}
-
-fn parse_swiss_filename(p: &Path) -> Option<(f64, f64)> {
-    let name = p.file_name()?.to_string_lossy();
-    let parts: Vec<&str> = name.split('_').collect();
-    for part in parts {
-        if part.contains('-') {
-            let coords: Vec<&str> = part.split('-').collect();
-            if coords.len() == 2 {
-                if let (Ok(e_km), Ok(n_km)) = (coords[0].parse::<f64>(), coords[1].parse::<f64>()) {
-                    return Some((e_km * 1000.0, n_km * 1000.0));
-                }
-            }
+/// EPSG code out of a raw GeoKeyDirectory (tag 34735) array, as `"EPSG:nnnn"`.
+///
+/// ProjectedCSTypeGeoKey (3072) is consulted first; only when it is absent is
+/// GeographicTypeGeoKey (2048) consulted. A *present but user-defined* (32767)
+/// projected key does NOT fall back to the geographic key: the pixels are in
+/// an unknown projection, and sampling them as the underlying geographic CRS
+/// would be silently wrong. `None` means "no usable code" and the caller must
+/// error unless the source carries an explicit `crs`.
+fn epsg_from_geokeys(dir: &[u16]) -> Option<String> {
+    // Header: KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys;
+    // then 4-u16 entries (KeyID, TIFFTagLocation, Count, ValueOffset). A key
+    // whose TIFFTagLocation != 0 stores its value in another tag — never the
+    // case for these two SHORT-valued keys, so such entries are unusable here.
+    if dir.len() < 4 {
+        return None;
+    }
+    let n_keys = dir[3] as usize;
+    let mut projected = None;
+    let mut geographic = None;
+    for i in 0..n_keys {
+        let off = 4 + i * 4;
+        if off + 4 > dir.len() {
+            break;
+        }
+        let (key_id, location, value) = (dir[off], dir[off + 1], dir[off + 3]);
+        if location != 0 {
+            continue;
+        }
+        match key_id {
+            3072 => projected = Some(value),
+            2048 => geographic = Some(value),
+            _ => {}
         }
     }
-    None
+    let usable = |v: u16| v != 0 && v != 32767;
+    match projected {
+        Some(v) if usable(v) => Some(format!("EPSG:{v}")),
+        Some(_) => None, // user-defined projection: explicit `crs` required
+        None => geographic.filter(|&v| usable(v)).map(|v| format!("EPSG:{v}")),
+    }
 }
 
-// FIX: Made public so main.rs can access it for sequential pre-loading
-pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
+/// Resolve a `crs` string (`"EPSG:nnnn"` or a raw `+proj=…` string) to a proj
+/// string. Hard errors name the source file and how to fix the job.
+fn crs_to_proj_string(crs: &str, path: &Path) -> Result<String> {
+    let s = crs.trim();
+    if s.starts_with('+') {
+        return Ok(s.to_string());
+    }
+    if let Some(code_str) = s.get(..5).filter(|p| p.eq_ignore_ascii_case("EPSG:")).map(|_| &s[5..]) {
+        let code: u16 = code_str.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "source {:?}: crs {:?} is not a valid EPSG code; use \"EPSG:nnnn\" \
+                 or a proj string starting with '+'",
+                path, s
+            )
+        })?;
+        return match crs_definitions::from_code(code) {
+            Some(def) => Ok(def.proj4.to_string()),
+            None => anyhow::bail!(
+                "source {:?}: unknown EPSG code {} (not in the built-in registry); \
+                 supply the projection as a proj string in \"crs\" instead, e.g. \
+                 \"+proj=… +ellps=… +units=m\"",
+                path, code
+            ),
+        };
+    }
+    anyhow::bail!(
+        "source {:?}: crs {:?} is neither \"EPSG:nnnn\" nor a proj string starting \
+         with '+'; fix the \"crs\" field of this source",
+        path, s
+    )
+}
+
+/// How one resolved source is sampled.
+enum SourceKind {
+    /// Geographic CRS: pixel coordinates are lon/lat degrees and are sampled
+    /// directly against the output's WGS84 grid — the historical `base_tif`
+    /// path, kept byte-identical. Decision: *any* geographic CRS is treated as
+    /// WGS84 degrees (datum shifts are metres — far below a DEM pixel).
+    Geographic,
+    /// Projected CRS: WGS84 -> source via proj4rs, by index into the job's
+    /// projection group table (sources sharing a CRS share row transforms).
+    Projected(usize),
+}
+
+struct ProjGroup {
+    proj: Arc<Proj>,
+    /// Finest source pixel size (metres) among the group's members — the unit
+    /// of the row-linearity check.
+    min_scale: f64,
+}
+
+// FIX: Made public so main.rs can access it for sequential pre-loading.
+//
+// `nodata_override` is the source's explicit `nodata` field; it wins over the
+// file's GDAL_NODATA tag. Matching samples become VOID_ELEV *here*, at load
+// time, which keeps the samplers' `> -5000` validity test unchanged.
+pub fn load_tiff_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<Arc<LoadedImage>> {
     let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
     let reader = BufReader::with_capacity(1024 * 1024, file);
     // The default tiff decode-buffer cap (~256 MB) rejects large rasters with
@@ -259,16 +451,61 @@ pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
     } else if tiepoints.len() >= 6 && pixel_scales.len() >= 2 {
         (tiepoints[3], tiepoints[4], pixel_scales[0])
     } else {
-        let (e, n) = parse_swiss_filename(path).unwrap_or((0.0, 0.0));
-        let est_scale = if w > 0 { 1000.0 / w as f64 } else { 0.5 };
-        (e, n + 1000.0, est_scale)
+        // Filename-derived georeferencing is gone for good: a wrong guess
+        // placed terrain kilometres off and the run still "succeeded".
+        anyhow::bail!(
+            "source {:?}: no geotransform — the file carries neither a \
+             ModelTransformation tag nor a ModelTiepoint+ModelPixelScale pair, \
+             so it is not georeferenced. Re-export it as a GeoTIFF with a \
+             geotransform (e.g. `gdal_translate`); georeferencing is never \
+             derived from file names.",
+            path
+        );
     };
+
+    let embedded_crs = decoder
+        .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
+        .ok()
+        .and_then(|dir| epsg_from_geokeys(&dir));
+
+    // Per-source nodata: the explicit job field wins; else the GDAL_NODATA
+    // ascii tag (trimmed, NUL-stripped; "nan"/"NaN" parse to f64 NaN and the
+    // existing non-finite->void rule already covers that case).
+    let nodata: Option<f64> = nodata_override.or_else(|| {
+        decoder
+            .get_tag_ascii_string(Tag::GdalNodata)
+            .ok()
+            .and_then(|s| s.trim_matches(['\0', ' ', '\t', '\r', '\n']).parse::<f64>().ok())
+    });
 
     let result = decoder.read_image()?;
     let data: Vec<i16> = match result {
-        DecodingResult::F32(v) => v.iter().map(|&x| f32_sample_to_half_metres(x)).collect(),
-        DecodingResult::I16(v) => v.iter().map(|&x| x.saturating_mul(2)).collect(),
-        DecodingResult::I32(v) => v.iter().map(|&x| i32_sample_to_half_metres(x)).collect(),
+        DecodingResult::F32(v) => match nodata {
+            // Compare in the source unit, before scaling. The f32 comparison
+            // uses the round-tripped f64->f32 value so a tag like
+            // "-3.402823466e+38" matches the stored Float32 exactly.
+            Some(nd) => {
+                let nd32 = nd as f32;
+                v.iter()
+                    .map(|&x| if x == nd32 { VOID_ELEV } else { f32_sample_to_half_metres(x) })
+                    .collect()
+            }
+            None => v.iter().map(|&x| f32_sample_to_half_metres(x)).collect(),
+        },
+        DecodingResult::I16(v) => match nodata {
+            Some(nd) => v
+                .iter()
+                .map(|&x| if f64::from(x) == nd { VOID_ELEV } else { x.saturating_mul(2) })
+                .collect(),
+            None => v.iter().map(|&x| x.saturating_mul(2)).collect(),
+        },
+        DecodingResult::I32(v) => match nodata {
+            Some(nd) => v
+                .iter()
+                .map(|&x| if f64::from(x) == nd { VOID_ELEV } else { i32_sample_to_half_metres(x) })
+                .collect(),
+            None => v.iter().map(|&x| i32_sample_to_half_metres(x)).collect(),
+        },
         _ => return Err(anyhow::anyhow!("Unsupported TIF format")),
     };
 
@@ -280,7 +517,151 @@ pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
         origin_e, origin_n, limit_e, limit_n,
         scale,
         name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        embedded_crs,
     }))
+}
+
+/// One linear segment of a row's WGS84 -> source-CRS geometry: over the pixels
+/// it covers, `coord = c0 + step * local_x`.
+struct Seg {
+    e0: f64,
+    n0: f64,
+    nlo0: f64,
+    step_e: f64,
+    step_n: f64,
+    step_nlo: f64,
+}
+
+/// Piecewise-linear source-CRS coordinates of one output row.
+///
+/// Either a single segment spanning the whole row (when the row-midpoint
+/// check passes) or 64-px segments with per-chunk endpoint transforms —
+/// O(size/64) transforms per row either way, never per-pixel. In practice a
+/// conformal projection's midpoint deviation (~1.2 m over a 0.1° row for
+/// EPSG:2056, growing quadratically with row width) exceeds the sub-pixel
+/// tolerance, so projected sources take the chunked path — strictly *more*
+/// accurate than the retired polynomial's whole-row lerp. Geographic sources
+/// never reach this machinery at all. Pixel `x` maps to segment `x >> shift`
+/// and local offset `x & mask`, so the hot loop stays branch- and
+/// division-free.
+struct RowGeom {
+    segs: Vec<Seg>,
+    shift: u32,
+    mask: usize,
+    /// Top-edge coordinate bounds, for the per-row source-overlap filter.
+    min_e: f64,
+    max_e: f64,
+    min_n: f64,
+    max_n: f64,
+}
+
+const CHUNK_SHIFT: u32 = 6; // 64-px row chunks on the chunked path
+/// A row's midpoint may deviate from the endpoint lerp by at most this many
+/// source pixels before the row is chunked. Measured, real projections
+/// (EPSG:2056, UTM) exceed this at practical tile widths and take the chunked
+/// path; the single-segment path serves quasi-linear cases (tiny tiles, very
+/// coarse sources).
+const ROW_LERP_TOLERANCE_PX: f64 = 0.25;
+
+/// WGS84 (degrees) -> `dst` (east, north). `None` when the point is outside
+/// the projection's domain.
+#[inline]
+fn fwd(wgs84: &Proj, dst: &Proj, lat: f64, lon: f64) -> Option<(f64, f64)> {
+    let mut pt = (lon.to_radians(), lat.to_radians(), 0.0);
+    transform(wgs84, dst, &mut pt).ok()?;
+    Some((pt.0, pt.1))
+}
+
+/// Build one output row's [`RowGeom`] for one projected CRS.
+///
+/// `lat_hi` is the row's sample latitude (the cell's north edge lerp uses it,
+/// exactly as the old code did) and `lat_lo` is one output row further south.
+/// Returns `None` when any needed point fails to transform: the row is then
+/// outside the projection's domain, where no source in this CRS can have
+/// pixels, so the row simply has no candidates from this group. (Decision:
+/// this is a coverage question, not an error — the job's other sources and
+/// `void_fill_m` decide what such pixels become.)
+fn make_row_geom(
+    wgs84: &Proj,
+    dst: &Proj,
+    lat_hi: f64,
+    lat_lo: f64,
+    ul_lon: f64,
+    pixel_deg: f64,
+    out_size: usize,
+    min_scale: f64,
+) -> Option<RowGeom> {
+    let lon_end = ul_lon + out_size as f64 * pixel_deg;
+    let (e_start, n_start) = fwd(wgs84, dst, lat_hi, ul_lon)?;
+    let (e_end, n_end) = fwd(wgs84, dst, lat_hi, lon_end)?;
+    let (_, n_lo_start) = fwd(wgs84, dst, lat_lo, ul_lon)?;
+    let (_, n_lo_end) = fwd(wgs84, dst, lat_lo, lon_end)?;
+
+    let inv_size = 1.0 / out_size as f64;
+    let step_e = (e_end - e_start) * inv_size;
+    let step_n = (n_end - n_start) * inv_size;
+    let step_nlo = (n_lo_end - n_lo_start) * inv_size;
+
+    // Row-midpoint linearity check: if the true midpoint sits within a
+    // fraction of a source pixel of the endpoint lerp, one segment serves the
+    // whole row.
+    let mid_lon = ul_lon + (out_size as f64 * 0.5) * pixel_deg;
+    let (e_mid, n_mid) = fwd(wgs84, dst, lat_hi, mid_lon)?;
+    let lerp_e = (e_start + e_end) * 0.5;
+    let lerp_n = (n_start + n_end) * 0.5;
+    let dev = ((e_mid - lerp_e).powi(2) + (n_mid - lerp_n).powi(2)).sqrt();
+
+    if dev < ROW_LERP_TOLERANCE_PX * min_scale {
+        return Some(RowGeom {
+            segs: vec![Seg { e0: e_start, n0: n_start, nlo0: n_lo_start, step_e, step_n, step_nlo }],
+            // One segment for every x: x >> (BITS-1) == 0 for any valid index,
+            // and x & usize::MAX == x. (A hardcoded 63 would be a >=-width
+            // shift on a 32-bit usize — wasm — and panic in debug builds.)
+            shift: usize::BITS - 1,
+            mask: usize::MAX,
+            min_e: e_start.min(e_end),
+            max_e: e_start.max(e_end),
+            min_n: n_start.min(n_end),
+            max_n: n_start.max(n_end),
+        });
+    }
+
+    // Slow path: 64-px chunks, endpoints transformed per chunk boundary.
+    let chunk = 1usize << CHUNK_SHIFT;
+    let n_segs = out_size.div_ceil(chunk);
+    let mut boundaries = Vec::with_capacity(n_segs + 1);
+    for i in 0..=n_segs {
+        let x = (i * chunk).min(out_size);
+        let lon = ul_lon + x as f64 * pixel_deg;
+        let (e, n) = fwd(wgs84, dst, lat_hi, lon)?;
+        let (_, n_lo) = fwd(wgs84, dst, lat_lo, lon)?;
+        boundaries.push((x, e, n, n_lo));
+    }
+    let (mut min_e, mut max_e) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_n, mut max_n) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(_, e, n, _) in &boundaries {
+        min_e = min_e.min(e);
+        max_e = max_e.max(e);
+        min_n = min_n.min(n);
+        max_n = max_n.max(n);
+    }
+    let segs = boundaries
+        .windows(2)
+        .map(|w| {
+            let (x0, e0, n0, nlo0) = w[0];
+            let (x1, e1, n1, nlo1) = w[1];
+            let inv = 1.0 / (x1 - x0) as f64;
+            Seg {
+                e0,
+                n0,
+                nlo0,
+                step_e: (e1 - e0) * inv,
+                step_n: (n1 - n0) * inv,
+                step_nlo: (nlo1 - nlo0) * inv,
+            }
+        })
+        .collect();
+    Some(RowGeom { segs, shift: CHUNK_SHIFT, mask: chunk - 1, min_e, max_e, min_n, max_n })
 }
 
 /// Convert one tile, decoding this job's `buildings_pbf_dir` (if any) for it.
@@ -289,10 +670,7 @@ pub fn load_tiff_to_ram(path: &Path) -> Result<Arc<LoadedImage>> {
 /// a whole-directory scan whose result is the same for every output tile, so
 /// doing it here runs it once per `.abt`. Batch callers load the set once with
 /// [`load_pbf_building_dir`] and call [`process_tile`].
-pub fn process_tile_with_cache(
-    job: IngestJob,
-    cache_arc: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>
-) -> Result<()> {
+pub fn process_tile_with_cache(job: IngestJob, cache_arc: ImageCache) -> Result<()> {
     let pbf_buildings = match &job.buildings_pbf_dir {
         Some(dir) => Some(load_pbf_building_dir(dir)?),
         None => None,
@@ -307,60 +685,94 @@ pub fn process_tile_with_cache(
 /// refused rather than quietly producing a building-less tile.
 pub fn process_tile(
     job: IngestJob,
-    cache_arc: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<LoadedImage>>>>,
+    cache_arc: ImageCache,
     pbf_buildings: Option<&PbfBuildingSet>,
 ) -> Result<()> {
+    // 0. Normalize the legacy aliases into sources[] — ONE code path from here.
+    let sources = job.effective_sources()?;
 
-    // 1. Identify missing files inside a lock
-    let mut missing = Vec::new();
-    {
-        let cache = cache_arc.lock().unwrap();
-        for p in &job.swiss_tifs {
-            if !cache.contains_key(p) { missing.push(p.clone()); }
-        }
-        if let Some(base_path) = &job.base_tif {
-            if !cache.contains_key(base_path) { missing.push(base_path.clone()); }
-        }
-    }
-
-    // 2. Load missing files sequentially to prevent RAM spikes (OOM fix)
-    if !missing.is_empty() {
-        let loaded: Vec<_> = missing.into_iter()
-            .map(|p| (p.clone(), load_tiff_to_ram(&p))).collect();
-
-        let mut cache = cache_arc.lock().unwrap();
-        for (p, res) in loaded {
-            match res {
-                Ok(img) => { cache.insert(p, img); },
-                Err(e) => println!("[Warn] Failed to load {:?}: {}", p, e),
+    // 1.-2. Fetch every source, loading cache misses one at a time (OOM fix)
+    // with a per-path in-flight guard: when several tiles miss on the same
+    // path at once, exactly one thread decodes it and the rest wait on the
+    // condvar, then take it from the cache — never N parallel decodes of one
+    // file. A listed source that cannot be loaded is FATAL: writing the tile
+    // without it would silently drop terrain and the run would still report
+    // success.
+    let mut images: Vec<Arc<LoadedImage>> = Vec::with_capacity(sources.len());
+    for s in &sources {
+        let key = cache_key(s);
+        let img = loop {
+            {
+                let cache = cache_arc.lock().unwrap();
+                if let Some(img) = cache.get(&key) {
+                    break img.clone();
+                }
             }
-        }
+            let (set, cv) = inflight();
+            let mut in_flight = set.lock().unwrap();
+            if in_flight.insert(s.path.clone()) {
+                // This thread owns the load. The mark is dropped (and waiters
+                // woken) whether the decode succeeds, errors, or panics.
+                drop(in_flight);
+                let _mark = InflightMark { path: s.path.clone() };
+                let img = load_tiff_to_ram(&s.path, s.nodata)
+                    .with_context(|| format!("loading source {:?}", key.0))?;
+                cache_arc.lock().unwrap().insert(key.clone(), img.clone());
+                break img;
+            }
+            // Another thread is decoding this path: wait for it to finish,
+            // then re-check the cache (a spurious wakeup just loops again).
+            let _unused = cv.wait(in_flight).unwrap();
+        };
+        images.push(img);
     }
 
-    // 3. Extract required images from cache
-    let mut swiss_images = Vec::new();
-    let mut base_image = None;
-    {
-        let cache = cache_arc.lock().unwrap();
-        for p in &job.swiss_tifs {
-            if let Some(img) = cache.get(p) { swiss_images.push(img.clone()); }
+    // Per-source Proj objects are built once per job and cached by CRS string;
+    // sources sharing a CRS share one projection group (and, later, one set of
+    // per-row transforms).
+    let wgs84 = Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs")
+        .expect("the WGS84 proj string is a constant and always parses");
+    let mut proj_cache: HashMap<String, (usize, Arc<Proj>)> = HashMap::new();
+    let mut groups: Vec<ProjGroup> = Vec::new();
+    let mut kinds: Vec<SourceKind> = Vec::with_capacity(sources.len());
+    for (spec, img) in sources.iter().zip(&images) {
+        let crs = match (&spec.crs, &img.embedded_crs) {
+            (Some(c), _) => c.clone(),
+            (None, Some(c)) => c.clone(),
+            (None, None) => anyhow::bail!(
+                "source {:?}: no CRS — the job does not set one and the file's \
+                 GeoKeyDirectory carries no usable EPSG code (absent or \
+                 user-defined/32767). Add \"crs\": \"EPSG:nnnn\" (or a proj \
+                 string starting with '+') to this source.",
+                spec.path
+            ),
+        };
+        let proj_string = crs_to_proj_string(&crs, &spec.path)?;
+        let kind = match proj_cache.get(&proj_string) {
+            Some((group_idx, _)) => SourceKind::Projected(*group_idx),
+            None => {
+                let proj = Proj::from_proj_string(&proj_string).map_err(|e| {
+                    anyhow::anyhow!(
+                        "source {:?}: crs {:?} did not parse as a projection: {e}",
+                        spec.path, crs
+                    )
+                })?;
+                if proj.is_latlong() {
+                    SourceKind::Geographic
+                } else {
+                    let group_idx = groups.len();
+                    let proj = Arc::new(proj);
+                    proj_cache.insert(proj_string, (group_idx, proj.clone()));
+                    groups.push(ProjGroup { proj, min_scale: img.scale });
+                    SourceKind::Projected(group_idx)
+                }
+            }
+        };
+        if let SourceKind::Projected(gi) = kind {
+            groups[gi].min_scale = groups[gi].min_scale.min(img.scale);
         }
-        if let Some(p) = &job.base_tif {
-            base_image = cache.get(p).cloned();
-        }
+        kinds.push(kind);
     }
-    // A base DEM that was requested but could not be loaded must be fatal:
-    // otherwise the tile is written with no terrain (flat 0) and the whole run
-    // reports success with empty coverage. (The classic cause was the source
-    // exceeding the tiff decoder limit — see the earlier [Warn].)
-    if job.base_tif.is_some() && base_image.is_none() {
-        anyhow::bail!(
-            "base DEM {:?} was specified but could not be loaded; refusing to \
-             write a terrain-less tile",
-            job.base_tif
-        );
-    }
-    let base_image_ref = base_image.as_deref();
 
     let deg_per_meter = 1.0 / 111111.0;
     let pixel_deg = job.resolution_m * deg_per_meter;
@@ -368,27 +780,59 @@ pub fn process_tile(
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
 
-    // Per-column source spans for the base DEM, computed once for the whole
-    // tile: the base is axis-aligned in degrees, so a column's footprint is the
-    // same on every row. `(0, 0)` means the column falls outside the base.
-    let base_x_spans: Vec<(u32, u32)> = match base_image_ref {
-        Some(base) => {
-            let half = 0.5 * pixel_deg / base.scale;
-            (0..out_size)
-                .map(|x| {
-                    let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
-                    if pixel_lon >= base.origin_e && pixel_lon < base.limit_e {
-                        let px_f = (pixel_lon - base.origin_e) / base.scale;
-                        if px_f >= 0.0 && (px_f as u32) < base.width {
-                            return sample_span(px_f - half, px_f + half, base.width);
-                        }
-                    }
-                    (0, 0)
-                })
-                .collect()
+    // What a pixel no source covers becomes: the void sentinel, or the job's
+    // requested fill elevation (round half away from zero, saturating i16).
+    let void_fill: i16 = match job.void_fill_m {
+        Some(m) => {
+            let half_metres = (m * 2.0).round();
+            if half_metres >= f64::from(i16::MAX) {
+                i16::MAX
+            } else if half_metres <= f64::from(i16::MIN) {
+                i16::MIN
+            } else {
+                half_metres as i16
+            }
         }
-        None => Vec::new(),
+        None => VOID_ELEV,
     };
+
+    // Per-column source spans for each *geographic* source, computed once for
+    // the whole tile: such a source is axis-aligned in degrees, so a column's
+    // footprint is the same on every row. `(0, 0)` means the column falls
+    // outside the source. (This is the historical base_tif fast path,
+    // byte-identical.)
+    let geo_x_spans: Vec<Option<Vec<(u32, u32)>>> = kinds
+        .iter()
+        .zip(&images)
+        .map(|(kind, img)| match kind {
+            SourceKind::Projected(_) => None,
+            SourceKind::Geographic => {
+                let half = 0.5 * pixel_deg / img.scale;
+                Some(
+                    (0..out_size)
+                        .map(|x| {
+                            let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
+                            if pixel_lon >= img.origin_e && pixel_lon < img.limit_e {
+                                let px_f = (pixel_lon - img.origin_e) / img.scale;
+                                if px_f >= 0.0 && (px_f as u32) < img.width {
+                                    return sample_span(px_f - half, px_f + half, img.width);
+                                }
+                            }
+                            (0, 0)
+                        })
+                        .collect(),
+                )
+            }
+        })
+        .collect();
+
+    /// One row-ready source, in job priority order.
+    enum RowSrc<'a> {
+        Geo { img: &'a LoadedImage, spans: &'a [(u32, u32)], py0: u32, py1: u32 },
+        // `inv` carries 1/scale so the per-pixel footprint maths is multiplies,
+        // not a division per pixel per candidate image.
+        Prj { img: &'a LoadedImage, inv: f64, geom_idx: usize },
+    }
 
     // Terrain Rasterization
     #[cfg(feature = "native")]
@@ -398,101 +842,126 @@ pub fn process_tile(
     iter.enumerate().for_each(|(y, row_buffer)| {
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
 
-        let mut base_row_valid = false;
-        let mut base_py = (0u32, 0u32);
-        if let Some(base) = base_image_ref {
-            if row_lat <= base.origin_n && row_lat >= base.limit_n {
-                let py_f = (base.origin_n - row_lat) / base.scale;
-                if py_f >= 0.0 {
-                    let py = py_f as u32;
-                    if py < base.height {
-                        base_row_valid = true;
-                        // The cell's own row band, hoisted: it is the same for
-                        // every pixel of this output row.
-                        let half = 0.5 * pixel_deg / base.scale;
-                        base_py = sample_span(py_f - half, py_f + half, base.height);
+        // The projected geometry of this row, one per CRS group. The south
+        // edge (`row_lat - pixel_deg`) gets its own transforms because
+        // area-averaging needs the cell's footprint, not just the corner the
+        // old point sample read, and a projected northing of a WGS84 parallel
+        // drifts along the row.
+        let row_geoms: Vec<Option<RowGeom>> = groups
+            .iter()
+            .map(|g| {
+                make_row_geom(
+                    &wgs84, &g.proj, row_lat, row_lat - pixel_deg,
+                    job.ul_lon, pixel_deg, out_size, g.min_scale,
+                )
+            })
+            .collect();
+
+        // Row candidates, in source priority order.
+        let mut row_srcs: Vec<RowSrc> = Vec::with_capacity(sources.len());
+        for ((kind, img), spans) in kinds.iter().zip(&images).zip(&geo_x_spans) {
+            match kind {
+                SourceKind::Geographic => {
+                    if row_lat <= img.origin_n && row_lat >= img.limit_n {
+                        let py_f = (img.origin_n - row_lat) / img.scale;
+                        if py_f >= 0.0 {
+                            let py = py_f as u32;
+                            if py < img.height {
+                                // The cell's own row band, hoisted: it is the
+                                // same for every pixel of this output row.
+                                let half = 0.5 * pixel_deg / img.scale;
+                                let (py0, py1) =
+                                    sample_span(py_f - half, py_f + half, img.height);
+                                row_srcs.push(RowSrc::Geo {
+                                    img,
+                                    spans: spans.as_deref().unwrap(),
+                                    py0,
+                                    py1,
+                                });
+                            }
+                        }
                     }
                 }
-            }
-        }
-
-        let (e_start, n_start) = wgs84_to_lv95_fast(row_lat, job.ul_lon);
-        let (e_end, n_end) = wgs84_to_lv95_fast(row_lat, job.ul_lon + (out_size as f64 * pixel_deg));
-        // The same two points one output row further down: the cell's south
-        // edge. Area-averaging needs the cell's footprint, not just the corner
-        // the old point sample read, and the LV95 northing of a WGS84 parallel
-        // drifts along the row, so the south edge needs its own row.
-        let (_, n_lo_start) = wgs84_to_lv95_fast(row_lat - pixel_deg, job.ul_lon);
-        let (_, n_lo_end) =
-            wgs84_to_lv95_fast(row_lat - pixel_deg, job.ul_lon + (out_size as f64 * pixel_deg));
-
-        let step_e = (e_end - e_start) / out_size as f64;
-        let step_n = (n_end - n_start) / out_size as f64;
-        let step_n_lo = (n_lo_end - n_lo_start) / out_size as f64;
-        let half_step_e = step_e * 0.5;
-
-        let row_min_n = n_start.min(n_end);
-        let row_max_n = n_start.max(n_end);
-        let row_min_e = e_start.min(e_end);
-        let row_max_e = e_start.max(e_end);
-
-        // Carries 1/scale so the per-pixel footprint maths is multiplies, not a
-        // division per pixel per candidate image.
-        let mut row_images = Vec::with_capacity(5);
-        for img in &swiss_images {
-            if img.origin_n >= row_min_n && img.limit_n <= row_max_n &&
-                img.limit_e >= row_min_e && img.origin_e <= row_max_e {
-                row_images.push((img.as_ref(), 1.0 / img.scale));
+                SourceKind::Projected(gi) => {
+                    if let Some(geom) = &row_geoms[*gi] {
+                        if img.origin_n >= geom.min_n && img.limit_n <= geom.max_n
+                            && img.limit_e >= geom.min_e && img.origin_e <= geom.max_e
+                        {
+                            row_srcs.push(RowSrc::Prj { img, inv: 1.0 / img.scale, geom_idx: *gi });
+                        }
+                    }
+                }
             }
         }
 
         for (x, out_pixel) in row_buffer.iter_mut().enumerate() {
-            let e = e_start + (step_e * x as f64);
-            let n = n_start + (step_n * x as f64);
             let mut val = VOID_ELEV;
+            // Consecutive candidates in the same CRS reuse the pixel's
+            // transformed cell footprint — one lerp per pixel per CRS, so a
+            // stack of same-CRS tiles costs what the old single-CRS loop cost.
+            let mut cached_geom = usize::MAX;
+            let mut cell = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
 
-            for &(img, inv) in &row_images {
-                // The cell this output pixel stands for, centred on the point
-                // the old code point-sampled: one output pixel wide and one
-                // output row tall. Centring it there is what keeps a source at
-                // or below the target resolution on the pixel it already used —
-                // the average is taken *around* the old sample, never offset
-                // from it. (Inside the loop so a tile with no candidate image
-                // under this row does not pay for it.)
-                let e_lo = e - half_step_e;
-                let e_hi = e + half_step_e;
-                let half_n = (n - (n_lo_start + step_n_lo * x as f64)) * 0.5;
-                let n_hi = n + half_n;
-                let n_lo = n - half_n;
-                if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
-                    let (px0, px1) =
-                        sample_span((e_lo - img.origin_e) * inv, (e_hi - img.origin_e) * inv, img.width);
-                    let (py0, py1) =
-                        sample_span((img.origin_n - n_hi) * inv, (img.origin_n - n_lo) * inv, img.height);
-                    // First image that has real ground under the cell wins, as
-                    // before. The footprint is clipped to that one image, so a
-                    // cell straddling two source tiles averages the part inside
-                    // the tile its corner landed in — still an average of real
-                    // terrain, and still better than the single pixel it took
-                    // before.
-                    if let Some(v) = sample_cell(img, px0, px1, py0, py1) {
-                        val = v;
-                        break;
+            for src in &row_srcs {
+                match src {
+                    RowSrc::Geo { img, spans, py0, py1 } => {
+                        let (px0, px1) = spans[x];
+                        if px0 < px1 {
+                            if let Some(v) = sample_cell(img, px0, px1, *py0, *py1) {
+                                val = v;
+                                break;
+                            }
+                        }
+                    }
+                    RowSrc::Prj { img, inv, geom_idx } => {
+                        if *geom_idx != cached_geom {
+                            // The cell this output pixel stands for, centred on
+                            // the point the old code point-sampled: one output
+                            // pixel wide and one output row tall. Centring it
+                            // there is what keeps a source at or below the
+                            // target resolution on the pixel it already used —
+                            // the average is taken *around* the old sample,
+                            // never offset from it.
+                            let geom = row_geoms[*geom_idx].as_ref().unwrap();
+                            let seg = &geom.segs[x >> geom.shift];
+                            let lx = (x & geom.mask) as f64;
+                            let e = seg.e0 + seg.step_e * lx;
+                            let n = seg.n0 + seg.step_n * lx;
+                            let e_lo = e - seg.step_e * 0.5;
+                            let e_hi = e + seg.step_e * 0.5;
+                            let half_n = (n - (seg.nlo0 + seg.step_nlo * lx)) * 0.5;
+                            cell = (e, n, e_lo, e_hi, n + half_n, n - half_n);
+                            cached_geom = *geom_idx;
+                        }
+                        let (e, n, e_lo, e_hi, n_hi, n_lo) = cell;
+                        if n <= img.origin_n && n >= img.limit_n
+                            && e >= img.origin_e && e < img.limit_e
+                        {
+                            let (px0, px1) = sample_span(
+                                (e_lo - img.origin_e) * inv,
+                                (e_hi - img.origin_e) * inv,
+                                img.width,
+                            );
+                            let (py0, py1) = sample_span(
+                                (img.origin_n - n_hi) * inv,
+                                (img.origin_n - n_lo) * inv,
+                                img.height,
+                            );
+                            // First source that has real ground under the cell
+                            // wins, as before. The footprint is clipped to that
+                            // one image, so a cell straddling two source tiles
+                            // averages the part inside the tile its corner
+                            // landed in — still an average of real terrain.
+                            if let Some(v) = sample_cell(img, px0, px1, py0, py1) {
+                                val = v;
+                                break;
+                            }
+                        }
                     }
                 }
             }
 
-            if val <= -5000 && base_row_valid {
-                let base = base_image_ref.unwrap();
-                let (px0, px1) = base_x_spans[x];
-                if px0 < px1 {
-                    if let Some(v) = sample_cell(base, px0, px1, base_py.0, base_py.1) {
-                        val = v;
-                    }
-                }
-            }
-
-            *out_pixel = val;
+            *out_pixel = if val == VOID_ELEV { void_fill } else { val };
         }
     });
 
@@ -908,6 +1377,7 @@ mod tests {
             limit_n: origin_n - h as f64 * scale,
             scale,
             name: "test".into(),
+            embedded_crs: None,
         }
     }
 
@@ -916,9 +1386,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("base.tif");
         job.output_path = dir.path().join("tile.abt");
+        // Exercises the deprecated base_tif shim: the shim maps it to a
+        // trailing EPSG:4326 source, whose geographic sampling path must stay
+        // byte-identical to the historical base path these tests pin.
         job.base_tif = Some(path.clone());
         let mut cache = HashMap::new();
-        cache.insert(path, Arc::new(base));
+        cache.insert((path, None), Arc::new(base));
         let out = job.output_path.clone();
         let size = job.size_px as usize;
         process_tile(job, Arc::new(std::sync::Mutex::new(cache)), None).unwrap();
@@ -1113,6 +1586,8 @@ mod tests {
             ul_lon: 8.25,
             resolution_m: 10.0,
             size_px: 8,
+            sources: Vec::new(),
+            void_fill_m: None,
             base_tif: None,
             swiss_tifs: Vec::new(),
             buildings_file: None,

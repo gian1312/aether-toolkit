@@ -1,0 +1,11 @@
+{
+  "output_path": "./data/cache_abt/tile_47_8.abt",
+  "format": "r16sint",
+  "ul_lat": 47.5,
+  "ul_lon": 8.0,
+  "resolution_m": 10.0,
+  "size_px": 2048,
+  "base_tif": "./data/raw_dem/base_47_8.tif",
+  "swiss_tifs": [],
+  "buildings_file": null
+}

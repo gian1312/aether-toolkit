@@ -1,9 +1,9 @@
 // rust/aether_converter/src/main.rs
 mod buildings;
 mod download;
-mod geo;
 mod ingest;
 mod mvt;
+mod plan;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -40,7 +40,32 @@ enum Commands {
         #[arg(short, long)]
         job_file: PathBuf,
     },
+    /// Enumerate the .abt tiles a bbox + resolution set produces, without
+    /// converting anything. Prints one JSON document (schema "aether-plan/1")
+    /// on stdout; consumers cross-check their own tile enumeration against it.
+    Plan {
+        // allow_negative_numbers: the plugin passes coordinates as separate
+        // tokens (`--west -70.3`), and clap would otherwise reject the leading
+        // dash as an unknown flag — southern/western hemispheres must work.
+        #[arg(long, allow_negative_numbers = true)]
+        south: f64,
+        #[arg(long, allow_negative_numbers = true)]
+        north: f64,
+        #[arg(long, allow_negative_numbers = true)]
+        west: f64,
+        #[arg(long, allow_negative_numbers = true)]
+        east: f64,
+        /// Comma-separated integer resolutions in metres, e.g. 30,90
+        #[arg(long, required = true, value_delimiter = ',')]
+        resolutions: Vec<u32>,
+    },
 }
+
+/// Files at or above this size are pre-loaded sequentially when shared by
+/// more than one job, so a thread-per-tile batch cannot load the same huge
+/// raster many times at once (the classic OOM). Decision: "100 MB" is read as
+/// the decimal 100,000,000 bytes — the threshold is a heuristic, not a format.
+const PRELOAD_MIN_BYTES: u64 = 100_000_000;
 
 fn main() -> anyhow::Result<()> {
     // Force line-buffered stdout so progress reaches the parent process
@@ -69,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             let content = fs::read_to_string(&job_file)?;
 
             // Wrap cache in Arc<Mutex> for safe multi-threading
-            let texture_cache = Arc::new(Mutex::new(HashMap::new()));
+            let texture_cache: ingest::ImageCache = Arc::new(Mutex::new(HashMap::new()));
 
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
                 println!("[Rust] Processing single tile: {:?}", job.output_path);
@@ -94,26 +119,45 @@ fn main() -> anyhow::Result<()> {
 
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(safe_threads).build().unwrap();
 
-                // --- OOM FIX 2: PRE-LOAD MASSIVE BASE DEMS SEQUENTIALLY ---
-                // If 16 threads try to load a 600MB Chunk TIF simultaneously, RAM explodes immediately.
-                let mut unique_bases = HashSet::new();
+                // --- OOM FIX 2: PRE-LOAD LARGE SHARED SOURCES SEQUENTIALLY ---
+                // If 16 threads try to load a 600MB source simultaneously, RAM
+                // explodes immediately. Normalizing every job up front also
+                // surfaces bad-job errors (ambiguous sources, etc.) before any
+                // tile work starts. Rule: pre-load every unique source that
+                // appears in MORE THAN ONE job and is larger than
+                // PRELOAD_MIN_BYTES on disk; small per-tile files keep the
+                // lazy per-tile cache loading.
+                let mut jobs_per_source: HashMap<ingest::CacheKey, usize> = HashMap::new();
                 for job in &jobs {
-                    if let Some(base) = &job.base_tif {
-                        unique_bases.insert(base.clone());
-                    }
-                }
-
-                if !unique_bases.is_empty() {
-                    println!("[Rust] Pre-loading {} Base DEM(s) to prevent memory races...", unique_bases.len());
-                    let mut cache = texture_cache.lock().unwrap();
-                    for base in unique_bases {
-                        if let Ok(img) = ingest::load_tiff_to_ram(&base) {
-                            cache.insert(base, img);
-                        } else {
-                            println!("[Warn] Failed to pre-load Base DEM: {:?}", base);
+                    let mut seen_in_job: HashSet<ingest::CacheKey> = HashSet::new();
+                    for spec in job.effective_sources()? {
+                        let key = ingest::cache_key(&spec);
+                        if seen_in_job.insert(key.clone()) {
+                            *jobs_per_source.entry(key).or_default() += 1;
                         }
                     }
                 }
+                let preload: HashSet<ingest::CacheKey> = jobs_per_source
+                    .into_iter()
+                    .filter(|(key, n_jobs)| {
+                        *n_jobs > 1
+                            && fs::metadata(&key.0)
+                                .map(|m| m.len() > PRELOAD_MIN_BYTES)
+                                .unwrap_or(false) // missing file: the per-tile load errors loudly
+                    })
+                    .map(|(key, _)| key)
+                    .collect();
+
+                if !preload.is_empty() {
+                    println!("[Rust] Pre-loading {} large shared source(s) to prevent memory races...", preload.len());
+                    let mut cache = texture_cache.lock().unwrap();
+                    for key in &preload {
+                        let img = ingest::load_tiff_to_ram(&key.0, key.1.map(f64::from_bits))
+                            .map_err(|e| anyhow::anyhow!("pre-loading shared source {:?}: {e}", key.0))?;
+                        cache.insert(key.clone(), img);
+                    }
+                }
+                let preload = Arc::new(preload);
 
                 // --- PBF DECODE HOIST ---
                 // A `buildings_pbf_dir` decodes to the same building set for
@@ -158,8 +202,13 @@ fn main() -> anyhow::Result<()> {
                         if curr % 5 == 0 {
                             if let Ok(mut cache) = texture_cache.try_lock() {
                                 if cache.len() > 30 {
-                                    // Retain Base DEMs (Chunk_), drop micro tiles
-                                    cache.retain(|k, _| k.file_name().unwrap_or_default().to_string_lossy().starts_with("Chunk_"));
+                                    // Retain the pre-loaded shared sources and
+                                    // legacy Chunk_ base DEMs, drop micro tiles
+                                    let keep = preload.clone();
+                                    cache.retain(|k, _| {
+                                        keep.contains(k)
+                                            || k.0.file_name().unwrap_or_default().to_string_lossy().starts_with("Chunk_")
+                                    });
                                 }
                             }
                         }
@@ -172,11 +221,55 @@ fn main() -> anyhow::Result<()> {
                 if n_failed > 0 {
                     anyhow::bail!("{} of {} tiles failed to convert", n_failed, total);
                 }
+            } else {
+                // Neither a single job nor a batch parsed. The old code fell
+                // through SILENTLY here and exited 0 having done nothing —
+                // fail loudly instead, with the parse error for the shape the
+                // file appears to be.
+                let err = if content.trim_start().starts_with('[') {
+                    serde_json::from_str::<Vec<ingest::IngestJob>>(&content).unwrap_err()
+                } else {
+                    serde_json::from_str::<ingest::IngestJob>(&content).unwrap_err()
+                };
+                anyhow::bail!(
+                    "ingest job file {:?} is not a valid job object or job array: {err}",
+                    job_file
+                );
             }
             Ok(())
         },
         Commands::Download { job_file } => {
             download::run_download(&job_file)
         },
+        Commands::Plan { south, north, west, east, resolutions } => {
+            let plan = plan::build_plan(south, north, west, east, &resolutions)?;
+            println!("{}", serde_json::to_string(&plan)?);
+            Ok(())
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_accepts_negative_coordinates_as_separate_tokens() {
+        // The plugin invokes `--west -70.3` as two argv entries; without
+        // allow_negative_numbers clap fails with "unexpected argument '-7'".
+        let cli = Cli::try_parse_from([
+            "aether_converter", "plan",
+            "--south", "-34.7", "--north", "-33.9",
+            "--west", "-70.9", "--east", "-70.3",
+            "--resolutions", "30,90",
+        ])
+        .expect("a southern/western-hemisphere bbox must parse");
+        match cli.command {
+            Commands::Plan { south, north, west, east, resolutions } => {
+                assert_eq!((south, north, west, east), (-34.7, -33.9, -70.9, -70.3));
+                assert_eq!(resolutions, vec![30, 90]);
+            }
+            _ => panic!("expected the plan subcommand"),
+        }
     }
 }

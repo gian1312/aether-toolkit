@@ -1,25 +1,22 @@
 # Aether engine contract
 
-**Status: Contract version 1.1.** This document is the canonical, versioned
+**Status: Contract version 2.0.** This document is the canonical, versioned
 description of the interface between the proprietary **`aether_core`** engine
 (which lives in the private `AETHER` repository and is *not* shipped here) and
 its consumers. It targets the current `aether_core` **0.x** engine line and the
 crates in this workspace (`aether_converter`, `aether_export`,
 `aether_aggregate`).
 
-> **Changelog — contract v1.1 (additive):** adds the **v2 node-locked license
-> key** format (§10) and the **`aether_core --fingerprint`** CLI (§1.1). Both are
-> additive under the compatibility policy below: v1 (84-byte) keys remain valid
-> indefinitely and every other surface is unchanged. v1.0 was the initial
-> contract.
-
-> **Unversioned behavior changes pending a version decision.** Four
-> `aether_converter` behaviors changed after v1.1 was written, each of them a
-> correction to output that was previously wrong rather than a new surface.
-> They are *not* additive and are recorded inline where they apply; the version
-> header above has deliberately **not** been bumped, because policy item 3 ties
-> a breaking change to a major **engine** version bump and the engine is not in
-> this repository. Decide the version before shipping these to a consumer:
+> **Changelog — contract v2.0 (breaking, `aether_converter` only).** This
+> version bundles every pending `aether_converter` change — the four
+> corrections that had been recorded here unversioned since v1.1, plus the
+> generalized ingest surface — into **one** major bump. The maintainer
+> approved bundling these as a single major version rather than shipping them
+> piecemeal. `aether_core`, `aether_export`, `aether_aggregate`, the license
+> format, and the `download` job format are unchanged from v1.1.
+>
+> Carried over from the previously-unversioned corrections (details inline
+> where they apply):
 > 1. **`.abt` bytes** change for DEM inputs that used Float32-NaN or
 >    Int32-minimum no-data — those pixels were written as 0 m (sea level) and
 >    are now the `-9999` void sentinel (§6).
@@ -33,6 +30,31 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    pixel values for any source finer than the target grid, which is the normal
 >    case — and it deliberately voids any "pixel-identical" expectation a
 >    consumer held.
+>
+> New in v2.0 proper:
+> 5. **`sources[]` ingest (§9a).** An ingest job's terrain inputs are now a
+>    prioritised `sources` array of `{path, crs?, nodata?}`; first valid
+>    sample wins per pixel. A source's CRS comes from its explicit `crs`
+>    field, else from the GeoTIFF's GeoKeyDirectory; an absent or
+>    user-defined key is a **hard error** naming the file. `GDAL_NODATA` is
+>    honored (explicit `nodata` wins). The legacy `base_tif`/`swiss_tifs`
+>    fields remain accepted as **deprecated aliases** (normalized internally
+>    to `sources`) and are slated for removal in the next major version;
+>    supplying both surfaces in one job is a hard error.
+> 6. **Filename-derived georeferencing removed (§9a).** A source GeoTIFF
+>    without a geotransform used to fall back to coordinates parsed from its
+>    file name (or to garbage); it is now a **hard error**.
+> 7. **EPSG:2056 sampling via a real projection (§9a).** The former
+>    approximate CH1903+ polynomial is replaced by proj4rs; coordinates move
+>    by **≤ 1 m**, so `.abt` pixels over such sources may shift by one source
+>    sample. Any projected CRS with an EPSG definition (or a supplied proj
+>    string) now works, not just EPSG:2056.
+> 8. **`void_fill_m` (§9a, additive).** Optional; a pixel no source covers is
+>    written as `round(void_fill_m * 2)` half-metres instead of the `-9999`
+>    sentinel.
+> 9. **`plan` subcommand (§1.2, additive).** Prints the `.abt` tile grid for
+>    a bbox + resolution set as a single JSON document (schema
+>    `aether-plan/1`) without converting anything.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -171,14 +193,35 @@ aether_core --fingerprint         # print this machine's node-lock fingerprint, 
 ```
 aether_converter ingest   --job-file <json>      # -j
 aether_converter download  --job-file <json>     # -j
+aether_converter plan --south S --north N --west W --east E --resolutions 30,90
 ```
 
-* Sub-commands: `ingest`, `download` (and a deprecated `convert` that just
-  prints a deprecation line). Each takes `--job-file <path>` (short `-j`).
+* Sub-commands: `ingest`, `download`, `plan` (and a deprecated `convert` that
+  just prints a deprecation line). `ingest`/`download` take `--job-file <path>`
+  (short `-j`).
 * stdout/stderr here use a **different, `[Rust]`/`[Download]`/`[Stats]`-prefixed
   style** — *not* the `[P:]/[S:]/[E:]/[D:]` markers of §1.1.
 * **Ingest progress** (stdout): `[Rust] Progress: <n>/<total>` (emitted every 10
   tiles and once at completion) — `println!("[Rust] Progress: {}/{}", curr, total)`.
+* **Ingest failure modes (v2.0, fail-loudly).** A job file that parses as
+  neither a single job nor a job array now **fails with the parse error**
+  (it used to exit 0 having done nothing). A listed terrain source that cannot
+  be loaded fails the tile (and thus the run) instead of warning and writing a
+  terrain-less tile. CRS/georeferencing problems are hard errors naming the
+  file and the fix (§9a).
+* **`plan` (new in v2.0, additive).** Enumerates, without downloading or
+  converting anything, exactly the `.abt` tiles an area/resolution request
+  produces: one JSON document on stdout with `schema: "aether-plan/1"`,
+  `tile_count`, `total_bytes`, and per-tile `resolution_m`, `filename`
+  (`tile_N{lat:.2}E{lon:.2}_{res}m.abt`), `ul_lat`, `ul_lon`, `size_px`,
+  `exact_res_m`, `est_bytes`. Schema: `schemas/plan_output.schema.json`.
+  The geometry reproduces the Waveshed plugin's Python tile enumeration
+  **exactly** (extent ladder, u16-stride guard, outward snap on the finest
+  sub-tile grid, 6-decimal stepping); the plugin cross-checks its own
+  enumeration against this output and aborts on mismatch. Validation is
+  strict: non-finite coordinates, `south >= north`, `west >= east`, an empty
+  or non-positive resolution list, and requests over 2,000,000 tiles
+  (`bbox too large`) all fail with a non-zero exit.
 * **Download progress** (stderr):
   `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight`.
 * **Download stats line** (stderr, at completion):
@@ -885,14 +928,43 @@ a **single object** or a **JSON array** of such objects (batch).
 | `ul_lon` | f64 | **required** | Upper-left longitude (east-positive). |
 | `resolution_m` | f64 | **required** | Metres per pixel. |
 | `size_px` | u32 | **required** | Output tile side (px). |
-| `base_tif` | string? | optional | Base DEM GeoTIFF to sample. |
-| `swiss_tifs` | array of string | **required (may be empty `[]`)** | Higher-resolution swissALTI GeoTIFFs to overlay. |
+| `sources` | array of source | optional (v2.0) | Prioritised terrain inputs; see **Sources** below. Array order is priority: the **first** source with a valid sample under a pixel wins. Mutually exclusive with `base_tif`/`swiss_tifs`. |
+| `void_fill_m` | f64? | optional (v2.0) | A pixel **no** source covers is written as `round(void_fill_m * 2)` half-metres (saturating i16) instead of the `-9999` sentinel. Buildings rasterize after, unchanged. Absent keeps the sentinel. |
+| `base_tif` | string? | **DEPRECATED** | Alias: normalized to a trailing `sources` entry with `crs "EPSG:4326"`. Slated for removal in the next major version. |
+| `swiss_tifs` | array of string | **DEPRECATED**, no longer required | Alias: normalized to leading `sources` entries with `crs "EPSG:2056"` (in order — which preserves the old per-pixel priority: this stack first, `base_tif` as fallback). Slated for removal in the next major version. |
 | `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in. Height comes from the geometry Z, read as an **absolute roof elevation (AMSL)**. |
 | `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Height comes from `render_height`, then `building:levels × 3`, then a 6 m default, and is read as **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
 
 Both building fields are optional and additive; a job that omits them behaves
 exactly as before. They may be combined, in which case FlatGeobuf is applied
 first.
+
+**Sources (v2.0).** Each `sources` entry is `{path, crs?, nodata?}`:
+
+* `path` — a GeoTIFF. It **must** carry a geotransform (a
+  `ModelTransformation` tag, or `ModelTiepoint` + `ModelPixelScale`); a file
+  without one is a **hard error** naming the file. Georeferencing is **never**
+  derived from file names (the old filename fallback is gone).
+* `crs` — `"EPSG:nnnn"` or a raw proj string starting with `+`. Optional:
+  when absent, the file's GeoKeyDirectory is read — `ProjectedCSTypeGeoKey`
+  (3072) first, else `GeographicTypeGeoKey` (2048). An absent key, or the
+  user-defined value 32767, is a **hard error** telling the user to add
+  `"crs"` to that source. An EPSG code missing from the built-in registry,
+  or a proj string that does not parse, is likewise a hard error naming the
+  code/file. A **geographic** CRS is sampled directly as lon/lat degrees
+  (the historical `base_tif` fast path, byte-identical); a **projected** CRS
+  is sampled through a WGS84→source transform (proj4rs) — EPSG:2056 output
+  thereby moved ≤ 1 m vs. the retired polynomial, i.e. up to one source
+  sample.
+* `nodata` — no-data value in source units. Optional: when absent, the
+  file's `GDAL_NODATA` ascii tag applies if present. Matching samples become
+  the `-9999` void sentinel **at load time**; the Float32-NaN and
+  Int32-widening rules of §6 apply unchanged on top.
+* Supplying `sources` **and** either legacy field in one job is a **hard
+  error** (the priority order would be ambiguous). A job with none of the
+  three writes an all-void (or all-`void_fill_m`) tile, as before.
+* A listed source that cannot be opened or decoded **fails the tile** —
+  never a warning.
 
 > **Mixed zooms are refused on both paths.** `ingest` previously accepted a
 > mixed-zoom `buildings_pbf_dir` and drew every zoom's copy of the same

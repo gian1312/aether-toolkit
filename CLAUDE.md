@@ -67,7 +67,7 @@ dependency that assumes otherwise.
 
 ```sh
 cargo build --release          # binaries → target/release/{aether_converter,aether_export,aether_aggregate}
-cargo test --workspace         # 7 test files under crates/*/tests/
+cargo test --workspace         # 8 test files under crates/*/tests/ + in-module tests
 python3 tools/validate_fixtures.py   # golden fixtures must stay valid
 ```
 
@@ -81,6 +81,39 @@ There is no CI in this repo (no `.github/`), so these run locally or not at all.
 Run `cargo test --workspace` **and** `validate_fixtures.py` before calling any
 change done — the fixture validator catches contract drift that `cargo test`
 does not.
+
+## Ingest jobs (contract v2.0)
+
+Terrain inputs are a prioritised `sources` array (first valid sample wins per
+pixel); the converter resolves each source's CRS itself and reprojects while
+sampling — callers never warp:
+
+```json
+{
+  "output_path": "./out/tile_N47.50E8.00_10m.abt",
+  "format": "r16sint",
+  "ul_lat": 47.5, "ul_lon": 8.0,
+  "resolution_m": 10.0, "size_px": 2048,
+  "sources": [
+    {"path": "overlay.tif", "crs": "EPSG:2056", "nodata": -9999.0},
+    {"path": "base.tif"}
+  ],
+  "void_fill_m": 0.0
+}
+```
+
+- `crs` is `"EPSG:nnnn"` or a `+proj=…` string; absent → read from the file's
+  GeoKeys, and an absent/user-defined key is a hard error naming the file.
+  `nodata` overrides the file's `GDAL_NODATA` tag. Files without a
+  geotransform are hard errors — georeferencing is never parsed from names.
+- `void_fill_m` (optional) fills uncovered pixels with that elevation instead
+  of the `-9999` void sentinel.
+- `base_tif`/`swiss_tifs` are deprecated aliases (still accepted, normalized
+  internally to `sources`; combining them with `sources` is an error).
+- `aether_converter plan --south … --north … --west … --east … --resolutions 30,90`
+  prints the `.abt` tile grid as JSON (`aether-plan/1`); its geometry mirrors
+  the Waveshed plugin's Python enumeration exactly and consumers cross-check
+  against it. See `docs/CONTRACT.md` §1.2/§9a and `schemas/`.
 
 ## The contract is the hard constraint
 

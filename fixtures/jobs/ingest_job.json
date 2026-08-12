@@ -5,7 +5,10 @@
   "ul_lon": 8.0,
   "resolution_m": 10.0,
   "size_px": 2048,
-  "base_tif": "./data/raw_dem/base_47_8.tif",
-  "swiss_tifs": [],
+  "sources": [
+    { "path": "./data/raw_dem/alti_2600-1200.tif", "crs": "EPSG:2056", "nodata": -9999.0 },
+    { "path": "./data/raw_dem/base_47_8.tif", "crs": "EPSG:4326" }
+  ],
+  "void_fill_m": 0.0,
   "buildings_file": null
 }
