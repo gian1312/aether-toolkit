@@ -106,6 +106,10 @@ sampling — callers never warp:
   GeoKeys, and an absent/user-defined key is a hard error naming the file.
   `nodata` overrides the file's `GDAL_NODATA` tag. Files without a
   geotransform are hard errors — georeferencing is never parsed from names.
+- A source `path` may also be an `.abt` tile (detected by the `AETH` magic,
+  not extension): self-describing (header geometry, raw i16 half-metres,
+  R16SINT only), sampled like a geographic GeoTIFF; `crs`/`nodata` on it is
+  a hard error.
 - `void_fill_m` (optional) fills uncovered pixels with that elevation instead
   of the `-9999` void sentinel.
 - `base_tif`/`swiss_tifs` are deprecated aliases (still accepted, normalized

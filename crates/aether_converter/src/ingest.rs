@@ -215,6 +215,10 @@ pub struct LoadedImage {
     /// carries a usable (non-user-defined) code. A per-source explicit `crs`
     /// always wins over this.
     pub embedded_crs: Option<String>,
+    /// True when the source was an `.abt` tile (detected by magic). Such a
+    /// source is self-describing — geographic degrees, values already in
+    /// half-metres — and refuses per-source `crs`/`nodata` overrides.
+    pub is_abt: bool,
 }
 
 /// Nudge that decides a source-pixel centre landing exactly on a cell edge.
@@ -427,13 +431,34 @@ struct ProjGroup {
     min_scale: f64,
 }
 
-// FIX: Made public so main.rs can access it for sequential pre-loading.
-//
-// `nodata_override` is the source's explicit `nodata` field; it wins over the
-// file's GDAL_NODATA tag. Matching samples become VOID_ELEV *here*, at load
-// time, which keeps the samplers' `> -5000` validity test unchanged.
-pub fn load_tiff_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<Arc<LoadedImage>> {
-    let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
+/// Load one terrain source — a GeoTIFF or an `.abt` tile — into RAM.
+///
+/// The two are told apart by the `AETH` magic, never by extension. Public so
+/// main.rs can use it for sequential pre-loading (the preload rule therefore
+/// applies to `.abt` sources exactly as to GeoTIFFs).
+///
+/// `nodata_override` is the source's explicit `nodata` field; for a GeoTIFF
+/// it wins over the file's GDAL_NODATA tag, and matching samples become
+/// VOID_ELEV *here*, at load time, which keeps the samplers' `> -5000`
+/// validity test unchanged. An `.abt` source refuses the override (it is
+/// self-describing; its voids are already `-9999`).
+pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<Arc<LoadedImage>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
+    let mut magic = [0u8; 4];
+    let got = file.read(&mut magic).with_context(|| format!("Reading {:?}", path))?;
+    if got == 4 && magic == *b"AETH" {
+        if nodata_override.is_some() {
+            anyhow::bail!(
+                "source {:?}: .abt sources are self-describing — remove \"nodata\" \
+                 from this source (its voids are already the -9999 sentinel)",
+                path
+            );
+        }
+        return load_abt_to_ram(path, file);
+    }
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("Reading {:?}", path))?;
     let reader = BufReader::with_capacity(1024 * 1024, file);
     // The default tiff decode-buffer cap (~256 MB) rejects large rasters with
     // "The Decoder limits are exceeded". Callers now hand us one small,
@@ -518,6 +543,106 @@ pub fn load_tiff_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<Arc
         scale,
         name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         embedded_crs,
+        is_abt: false,
+    }))
+}
+
+/// Load an `.abt` tile as an ingest source.
+///
+/// Self-describing: the 44-byte header (contract §6) carries the geometry —
+/// geographic degrees, square tile, same step both axes — and the payload is
+/// already i16 half-metres, so pixels are loaded RAW (no metres→half-metres
+/// conversion) with the row-stride padding stripped. `-9999` voids pass
+/// through unchanged and read as no-data in the samplers. Sampling and
+/// area-averaging then behave exactly as for a geographic GeoTIFF.
+///
+/// *file* has its cursor just past the magic the caller sniffed.
+fn load_abt_to_ram(path: &Path, file: File) -> Result<Arc<LoadedImage>> {
+    use byteorder::ReadBytesExt;
+    use std::io::Read;
+
+    let corrupt = |what: &str| {
+        anyhow::anyhow!(
+            "source {:?}: truncated or corrupt .abt header ({what}); the file \
+             cannot be used as a terrain source",
+            path
+        )
+    };
+
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut rest = [0u8; 40]; // header minus the 4 magic bytes already read
+    reader.read_exact(&mut rest).map_err(|_| corrupt("shorter than 44 bytes"))?;
+    let mut hdr = &rest[..];
+    let version = hdr.read_u16::<LittleEndian>()?;
+    let size = hdr.read_u16::<LittleEndian>()? as usize;
+    let ul_lat = hdr.read_f64::<LittleEndian>()?;
+    let ul_lon = hdr.read_f64::<LittleEndian>()?;
+    let _scale_y = hdr.read_f64::<LittleEndian>()?;
+    let scale_x = hdr.read_f64::<LittleEndian>()?;
+    let _base_elev = hdr.read_i16::<LittleEndian>()?;
+    let stride = hdr.read_u16::<LittleEndian>()? as usize;
+
+    // Decision: only R16SINT (version 1) tiles can be sources — a version-2
+    // tile's payload is BC6H blocks, not i16 rows, and decoding it as rows
+    // would produce silent garbage terrain.
+    if version != 1 {
+        anyhow::bail!(
+            "source {:?}: .abt version {version} is not ingestable — only \
+             R16SINT (version 1) tiles can be terrain sources",
+            path
+        );
+    }
+    if size == 0 {
+        return Err(corrupt("size is 0"));
+    }
+    let row_bytes = size * 2;
+    if stride < row_bytes {
+        return Err(corrupt(&format!("row stride {stride} < row bytes {row_bytes}")));
+    }
+    // Legacy scale quirk, mirrored from the plugin's reader
+    // (waveshed/core/abt.py): older converter builds wrote the tile's WHOLE
+    // SPAN in scale_x rather than the per-pixel step. A real per-pixel step is
+    // tiny (10 m is 9e-5 degrees), so anything at or above 0.005 degrees is a
+    // span and is divided by the tile size. scale_y is ignored, as there.
+    let pixel_res = if scale_x < 0.005 { scale_x } else { scale_x / size as f64 };
+    if !(pixel_res > 0.0) || !pixel_res.is_finite() {
+        return Err(corrupt(&format!("non-positive pixel scale {scale_x}")));
+    }
+
+    let mut data = vec![0i16; size * size];
+    let mut row_buf = vec![0u8; row_bytes];
+    let pad = (stride - row_bytes) as i64;
+    for row in 0..size {
+        reader.read_exact(&mut row_buf).map_err(|_| {
+            anyhow::anyhow!(
+                "source {:?}: truncated .abt payload (row {row} of {size} is \
+                 incomplete); the file cannot be used as a terrain source",
+                path
+            )
+        })?;
+        for (i, px) in row_buf.chunks_exact(2).enumerate() {
+            // RAW half-metres — .abt already stores the target unit.
+            data[row * size + i] = i16::from_le_bytes([px[0], px[1]]);
+        }
+        if pad > 0 {
+            reader.seek_relative(pad).map_err(|_| corrupt("padding seek failed"))?;
+        }
+    }
+
+    let limit_n = ul_lat - (size as f64 * pixel_res);
+    let limit_e = ul_lon + (size as f64 * pixel_res);
+    Ok(Arc::new(LoadedImage {
+        width: size as u32,
+        height: size as u32,
+        data,
+        origin_e: ul_lon,
+        origin_n: ul_lat,
+        limit_e,
+        limit_n,
+        scale: pixel_res,
+        name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        embedded_crs: None,
+        is_abt: true,
     }))
 }
 
@@ -715,7 +840,7 @@ pub fn process_tile(
                 // woken) whether the decode succeeds, errors, or panics.
                 drop(in_flight);
                 let _mark = InflightMark { path: s.path.clone() };
-                let img = load_tiff_to_ram(&s.path, s.nodata)
+                let img = load_source_to_ram(&s.path, s.nodata)
                     .with_context(|| format!("loading source {:?}", key.0))?;
                 cache_arc.lock().unwrap().insert(key.clone(), img.clone());
                 break img;
@@ -736,6 +861,22 @@ pub fn process_tile(
     let mut groups: Vec<ProjGroup> = Vec::new();
     let mut kinds: Vec<SourceKind> = Vec::with_capacity(sources.len());
     for (spec, img) in sources.iter().zip(&images) {
+        // An .abt source is self-describing: geographic degrees by format
+        // definition. A crs field on it is refused rather than ignored — the
+        // caller is asserting something the format cannot honor. (The nodata
+        // twin of this error lives in load_source_to_ram.)
+        if img.is_abt {
+            if spec.crs.is_some() {
+                anyhow::bail!(
+                    "source {:?}: .abt sources are self-describing — remove \
+                     \"crs\" from this source (the header fixes the geometry \
+                     to geographic WGS84 degrees)",
+                    spec.path
+                );
+            }
+            kinds.push(SourceKind::Geographic);
+            continue;
+        }
         let crs = match (&spec.crs, &img.embedded_crs) {
             (Some(c), _) => c.clone(),
             (None, Some(c)) => c.clone(),
@@ -1378,6 +1519,7 @@ mod tests {
             scale,
             name: "test".into(),
             embedded_crs: None,
+            is_abt: false,
         }
     }
 

@@ -55,6 +55,11 @@ crates in this workspace (`aether_converter`, `aether_export`,
 > 9. **`plan` subcommand (§1.2, additive).** Prints the `.abt` tile grid for
 >    a bbox + resolution set as a single JSON document (schema
 >    `aether-plan/1`) without converting anything.
+> 10. **`.abt` files as ingest sources (§9a, additive).** A `sources[].path`
+>    may be an `.abt` tile (detected by the `AETH` magic, never by
+>    extension); it is self-describing and sampled like a geographic GeoTIFF.
+>    `crs`/`nodata` on such a source, a truncated/corrupt header, or a BC6H
+>    (version 2) tile are hard errors.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -224,6 +229,14 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   (`bbox too large`) all fail with a non-zero exit.
 * **Download progress** (stderr):
   `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight`.
+
+  > **Parsed interface (frozen).** The `download` subcommand's stdout/stderr
+  > progress lines — the `[Download] …` progress format above and the
+  > `[Stats] …` completion block below — are **read programmatically by the
+  > Waveshed QGIS plugin** to drive its progress bar, not just shown to
+  > humans. Treat their shape exactly like the `[Rust] Progress: X/N` ingest
+  > line: any change to the prefix, ordering, or number formats is a
+  > breaking change under this contract.
 * **Download stats line** (stderr, at completion):
 
   ```rust
@@ -941,7 +954,19 @@ first.
 
 **Sources (v2.0).** Each `sources` entry is `{path, crs?, nodata?}`:
 
-* `path` — a GeoTIFF. It **must** carry a geotransform (a
+* `path` — a GeoTIFF or an **`.abt` tile**; the two are told apart by the
+  `AETH` magic, **never by extension**. An `.abt` source is self-describing:
+  its 44-byte header (§6) fixes the geometry — geographic WGS84 degrees,
+  square tile, per-pixel step from `scale_x` (older builds wrote the tile's
+  whole *span* there; anything ≥ 0.005° is treated as a span and divided by
+  the size, matching the plugin's reader) — and its payload is **already**
+  i16 half-metres, loaded raw with the row-stride padding stripped and
+  `-9999` voids passing through as no-data. Sampling and area-averaging are
+  identical to a geographic GeoTIFF source. Hard errors, each naming the
+  file: a `crs` or `nodata` field on an `.abt` source (*"abt sources are
+  self-describing — remove …"*), a truncated/corrupt header, and a BC6H
+  (version 2) tile — only R16SINT (version 1) is ingestable.
+  A GeoTIFF `path` **must** carry a geotransform (a
   `ModelTransformation` tag, or `ModelTiepoint` + `ModelPixelScale`); a file
   without one is a **hard error** naming the file. Georeferencing is **never**
   derived from file names (the old filename fallback is gone).

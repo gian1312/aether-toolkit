@@ -152,7 +152,9 @@ fn main() -> anyhow::Result<()> {
                     println!("[Rust] Pre-loading {} large shared source(s) to prevent memory races...", preload.len());
                     let mut cache = texture_cache.lock().unwrap();
                     for key in &preload {
-                        let img = ingest::load_tiff_to_ram(&key.0, key.1.map(f64::from_bits))
+                        // load_source_to_ram sniffs the AETH magic itself, so
+                        // large shared .abt sources preload exactly like TIFFs.
+                        let img = ingest::load_source_to_ram(&key.0, key.1.map(f64::from_bits))
                             .map_err(|e| anyhow::anyhow!("pre-loading shared source {:?}: {e}", key.0))?;
                         cache.insert(key.clone(), img);
                     }

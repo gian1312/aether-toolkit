@@ -583,6 +583,179 @@ fn a_file_without_a_geotransform_is_refused_naming_the_file() {
     assert!(err.contains("never"), "must state filenames are never parsed: {err:?}");
 }
 
+// ── .abt files as ingest sources (Addendum A1) ────────────────────────────
+
+/// Hand-crafted `.abt` writer: 44-byte header + 256-aligned stride-padded
+/// rows of raw i16 half-metres (contract §6). `legacy_span_scale` writes the
+/// tile's WHOLE SPAN into scale_x — the old-build quirk the reader must
+/// divide back out (mirroring the plugin's waveshed/core/abt.py).
+fn write_abt(
+    path: &Path,
+    size: u16,
+    ul_lat: f64,
+    ul_lon: f64,
+    pixel_deg: f64,
+    data: &[i16],
+    legacy_span_scale: bool,
+    version: u16,
+) {
+    assert_eq!(data.len(), size as usize * size as usize);
+    let row_bytes = size as usize * 2;
+    let stride = (row_bytes + 255) & !255;
+    let scale_x = if legacy_span_scale { pixel_deg * size as f64 } else { pixel_deg };
+
+    let mut buf: Vec<u8> = Vec::with_capacity(44 + stride * size as usize);
+    buf.extend_from_slice(b"AETH");
+    buf.extend_from_slice(&version.to_le_bytes());
+    buf.extend_from_slice(&size.to_le_bytes());
+    buf.extend_from_slice(&ul_lat.to_le_bytes());
+    buf.extend_from_slice(&ul_lon.to_le_bytes());
+    buf.extend_from_slice(&pixel_deg.to_le_bytes()); // scale_y (ignored by readers)
+    buf.extend_from_slice(&scale_x.to_le_bytes());
+    buf.extend_from_slice(&0i16.to_le_bytes()); // base_elev
+    buf.extend_from_slice(&(stride as u16).to_le_bytes());
+    for row in data.chunks(size as usize) {
+        for v in row {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf.resize(buf.len() + (stride - row_bytes), 0);
+    }
+    std::fs::write(path, buf).unwrap();
+}
+
+#[test]
+fn an_abt_source_is_loaded_raw_and_its_voids_fall_through() {
+    // .abt values are ALREADY half-metres: 500 must come out as 500 (250 m),
+    // never doubled. Void pixels fall through to the next source exactly like
+    // a GeoTIFF's no-data. Mixed .abt + GeoTIFF priority in one job.
+    let dir = tempfile::tempdir().unwrap();
+    let abt = dir.path().join("pool_tile.bin"); // deliberately NOT .abt — magic, not extension
+    let w = 40u16;
+    // West half 500 half-metres, east half void.
+    let data: Vec<i16> = (0..w as u32 * w as u32)
+        .map(|i| if i % (w as u32) < 20 { 500 } else { VOID_ELEV })
+        .collect();
+    write_abt(&abt, w, 47.00, 7.40, 0.001, &data, false, 1);
+    // The stacked pair's B (a GeoTIFF, 222 m everywhere) backs the .abt.
+    let (_a, tif) = stacked_pair(dir.path());
+
+    let mut job = straddle_json(dir.path(), "mixed.abt.out");
+    job["sources"] = serde_json::json!([{"path": abt}, {"path": tif}]);
+    let px = payload(&run_job(job).unwrap(), 16);
+    let flat: Vec<i16> = px.iter().flatten().copied().collect();
+    assert!(flat.contains(&500), "raw half-metre values must survive undoubled");
+    assert!(flat.contains(&444), "the GeoTIFF must fill the .abt's void half");
+    assert!(flat.iter().all(|&v| v == 500 || v == 444));
+}
+
+#[test]
+fn an_abt_source_area_averages_like_a_geographic_geotiff() {
+    // Ratio > 1: source three times finer than the target; an interior output
+    // cell is the mean of its 3x3 block — the same rule the lib tests pin for
+    // geographic GeoTIFFs, with NO unit conversion on the way in.
+    let dir = tempfile::tempdir().unwrap();
+    let abt = dir.path().join("fine.abt");
+    let out_pixel_deg = 30.0 / 111111.0;
+    let src_deg = out_pixel_deg / 3.0;
+    let (w, h) = (12u16, 12u16);
+    let ramp: Vec<i16> = (0..w as u32 * h as u32)
+        .map(|i| (i % w as u32) as i16 * 10 + (i / w as u32) as i16)
+        .collect();
+    write_abt(&abt, w, 47.5, 8.25, src_deg, &ramp, false, 1);
+
+    let job = serde_json::json!({
+        "output_path": dir.path().join("t.abt.out"),
+        "ul_lat": 47.5, "ul_lon": 8.25,
+        "resolution_m": 30.0, "size_px": 4,
+        "sources": [{"path": abt}],
+    });
+    let px = payload(&run_job(job).unwrap(), 4);
+
+    let block_mean = |cx: usize, cy: usize| -> i16 {
+        let mut s = 0i32;
+        for y in cy - 1..=cy + 1 {
+            for x in cx - 1..=cx + 1 {
+                s += ramp[y * 12 + x] as i32;
+            }
+        }
+        ((s * 2 + 9) / 18) as i16 // round half away from zero, 9 samples
+    };
+    for y in 1..4 {
+        for x in 1..4 {
+            assert_eq!(px[y][x], block_mean(3 * x, 3 * y), "pixel ({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn a_legacy_span_scale_abt_header_reads_identically() {
+    // Old builds wrote the tile's whole span in scale_x; the reader divides it
+    // back out (same rule as the plugin's abt.py), so the two header variants
+    // must produce byte-identical output.
+    let dir = tempfile::tempdir().unwrap();
+    let modern = dir.path().join("modern.abt");
+    let legacy = dir.path().join("legacy.abt");
+    let (w, _) = (40u16, ());
+    let data: Vec<i16> = (0..w as u32 * w as u32).map(|i| (i % 97) as i16 * 3).collect();
+    write_abt(&modern, w, 47.00, 7.40, 0.001, &data, false, 1);
+    write_abt(&legacy, w, 47.00, 7.40, 0.001, &data, true, 1);
+
+    let mut a = straddle_json(dir.path(), "modern.out");
+    a["sources"] = serde_json::json!([{"path": modern}]);
+    let mut b = straddle_json(dir.path(), "legacy.out");
+    b["sources"] = serde_json::json!([{"path": legacy}]);
+    assert_eq!(run_job(a).unwrap(), run_job(b).unwrap());
+}
+
+#[test]
+fn crs_on_an_abt_source_is_refused_as_self_describing() {
+    let dir = tempfile::tempdir().unwrap();
+    let abt = dir.path().join("tile.abt");
+    write_abt(&abt, 8, 47.00, 7.40, 0.001, &vec![100; 64], false, 1);
+    let mut job = straddle_json(dir.path(), "x.out");
+    job["sources"] = serde_json::json!([{"path": abt, "crs": "EPSG:4326"}]);
+    let err = run_job(job).unwrap_err().to_string();
+    assert!(err.contains("tile.abt"), "must name the file: {err:?}");
+    assert!(err.contains("self-describing") && err.contains("crs"), "got {err:?}");
+}
+
+#[test]
+fn nodata_on_an_abt_source_is_refused_as_self_describing() {
+    let dir = tempfile::tempdir().unwrap();
+    let abt = dir.path().join("tile.abt");
+    write_abt(&abt, 8, 47.00, 7.40, 0.001, &vec![100; 64], false, 1);
+    let mut job = straddle_json(dir.path(), "x.out");
+    job["sources"] = serde_json::json!([{"path": abt, "nodata": -9999.0}]);
+    let err = format!("{:?}", run_job(job).unwrap_err());
+    assert!(err.contains("tile.abt"), "must name the file: {err:?}");
+    assert!(err.contains("self-describing") && err.contains("nodata"), "got {err:?}");
+}
+
+#[test]
+fn a_truncated_abt_header_is_refused_naming_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let abt = dir.path().join("stub.abt");
+    std::fs::write(&abt, b"AETH\x01\x00\x10\x00short").unwrap();
+    let mut job = straddle_json(dir.path(), "x.out");
+    job["sources"] = serde_json::json!([{"path": abt}]);
+    let err = format!("{:?}", run_job(job).unwrap_err());
+    assert!(err.contains("stub.abt"), "must name the file: {err:?}");
+    assert!(err.contains("truncated or corrupt .abt header"), "got {err:?}");
+}
+
+#[test]
+fn a_bc6h_abt_tile_is_refused_as_a_source() {
+    // Version 2 payloads are BC6H blocks, not i16 rows — decoding them as
+    // rows would be silent garbage, so the version is a hard error.
+    let dir = tempfile::tempdir().unwrap();
+    let abt = dir.path().join("bc6h.abt");
+    write_abt(&abt, 8, 47.00, 7.40, 0.001, &vec![100; 64], false, 2);
+    let mut job = straddle_json(dir.path(), "x.out");
+    job["sources"] = serde_json::json!([{"path": abt}]);
+    let err = format!("{:?}", run_job(job).unwrap_err());
+    assert!(err.contains("bc6h.abt") && err.contains("version 2"), "got {err:?}");
+}
+
 #[test]
 fn a_missing_source_file_is_fatal_not_a_warning() {
     let dir = tempfile::tempdir().unwrap();
