@@ -89,7 +89,7 @@ pub enum Rounding {
 
 impl Rounding {
     #[inline]
-    fn to_half_metres(self, metres: f64) -> i16 {
+    pub(crate) fn to_half_metres(self, metres: f64) -> i16 {
         let v = metres * 2.0;
         let v = match self {
             Rounding::Nearest => v.round(),
@@ -184,6 +184,32 @@ impl ElevGrid for AbtGrid<'_> {
             self.buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
         }
     }
+}
+
+/// Georeferencing and row stride of an already-written `.abt` buffer.
+///
+/// The 44-byte header is: `AETH`, `u16` version, `u16` size_px, then `f64`
+/// ul_lat / ul_lon / scale_y / scale_x, an `i16` base elevation and the `u16`
+/// row stride in bytes. Returns `None` for anything too short to hold one —
+/// callers treat that as "not a tile" and leave the buffer alone.
+pub fn parse_abt_header(buf: &[u8]) -> Option<(TileRef, usize)> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    use std::io::Cursor;
+
+    if buf.len() < 44 {
+        return None;
+    }
+    let mut c = Cursor::new(&buf[4..44]);
+    let _version = c.read_u16::<LittleEndian>().ok()?;
+    let size_px = c.read_u16::<LittleEndian>().ok()? as u32;
+    let ul_lat = c.read_f64::<LittleEndian>().ok()?;
+    let ul_lon = c.read_f64::<LittleEndian>().ok()?;
+    let scale_y = c.read_f64::<LittleEndian>().ok()?;
+    let scale_x = c.read_f64::<LittleEndian>().ok()?;
+    let _base_elev = c.read_i16::<LittleEndian>().ok()?;
+    let stride = c.read_u16::<LittleEndian>().ok()? as usize;
+
+    Some((TileRef { ul_lat, ul_lon, scale_x, scale_y, size_px }, stride))
 }
 
 /// Knobs for [`rasterize_buildings`].

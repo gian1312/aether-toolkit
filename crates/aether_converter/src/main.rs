@@ -1,5 +1,9 @@
 // rust/aether_converter/src/main.rs
 mod buildings;
+// Reached only through `mvt::apply_buildings_to_abt_tiles`; the CLI has no
+// canopy subcommand, so the rest of the module is dead code in this binary.
+#[allow(dead_code)]
+mod canopy;
 mod download;
 mod ingest;
 mod mvt;

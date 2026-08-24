@@ -143,7 +143,7 @@ fn tile_to_lat(y: u32, z: u32) -> f64 {
 // Each command word: (id & 0x7) = command, (id >> 3) = count
 // Coordinates are zigzag-encoded deltas in tile-local space (0..extent).
 
-fn decode_geometry(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u32, z: u32) -> Vec<Vec<(f64, f64)>> {
+pub(crate) fn decode_geometry(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u32, z: u32) -> Vec<Vec<(f64, f64)>> {
     let tile_w = tile_to_lon(tile_x + 1, z) - tile_to_lon(tile_x, z);
     let tile_n = tile_to_lat(tile_y, z);
     let tile_s = tile_to_lat(tile_y + 1, z);
@@ -340,7 +340,20 @@ pub fn extract_buildings_from_pbf(
     z: u32,
 ) -> Result<(Vec<BuildingPolygon>, ExtractStats)> {
     let tile = Tile::decode(pbf_data).map_err(|e| anyhow!("PBF decode error: {e}"))?;
+    Ok(extract_buildings_from_tile(&tile, tile_x, tile_y, z))
+}
 
+/// Extract buildings from an already-decoded vector tile.
+///
+/// Split out of [`extract_buildings_from_pbf`] so a pipeline that also wants the
+/// canopy mask (`crate::canopy::extract_canopy_from_tile`) can decode the
+/// protobuf once and read both layers out of the same `Tile`.
+pub fn extract_buildings_from_tile(
+    tile: &Tile,
+    tile_x: u32,
+    tile_y: u32,
+    z: u32,
+) -> (Vec<BuildingPolygon>, ExtractStats) {
     let mut buildings = Vec::new();
     let mut stats = ExtractStats {
         layers_total: tile.layers.len(),
@@ -411,14 +424,12 @@ pub fn extract_buildings_from_pbf(
     }
 
     stats.buildings_out = buildings.len();
-    Ok((buildings, stats))
+    (buildings, stats)
 }
 
 // ── Batch building application to .abt tiles ──────────────────────
 
-use crate::buildings::{rasterize_buildings, AbtGrid, RasterOpts, TileRef};
-use byteorder::{LittleEndian, ReadBytesExt};
-use std::io::Cursor;
+use crate::canopy::{apply_surface_to_abt_tiles, SurfaceOpts};
 use std::collections::HashSet;
 
 /// Result of applying buildings to a set of .abt tiles.
@@ -451,6 +462,16 @@ pub fn maybe_gunzip(data: &[u8]) -> Vec<u8> {
 /// This is the core building integration pipeline. The WASM wrapper calls this
 /// after converting JS types to Rust types.
 ///
+/// The write rule lives in `buildings::rasterize_buildings`, shared with the
+/// FlatGeobuf path: resolve each above-ground height against the terrain under
+/// its own footprint, then composite the resulting absolute roof with `max`.
+/// This replaced a per-pixel `+= height`, which draped roofs over slopes,
+/// stacked overlapping footprints and doubled on re-application.
+///
+/// Buildings are one of two layers that can be burned into a tile; the body is
+/// [`crate::canopy::apply_surface_to_abt_tiles`] with the canopy switched off,
+/// so "buildings only" cannot drift away from "buildings and canopy".
+///
 /// * `abt_bufs` — mutable .abt tile buffers (44-byte header + i16 elevation data)
 /// * `pbf_tiles` — raw PBF tile bytes (one per vector tile)
 /// * `pbf_xs`, `pbf_ys` — tile x/y coordinates for each PBF tile
@@ -462,68 +483,19 @@ pub fn apply_buildings_to_abt_tiles(
     pbf_ys: &[u32],
     pbf_zoom: u32,
 ) -> ApplyBuildingsResult {
-    // ── 1. Decode ALL PBF tiles ──────────────────────────────────
-    let mut all_buildings: Vec<BuildingPolygon> = Vec::new();
-    for i in 0..pbf_tiles.len() {
-        let pbf_bytes = maybe_gunzip(&pbf_tiles[i]);
-        if let Ok((buildings, _)) = extract_buildings_from_pbf(&pbf_bytes, pbf_xs[i], pbf_ys[i], pbf_zoom) {
-            all_buildings.extend(buildings);
-        }
-    }
-
-    let buildings_decoded = all_buildings.len();
-
-    // ── 2. Deduplicate buffer-zone duplicates ────────────────────
-    {
-        let mut seen = HashSet::new();
-        all_buildings.retain(|b| {
-            if b.coords.is_empty() { return false; }
-            let (lon, lat) = b.coords[0];
-            let key = ((lat * 1_000_000.0).round() as i64, (lon * 1_000_000.0).round() as i64);
-            seen.insert(key)
-        });
-    }
-
-    let buildings_after_dedup = all_buildings.len();
-
-    // ── 3. Rasterize onto each .abt tile ─────────────────────────
-    // The write rule lives in `buildings::rasterize_buildings`, shared with the
-    // FlatGeobuf path: resolve each above-ground height against the terrain
-    // under its own footprint, then composite the resulting absolute roof with
-    // `max`. This replaced a per-pixel `+= height`, which draped roofs over
-    // slopes, stacked overlapping footprints and doubled on re-application.
-    let model: Vec<Building> = all_buildings.iter().map(|b| b.to_building()).collect();
-    let opts = RasterOpts::default();
-    let mut per_tile = Vec::with_capacity(abt_bufs.len());
-
-    for buf in abt_bufs.iter_mut() {
-        if buf.len() < 44 || model.is_empty() {
-            per_tile.push((0, 0));
-            continue;
-        }
-
-        let mut c = Cursor::new(&buf[4..44]);
-        let _version = c.read_u16::<LittleEndian>().unwrap();
-        let size_px = c.read_u16::<LittleEndian>().unwrap() as u32;
-        let ul_lat = c.read_f64::<LittleEndian>().unwrap();
-        let ul_lon = c.read_f64::<LittleEndian>().unwrap();
-        let scale_y = c.read_f64::<LittleEndian>().unwrap();
-        let scale_x = c.read_f64::<LittleEndian>().unwrap();
-        let _base_elev = c.read_i16::<LittleEndian>().unwrap();
-        let stride = c.read_u16::<LittleEndian>().unwrap() as usize;
-
-        let tile = TileRef { ul_lat, ul_lon, scale_x, scale_y, size_px };
-        let mut grid = AbtGrid { buf, size: size_px, stride };
-        let stats = rasterize_buildings(&mut grid, &tile, &model, &opts);
-
-        per_tile.push((stats.buildings_hit, stats.pixels_modified));
-    }
+    let opts = SurfaceOpts { buildings: true, canopy: None };
+    let result =
+        apply_surface_to_abt_tiles(abt_bufs, pbf_tiles, pbf_xs, pbf_ys, pbf_zoom, &opts);
 
     ApplyBuildingsResult {
         tiles: Vec::new(), // caller already has the mutated bufs
-        buildings_decoded,
-        buildings_after_dedup,
-        per_tile,
+        buildings_decoded: result.buildings_decoded,
+        buildings_after_dedup: result.buildings_after_dedup,
+        per_tile: result
+            .per_tile
+            .iter()
+            .map(|t| (t.buildings_hit, t.building_pixels))
+            .collect(),
     }
 }
 

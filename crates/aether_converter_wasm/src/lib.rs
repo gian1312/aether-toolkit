@@ -6,6 +6,7 @@ use wasm_bindgen::prelude::*;
 use aether_converter::download::{
     DownloadJob, run_download_mem, lon2tx, lat2ty, ty2lat, tx2lon,
 };
+use aether_converter::canopy::{apply_surface_to_abt_tiles, SurfaceOpts};
 use aether_converter::mvt;
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{Cursor, Write};
@@ -256,6 +257,95 @@ pub fn apply_buildings_pbf_batch(
         web_sys::console::log_1(&format!(
             "[AETHER] .abt tile {}: {} buildings, {} pixels", i, hits, pixels
         ).into());
+    }
+
+    let result = js_sys::Array::new_with_length(abt_bufs.len() as u32);
+    for (i, buf) in abt_bufs.iter().enumerate() {
+        result.set(i as u32, js_sys::Uint8Array::from(&buf[..]).into());
+    }
+    Ok(result)
+}
+
+/// Apply buildings **and** forest canopy from PBF vector tiles to all .abt tiles.
+///
+/// Wrapper around `canopy::apply_surface_to_abt_tiles`, which composes the two
+/// layers against the *pristine* terrain — a house in a wood is measured from
+/// the ground, not from the treetops. Running
+/// `apply_buildings_pbf_batch` and a separate canopy pass would not give that.
+///
+/// `opts_json`:
+///
+/// ```json
+/// {"buildings": true,
+///  "canopy": {"height_m": 15, "antialias": false,
+///             "carveout": {"lon": 10.09, "lat": 46.7, "radius_px": 1}}}
+/// ```
+///
+/// `canopy` may be absent or `null` (buildings only, byte-identical to
+/// `apply_buildings_pbf_batch`); `carveout` is optional and keeps the
+/// observer's own pixels on the ground. Unknown fields are ignored, so the
+/// caller may send options a future build understands.
+///
+/// Returns the modified tiles in input order.
+#[wasm_bindgen]
+pub fn apply_surface_pbf_batch(
+    abt_tiles: Vec<js_sys::Uint8Array>,
+    pbf_tiles: Vec<js_sys::Uint8Array>,
+    pbf_xs: &[u32],
+    pbf_ys: &[u32],
+    pbf_zoom: u32,
+    opts_json: &str,
+) -> Result<js_sys::Array, JsValue> {
+    if pbf_tiles.len() != pbf_xs.len() || pbf_tiles.len() != pbf_ys.len() {
+        return Err(JsValue::from_str("pbf_tiles/pbf_xs/pbf_ys length mismatch"));
+    }
+
+    let opts: SurfaceOpts = if opts_json.trim().is_empty() {
+        SurfaceOpts::default()
+    } else {
+        serde_json::from_str(opts_json)
+            .map_err(|e| JsValue::from_str(&format!("Invalid surface opts JSON: {e}")))?
+    };
+
+    let pbf_vecs: Vec<Vec<u8>> = pbf_tiles.iter().map(|t| t.to_vec()).collect();
+    let mut abt_bufs: Vec<Vec<u8>> = abt_tiles.iter().map(|t| t.to_vec()).collect();
+
+    let stats =
+        apply_surface_to_abt_tiles(&mut abt_bufs, &pbf_vecs, pbf_xs, pbf_ys, pbf_zoom, &opts);
+
+    let canopy = match opts.canopy {
+        Some(c) => format!(
+            "canopy {} m{}{}, {} polygons",
+            c.height_m,
+            if c.antialias { " (antialiased)" } else { "" },
+            match c.carveout {
+                Some(cv) => format!(", carve-out {} px", cv.radius_px),
+                None => String::new(),
+            },
+            stats.canopy_polygons
+        ),
+        None => "no canopy".to_string(),
+    };
+    web_sys::console::log_1(
+        &format!(
+            "[AETHER] Surface: {} buildings decoded, {} after dedup; {}",
+            stats.buildings_decoded, stats.buildings_after_dedup, canopy
+        )
+        .into(),
+    );
+    for (i, t) in stats.per_tile.iter().enumerate() {
+        web_sys::console::log_1(
+            &format!(
+                "[AETHER] .abt tile {}: {} buildings / {} px, {} woods / {} px raised, {} px carved",
+                i,
+                t.buildings_hit,
+                t.building_pixels,
+                t.canopy_polygons_hit,
+                t.canopy_pixels,
+                t.canopy_pixels_carved
+            )
+            .into(),
+        );
     }
 
     let result = js_sys::Array::new_with_length(abt_bufs.len() as u32);
