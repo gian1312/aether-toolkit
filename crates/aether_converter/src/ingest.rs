@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use serde::Deserialize;
 #[cfg(feature = "native")]
@@ -13,10 +14,11 @@ use tiff::tags::Tag;
 use anyhow::{Context, Result};
 use proj4rs::Proj;
 use proj4rs::transform::transform;
-use flatgeobuf::{FgbReader, GeometryType};
+use flatgeobuf::{FeatureProperties, FgbReader, GeometryType};
 use crate::buildings::{
-    load_pbf_building_dir, rasterize_buildings, Building, BuildingHeight, HeightSource, I16Grid,
-    PbfBuildingSet, RasterOpts, Rounding, TileRef,
+    load_pbf_building_dir, parse_leading_metres, rasterize_buildings, resolve_building_height,
+    Building, BuildingHeight, HeightSource, I16Grid, PbfBuildingSet, RasterOpts, Rounding, TileRef,
+    DEFAULT_HEIGHT_M,
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
 #[cfg(feature = "bc6h")]
@@ -167,6 +169,22 @@ impl Drop for InflightMark {
 /// another source.
 pub const VOID_ELEV: i16 = -9999;
 
+/// How much of one tile a source actually reached.
+///
+/// Counted BEFORE `void_fill_m` is applied, so it answers "did any source
+/// cover this pixel?" and not "is this pixel non-sentinel?" — a job that fills
+/// its holes with 0 m would otherwise report full coverage of a tile no source
+/// touched. [`process_tile`] returns it so the caller can refuse a run that
+/// produced no terrain at all; a partially covered tile is normal and says
+/// nothing on its own (the edge tiles of any area straddle the source).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TileStats {
+    /// Pixels at least one source supplied a sample for.
+    pub covered_px: u64,
+    /// Pixels in the tile.
+    pub total_px: u64,
+}
+
 /// Convert one Float32 DEM sample to the `.abt` half-metre unit.
 ///
 /// `f32 as i16` is defined to produce **0** for NaN, and NaN is GDAL's default
@@ -191,7 +209,17 @@ pub fn f32_sample_to_half_metres(x: f32) -> i16 {
 /// the void sentinel.
 #[inline]
 pub fn i32_sample_to_half_metres(x: i32) -> i16 {
-    let half_metres = x as i64 * 2;
+    i64_sample_to_half_metres(i64::from(x))
+}
+
+/// The same rule for any integer width the `tiff` crate can decode.
+///
+/// UInt16 is the commonest national-DEM sample format and UInt8/Int8/UInt32/
+/// Int64 all turn up in the wild; every one of them used to come back as a
+/// bare "Unsupported TIF format" from a reader that handled only I16/I32/F32.
+#[inline]
+pub fn i64_sample_to_half_metres(x: i64) -> i16 {
+    let half_metres = x.saturating_mul(2);
     if half_metres < VOID_ELEV as i64 {
         VOID_ELEV
     } else if half_metres > i16::MAX as i64 {
@@ -199,6 +227,35 @@ pub fn i32_sample_to_half_metres(x: i32) -> i16 {
     } else {
         half_metres as i16
     }
+}
+
+/// Convert one Float64 DEM sample to the `.abt` half-metre unit.
+///
+/// Same rule as [`f32_sample_to_half_metres`] — non-finite is the void
+/// sentinel, and the `as i16` cast saturates rather than wrapping.
+#[inline]
+pub fn f64_sample_to_half_metres(x: f64) -> i16 {
+    if !x.is_finite() {
+        return VOID_ELEV;
+    }
+    (x * 2.0) as i16
+}
+
+/// Decoded integer samples of any width -> half-metres, honouring *nodata*.
+#[inline]
+fn int_samples<T>(v: Vec<T>, nodata: Option<f64>) -> Vec<i16>
+where
+    T: Copy + Into<i64>,
+{
+    v.into_iter()
+        .map(|x| {
+            let widened: i64 = x.into();
+            match nodata {
+                Some(nd) if widened as f64 == nd => VOID_ELEV,
+                _ => i64_sample_to_half_metres(widened),
+            }
+        })
+        .collect()
 }
 
 pub struct LoadedImage {
@@ -531,7 +588,41 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
                 .collect(),
             None => v.iter().map(|&x| i32_sample_to_half_metres(x)).collect(),
         },
-        _ => return Err(anyhow::anyhow!("Unsupported TIF format")),
+        // Every remaining width the `tiff` crate can hand back. The three arms
+        // above keep their own comparison rules verbatim (the F32 one rounds
+        // the nodata tag through f32 on purpose); these are additive.
+        DecodingResult::U8(v) => int_samples(v, nodata),
+        DecodingResult::U16(v) => int_samples(v, nodata),
+        DecodingResult::U32(v) => int_samples(v, nodata),
+        DecodingResult::I8(v) => int_samples(v, nodata),
+        DecodingResult::I64(v) => int_samples(v, nodata),
+        // u64 is the one width that does not fit i64; saturate rather than
+        // wrap, and let the half-metre rule clamp it to i16::MAX.
+        DecodingResult::U64(v) => int_samples(
+            v.into_iter().map(|x| x.min(i64::MAX as u64) as i64).collect::<Vec<i64>>(),
+            nodata,
+        ),
+        // 16-bit float: widened to f32 and handled by the f32 rule. Named
+        // through `to_f32()` so `half` stays out of this crate's dependencies.
+        DecodingResult::F16(v) => match nodata {
+            Some(nd) => {
+                let nd32 = nd as f32;
+                v.iter()
+                    .map(|&x| {
+                        let f = x.to_f32();
+                        if f == nd32 { VOID_ELEV } else { f32_sample_to_half_metres(f) }
+                    })
+                    .collect()
+            }
+            None => v.iter().map(|&x| f32_sample_to_half_metres(x.to_f32())).collect(),
+        },
+        DecodingResult::F64(v) => match nodata {
+            Some(nd) => v
+                .iter()
+                .map(|&x| if x == nd { VOID_ELEV } else { f64_sample_to_half_metres(x) })
+                .collect(),
+            None => v.iter().map(|&x| f64_sample_to_half_metres(x)).collect(),
+        },
     };
 
     let limit_n = origin_n - (h as f64 * scale);
@@ -795,7 +886,7 @@ fn make_row_geom(
 /// a whole-directory scan whose result is the same for every output tile, so
 /// doing it here runs it once per `.abt`. Batch callers load the set once with
 /// [`load_pbf_building_dir`] and call [`process_tile`].
-pub fn process_tile_with_cache(job: IngestJob, cache_arc: ImageCache) -> Result<()> {
+pub fn process_tile_with_cache(job: IngestJob, cache_arc: ImageCache) -> Result<TileStats> {
     let pbf_buildings = match &job.buildings_pbf_dir {
         Some(dir) => Some(load_pbf_building_dir(dir)?),
         None => None,
@@ -812,7 +903,7 @@ pub fn process_tile(
     job: IngestJob,
     cache_arc: ImageCache,
     pbf_buildings: Option<&PbfBuildingSet>,
-) -> Result<()> {
+) -> Result<TileStats> {
     // 0. Normalize the legacy aliases into sources[] — ONE code path from here.
     let sources = job.effective_sources()?;
 
@@ -980,7 +1071,13 @@ pub fn process_tile(
     let iter = buffer.par_chunks_mut(out_size);
     #[cfg(not(feature = "native"))]
     let iter = buffer.chunks_mut(out_size);
+    // Pixels a source actually reached, folded once per row. Counted before
+    // `void_fill` rewrites the holes, which is the only place the answer still
+    // exists: after the fill, an uncovered tile and a real sea-level one are
+    // the same bytes.
+    let covered_px = AtomicU64::new(0);
     iter.enumerate().for_each(|(y, row_buffer)| {
+        let mut row_covered: u64 = 0;
         let row_lat = job.ul_lat - (y as f64 * pixel_deg);
 
         // The projected geometry of this row, one per CRS group. The south
@@ -1102,14 +1199,34 @@ pub fn process_tile(
                 }
             }
 
-            *out_pixel = if val == VOID_ELEV { void_fill } else { val };
+            if val == VOID_ELEV {
+                *out_pixel = void_fill;
+            } else {
+                row_covered += 1;
+                *out_pixel = val;
+            }
         }
+        covered_px.fetch_add(row_covered, Ordering::Relaxed);
     });
+    let stats = TileStats {
+        covered_px: covered_px.load(Ordering::Relaxed),
+        total_px: total_pixels as u64,
+    };
 
     // Building Rasterization
     if let Some(fgb) = &job.buildings_file {
+        // A buildings source that cannot be read fails the tile, exactly as an
+        // unusable `buildings_pbf_dir` does below. This used to warn and exit 0,
+        // which wrote building-less terrain under an identity that claims
+        // buildings — a cache hit forever, for every later run.
         if let Err(e) = apply_buildings(&job, &mut buffer, fgb, pixel_deg) {
-            println!("[Warn] Failed to apply buildings: {}", e);
+            anyhow::bail!(
+                "failed to apply buildings from buildings_file {:?} to {:?}: {:#}; \
+                 refusing to write a building-less tile",
+                fgb,
+                job.output_path,
+                e
+            );
         }
     }
     match (&job.buildings_pbf_dir, pbf_buildings) {
@@ -1241,19 +1358,34 @@ pub fn process_tile(
         }
     }
 
-    Ok(())
+    Ok(stats)
 }
 
+/// Burn a `buildings_file` — one `.fgb`, or a directory of them — into *buffer*.
+///
+/// Errors here are fatal to the tile. A source that cannot be opened, parsed or
+/// scanned used to be a warning and an exit 0, which handed the caller a
+/// building-*less* tile under an identity claiming buildings; the caller then
+/// cached it and every later run was a hit. Finding **no** buildings over this
+/// particular tile is not that: it is the ordinary fate of an edge tile, so it
+/// is reported and the terrain is written.
 fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_deg: f64) -> Result<()> {
     let mut files_to_process = Vec::new();
     if fgb_target.is_dir() {
-        if let Ok(entries) = fs::read_dir(fgb_target) {
-            for entry in entries.flatten() {
-                if entry.path().extension().map_or(false, |ext| ext == "fgb") {
-                    files_to_process.push(entry.path());
-                }
+        let entries = fs::read_dir(fgb_target)
+            .with_context(|| format!("buildings_file directory {:?} cannot be read", fgb_target))?;
+        for entry in entries.flatten() {
+            if entry.path().extension().map_or(false, |ext| ext == "fgb") {
+                files_to_process.push(entry.path());
             }
         }
+        if files_to_process.is_empty() {
+            anyhow::bail!("buildings_file directory {:?} holds no .fgb file", fgb_target);
+        }
+        // Directory order is not defined; sorting makes the reported counts
+        // reproducible run to run. The drawn surface never depended on it —
+        // `max` compositing is order-independent.
+        files_to_process.sort();
     } else {
         files_to_process.push(fgb_target.to_path_buf());
     }
@@ -1268,10 +1400,13 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
     let max_lat = job.ul_lat.max(lr_lat) + pad_deg;
 
     let mut all_buildings: Vec<Building> = Vec::new();
+    let mut features_seen = 0usize;
 
     for fgb_path in files_to_process {
-        let file = File::open(&fgb_path)?;
-        let fgb = FgbReader::open(BufReader::new(file))?;
+        let file = File::open(&fgb_path)
+            .with_context(|| format!("buildings_file {:?} cannot be opened", fgb_path))?;
+        let fgb = FgbReader::open(BufReader::new(file))
+            .with_context(|| format!("buildings_file {:?} is not a readable FlatGeobuf", fgb_path))?;
 
         if let Some(env) = fgb.header().envelope() {
             if env.get(0) > max_lon || env.get(2) < min_lon || env.get(1) > max_lat || env.get(3) < min_lat {
@@ -1279,18 +1414,51 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
             }
         }
 
-        let mut features = fgb.select_bbox(min_lon, min_lat, max_lon, max_lat)?;
+        // A FlatGeobuf writes the geometry type ONCE, in the header; a feature
+        // repeats it only in a mixed-type dataset, where the header says
+        // `Unknown`. Reading it off the feature alone — which this did — makes
+        // every feature of an ordinary single-type file look like `Unknown`
+        // and drops the lot. This is the resolution order the format's own
+        // reader uses (`flatgeobuf::geometry_reader::read_geometry`).
+        let header_type = fgb.header().geometry_type();
+
+        let mut features = fgb
+            .select_bbox(min_lon, min_lat, max_lon, max_lat)
+            .with_context(|| format!("buildings_file {:?} cannot be scanned", fgb_path))?;
         while let Some(feature) = features.next()? {
-            if let Some(geo) = feature.geometry() {
-                let g_type = geo.type_();
-                if g_type == GeometryType::MultiPolygon || g_type == GeometryType::Polygon {
-                    collect_fgb_buildings(&geo, &mut all_buildings);
-                }
+            let Some(geo) = feature.geometry() else { continue };
+            let g_type = match geo.type_() {
+                GeometryType::Unknown => header_type,
+                t => t,
+            };
+            if g_type != GeometryType::MultiPolygon && g_type != GeometryType::Polygon {
+                continue;
             }
+            features_seen += 1;
+
+            // Read every attribute column once, then walk the shared ladder
+            // over them. This is only consulted for a geometry with no Z —
+            // see `collect_fgb_buildings` — but resolving it here keeps it one
+            // property scan per feature rather than one per ring.
+            let props = feature.properties().unwrap_or_default();
+            let fallback = resolve_building_height(None, |key| {
+                props.get(key).map(String::as_str).and_then(parse_leading_metres)
+            });
+
+            collect_fgb_buildings(&geo, fallback, &mut all_buildings);
         }
     }
 
     if all_buildings.is_empty() {
+        // Not an error — an edge tile with no buildings over it is ordinary —
+        // but never again silent: this line is the only thing separating a
+        // burn that drew nothing from one that never ran.
+        println!(
+            "[Buildings] {}: {} polygon feature(s) in this tile's extent, \
+             no footprint to draw",
+            fgb_target.display(),
+            features_seen
+        );
         return Ok(());
     }
 
@@ -1306,6 +1474,25 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
     // keeping that keeps previously generated .abt tiles byte-identical.
     let opts = RasterOpts { rounding: Rounding::Truncate, ..Default::default() };
     let stats = rasterize_buildings(&mut grid, &tile, &all_buildings, &opts);
+
+    let measured = all_buildings.iter().filter(|b| b.source.is_measured()).count();
+    println!(
+        "[Buildings] {}: {} polygon feature(s) → {} footprint(s), {} with a height \
+         from the data ({} at the {} m default), {} drawn, {} px raised{}",
+        fgb_target.display(),
+        features_seen,
+        all_buildings.len(),
+        measured,
+        all_buildings.len() - measured,
+        DEFAULT_HEIGHT_M,
+        stats.buildings_hit,
+        stats.pixels_modified,
+        if stats.pixels_modified == 0 {
+            " — the surface is unchanged"
+        } else {
+            ""
+        },
+    );
 
     if stats.datum_suspect {
         eprintln!(
@@ -1369,30 +1556,49 @@ fn apply_buildings_pbf(
 
 /// Collect building rings from a FlatGeobuf geometry into the shared model.
 ///
-/// FlatGeobuf carries the roof as an absolute elevation in the geometry Z, so
-/// every ring becomes a [`BuildingHeight::Absolute`] at the geometry's maximum
-/// Z — which is what this path has always used.
-fn collect_fgb_buildings(geo: &flatgeobuf::Geometry, out: &mut Vec<Building>) {
+/// The roof comes off the geometry Z when there is one — an **absolute**
+/// elevation, which is what this path has always used and still the top rung
+/// of [`resolve_building_height`]. A 2D FlatGeobuf has no Z at all, and used to
+/// return here on its first line: every feature was dropped, the building list
+/// came back empty and the burn was a silent no-op. Such a geometry now falls
+/// back to *fallback* — the height the caller resolved from this feature's
+/// attribute columns, always **above ground** — so a 2D file with `height` or
+/// `levels` columns draws the buildings it has always described.
+///
+/// *fallback* is resolved once per feature, not per ring: a multi-polygon's
+/// parts are one building's outline and share its attributes. Each part still
+/// takes its own Z, exactly as before.
+fn collect_fgb_buildings(
+    geo: &flatgeobuf::Geometry,
+    fallback: (BuildingHeight, HeightSource),
+    out: &mut Vec<Building>,
+) {
     if let Some(parts) = geo.parts() {
         if parts.len() > 0 {
             for i in 0..parts.len() {
-                collect_fgb_buildings(&parts.get(i), out);
+                collect_fgb_buildings(&parts.get(i), fallback, out);
             }
             return;
         }
     }
 
     let xy = match geo.xy() { Some(v) => v, None => return };
-    let z_vals = match geo.z() { Some(v) => v, None => return };
 
-    let mut max_z: f64 = -1000.0;
-    for z in z_vals {
-        if z > max_z { max_z = z; }
-    }
-
-    // Preserved from the original write loop: a roof that lands below zero in
-    // half-metre units is dropped rather than drawn.
-    if (max_z * 2.0).trunc() < 0.0 { return; }
+    let (height, source) = match geo.z() {
+        Some(z_vals) => {
+            let mut max_z: f64 = -1000.0;
+            for z in z_vals {
+                if z > max_z { max_z = z; }
+            }
+            // Preserved from the original write loop: a roof that lands below
+            // zero in half-metre units is dropped rather than drawn. This is a
+            // property of an *absolute* roof only — an above-ground height is
+            // screened by the rasterizer instead, against real terrain.
+            if (max_z * 2.0).trunc() < 0.0 { return; }
+            (BuildingHeight::Absolute(max_z), HeightSource::AbsoluteZ)
+        }
+        None => fallback,
+    };
 
     let mut push_ring = |stop_idx: usize, start_idx: usize, out: &mut Vec<Building>| {
         let count = (stop_idx - start_idx) / 2;
@@ -1403,18 +1609,19 @@ fn collect_fgb_buildings(geo: &flatgeobuf::Geometry, out: &mut Vec<Building>) {
             coords.push((xy.get(i), xy.get(i + 1)));
             i += 2;
         }
-        out.push(Building {
-            coords,
-            height: BuildingHeight::Absolute(max_z),
-            source: HeightSource::AbsoluteZ,
-        });
+        out.push(Building { coords, height, source });
     };
 
+    // `ends` counts POINTS, not `xy` slots — the format's own reader shifts
+    // each entry left by one to index `xy` (`geometry_reader::read_polygon`).
+    // Taking them as `xy` offsets, as this did, read the first half of each
+    // ring and closed the footprint through the middle of the building.
     if let Some(ends_vec) = geo.ends() {
         let mut start = 0;
         for end in ends_vec {
-            push_ring(end as usize, start, out);
-            start = end as usize;
+            let stop = (end as usize) * 2;
+            push_ring(stop, start, out);
+            start = stop;
         }
     } else {
         push_ring(xy.len(), 0, out);

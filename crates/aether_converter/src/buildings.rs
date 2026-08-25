@@ -34,6 +34,20 @@ pub enum BuildingHeight {
     AboveGround(f64),
 }
 
+impl BuildingHeight {
+    /// The metre value, whatever its datum.
+    ///
+    /// For a caller that already knows which variant it asked for — the datum
+    /// is the whole point of the enum, so do not use this to compare two
+    /// heights of different provenance.
+    #[inline]
+    pub fn metres(self) -> f64 {
+        match self {
+            BuildingHeight::Absolute(v) | BuildingHeight::AboveGround(v) => v,
+        }
+    }
+}
+
 /// Which rung of the height ladder a value came from.
 ///
 /// Carried through so callers can report confidence instead of presenting a
@@ -48,6 +62,122 @@ pub enum HeightSource {
     Levels,
     /// Nothing usable was found; a configured default was applied.
     Default,
+}
+
+impl HeightSource {
+    /// True when the value came off the data rather than out of the default.
+    #[inline]
+    pub fn is_measured(self) -> bool {
+        self != HeightSource::Default
+    }
+}
+
+// ── The height ladder, shared by every building source ────────────────────
+
+/// Attribute names carrying an explicit height in **metres above ground**,
+/// in the order the ladder tries them.
+///
+/// `height` is the OSM spelling, `render_height` the one Planetiler-derived
+/// vector tiles use, `building:height` a common variant. All three mean the
+/// same thing: metres from the ground to the top of the building — never an
+/// elevation above sea level.
+pub const HEIGHT_ATTRS: [&str; 3] = ["height", "render_height", "building:height"];
+
+/// Attribute names carrying a storey count, in the order the ladder tries them.
+pub const LEVEL_ATTRS: [&str; 3] = ["levels", "building:levels", "building_levels"];
+
+/// Metres of height one storey contributes.
+pub const METRES_PER_LEVEL: f64 = 3.0;
+
+/// Height applied when no rung of the ladder yielded anything usable.
+pub const DEFAULT_HEIGHT_M: f64 = 6.0;
+
+/// The leading float of an attribute value, if it has one.
+///
+/// Attribute heights arrive as free text far more often than as numbers —
+/// `"12"`, `"12.5"`, `"12 m"` all occur in OSM — so the parse stops at the
+/// first character that cannot continue a decimal number instead of demanding
+/// the whole string be one. Anything with no leading digits (`""`, `"tall"`,
+/// `"~"`) and anything non-finite is rejected; the sign is kept so a negative
+/// value can be rejected by the caller rather than silently becoming positive.
+pub fn parse_leading_metres(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    let bytes = s.as_bytes();
+    let mut end = 0usize;
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    while end < bytes.len() {
+        match bytes[end] {
+            b'0'..=b'9' => seen_digit = true,
+            b'.' if !seen_dot => seen_dot = true,
+            b'+' | b'-' if end == 0 => {}
+            _ => break,
+        }
+        end += 1;
+    }
+    if !seen_digit {
+        return None;
+    }
+    let v: f64 = s[..end].parse().ok()?;
+    v.is_finite().then_some(v)
+}
+
+/// Resolve one building's height, from whatever the source could supply.
+///
+/// This is the **single** height ladder. Every source funnels into it so that
+/// a FlatGeobuf and a vector tile carrying the same building end up at the
+/// same roof, and so there is one place to read when the answer surprises
+/// someone. In order:
+///
+/// 1. `absolute_z` — a roof elevation read from the geometry Z, metres above
+///    mean sea level. The only rung that is *absolute*; when a source has it,
+///    it is surveyed truth and nothing below can improve on it.
+/// 2. An explicit height attribute ([`HEIGHT_ATTRS`]), **metres above ground**.
+/// 3. A storey count ([`LEVEL_ATTRS`]) × [`METRES_PER_LEVEL`], above ground.
+/// 4. [`DEFAULT_HEIGHT_M`] above ground.
+///
+/// # Attribute heights are never absolute
+///
+/// Rungs 2–4 are above-ground by definition and are returned as
+/// [`BuildingHeight::AboveGround`] so [`rasterize_buildings`] resolves them
+/// against the terrain under the footprint. Treating them as absolute would
+/// put a 12 m building 528 m below the ground it stands on in Bern, and every
+/// such building would then be dropped as being under the surface — silently,
+/// because a roof below the terrain simply loses the `max`.
+///
+/// *lookup* returns the numeric value of an attribute, already parsed out of
+/// whatever the container stores (a FlatGeobuf column, an MVT tag). A value it
+/// returns is used only if it is finite and strictly positive; otherwise the
+/// ladder moves on to the next rung.
+pub fn resolve_building_height<F>(
+    absolute_z: Option<f64>,
+    mut lookup: F,
+) -> (BuildingHeight, HeightSource)
+where
+    F: FnMut(&str) -> Option<f64>,
+{
+    if let Some(z) = absolute_z {
+        return (BuildingHeight::Absolute(z), HeightSource::AbsoluteZ);
+    }
+    let usable = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+
+    for key in HEIGHT_ATTRS {
+        if let Some(m) = usable(lookup(key)) {
+            return (BuildingHeight::AboveGround(m), HeightSource::ExplicitHeight);
+        }
+    }
+    for key in LEVEL_ATTRS {
+        if let Some(n) = usable(lookup(key)) {
+            return (
+                BuildingHeight::AboveGround(n * METRES_PER_LEVEL),
+                HeightSource::Levels,
+            );
+        }
+    }
+    (
+        BuildingHeight::AboveGround(DEFAULT_HEIGHT_M),
+        HeightSource::Default,
+    )
 }
 
 /// One building footprint ring in WGS84, with its height.
@@ -988,6 +1118,173 @@ pub(crate) mod tests {
             per_tile[0].iter().any(|&v| v != 200),
             "the fixture must actually draw a building, or this proves nothing"
         );
+    }
+
+    // ── The shared height ladder ────────────────────────────────────────────
+
+    /// The ladder over a fixed attribute table, as both call sites see it.
+    fn ladder(z: Option<f64>, attrs: &[(&str, &str)]) -> (BuildingHeight, HeightSource) {
+        resolve_building_height(z, |key| {
+            attrs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| parse_leading_metres(v))
+        })
+    }
+
+    #[test]
+    fn a_leading_float_is_parsed_out_of_whatever_the_attribute_says() {
+        assert_eq!(parse_leading_metres("12"), Some(12.0));
+        assert_eq!(parse_leading_metres("12.5"), Some(12.5));
+        assert_eq!(parse_leading_metres("12 m"), Some(12.0));
+        assert_eq!(parse_leading_metres(" 12.5m "), Some(12.5));
+        assert_eq!(parse_leading_metres("3.5"), Some(3.5));
+        // The sign survives the parse so the ladder can reject it, rather than
+        // "-2" silently becoming a two-storey building.
+        assert_eq!(parse_leading_metres("-2"), Some(-2.0));
+        assert_eq!(parse_leading_metres(""), None);
+        assert_eq!(parse_leading_metres("tall"), None);
+        assert_eq!(parse_leading_metres("."), None);
+        assert_eq!(parse_leading_metres("~"), None);
+    }
+
+    #[test]
+    fn geometry_z_is_the_top_rung_and_is_absolute() {
+        // Nothing below Z can improve on it, and its datum is sea level — the
+        // one rung the rasterizer must NOT add to the terrain.
+        let (h, src) = ladder(Some(560.0), &[("height", "12"), ("levels", "40")]);
+        assert_eq!(h, BuildingHeight::Absolute(560.0));
+        assert_eq!(src, HeightSource::AbsoluteZ);
+    }
+
+    #[test]
+    fn every_rung_below_z_is_above_ground() {
+        // The distinction is the whole point: a 12 m *absolute* roof on Bern's
+        // 540 m terrain is underground, and every such building would be
+        // dropped by the `max` composite without a word.
+        for attrs in [
+            vec![("height", "12")],
+            vec![("render_height", "12")],
+            vec![("building:height", "12")],
+            vec![("levels", "4")],
+            vec![("building:levels", "4")],
+            vec![("building_levels", "4")],
+            vec![],
+        ] {
+            let (h, _) = ladder(None, &attrs);
+            assert!(
+                matches!(h, BuildingHeight::AboveGround(_)),
+                "{attrs:?} must be above-ground, got {h:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ladder_is_tried_in_order() {
+        // A measured height outranks a storey count outranks a guess, whatever
+        // order the attributes happen to sit in on the feature.
+        assert_eq!(
+            ladder(None, &[("levels", "20"), ("height", "9")]),
+            (BuildingHeight::AboveGround(9.0), HeightSource::ExplicitHeight)
+        );
+        assert_eq!(
+            ladder(None, &[("height", "9"), ("render_height", "30")]),
+            (BuildingHeight::AboveGround(9.0), HeightSource::ExplicitHeight)
+        );
+        assert_eq!(
+            ladder(None, &[("building:levels", "4")]),
+            (BuildingHeight::AboveGround(12.0), HeightSource::Levels)
+        );
+        assert_eq!(
+            ladder(None, &[]),
+            (BuildingHeight::AboveGround(DEFAULT_HEIGHT_M), HeightSource::Default)
+        );
+    }
+
+    #[test]
+    fn a_non_positive_or_unparseable_value_falls_to_the_next_rung() {
+        // Not to zero, and not to a dropped building: an unusable value on one
+        // rung says nothing about the next one.
+        assert_eq!(
+            ladder(None, &[("height", "0"), ("levels", "3")]),
+            (BuildingHeight::AboveGround(9.0), HeightSource::Levels)
+        );
+        assert_eq!(
+            ladder(None, &[("height", "-4"), ("levels", "3")]),
+            (BuildingHeight::AboveGround(9.0), HeightSource::Levels)
+        );
+        assert_eq!(
+            ladder(None, &[("height", "tall")]),
+            (BuildingHeight::AboveGround(DEFAULT_HEIGHT_M), HeightSource::Default)
+        );
+        assert_eq!(
+            ladder(None, &[("height", ""), ("levels", "")]),
+            (BuildingHeight::AboveGround(DEFAULT_HEIGHT_M), HeightSource::Default)
+        );
+    }
+
+    #[test]
+    fn only_the_default_rung_is_unmeasured() {
+        assert!(!HeightSource::Default.is_measured());
+        for s in [HeightSource::AbsoluteZ, HeightSource::ExplicitHeight, HeightSource::Levels] {
+            assert!(s.is_measured(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_vector_tile_reads_the_same_ladder_as_a_flatgeobuf() {
+        // `HeightSource::ExplicitHeight` has always documented `height` as one
+        // of the names it covers, while the vector-tile path only ever looked
+        // at `render_height`. Both now walk the one ladder, so a tile keyed
+        // `height` resolves exactly as the same attribute would off a
+        // FlatGeobuf column — including a string value with a unit suffix.
+        use crate::mvt::{extract_buildings_from_pbf, Feature, Layer, Tile, Value};
+        use prost::Message;
+
+        let tile_with = |key: &str, value: Value| {
+            let geometry = vec![
+                (1 << 3) | 1, zz(100), zz(100),
+                (3 << 3) | 2, zz(400), zz(0), zz(0), zz(400), zz(-400), zz(0),
+                (1 << 3) | 7,
+            ];
+            Tile {
+                layers: vec![Layer {
+                    name: "building".into(),
+                    features: vec![Feature {
+                        id: Some(1),
+                        tags: vec![0, 0],
+                        r#type: Some(3),
+                        geometry,
+                    }],
+                    keys: vec![key.into()],
+                    values: vec![value],
+                    extent: Some(4096),
+                    version: Some(2),
+                }],
+            }
+            .encode_to_vec()
+        };
+
+        let height_of = |bytes: Vec<u8>| {
+            let (b, _) = extract_buildings_from_pbf(&bytes, 8531, 5752, 14).unwrap();
+            (b[0].height_m, b[0].source)
+        };
+
+        let string_val = |s: &str| Value { string_val: Some(s.into()), ..Default::default() };
+        let double_val = |v: f64| Value { double_val: Some(v), ..Default::default() };
+
+        assert_eq!(height_of(tile_with("height", double_val(12.0))),
+                   (12.0, HeightSource::ExplicitHeight));
+        assert_eq!(height_of(tile_with("height", string_val("12.5 m"))),
+                   (12.5, HeightSource::ExplicitHeight));
+        assert_eq!(height_of(tile_with("render_height", double_val(12.0))),
+                   (12.0, HeightSource::ExplicitHeight));
+        assert_eq!(height_of(tile_with("building:levels", string_val("4"))),
+                   (12.0, HeightSource::Levels));
+        assert_eq!(height_of(tile_with("levels", string_val("4"))),
+                   (12.0, HeightSource::Levels));
+        assert_eq!(height_of(tile_with("colour", string_val("red"))),
+                   (DEFAULT_HEIGHT_M, HeightSource::Default));
     }
 
     #[test]

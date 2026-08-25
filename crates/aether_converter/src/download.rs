@@ -389,6 +389,28 @@ impl DownloadStats {
         self.ok_count.load(Ordering::Relaxed) + self.total_errors()
     }
 
+    /// The per-class error tally, e.g. `"decode=1369"` or `"timeout=4, HTTP_4xx=2"`.
+    ///
+    /// Rendered both by the `[Stats] ERRORS` line and by the fatal
+    /// `Tile download failed:` bail, so a caller that only sees the failure
+    /// message still learns *which* failure it was: a source serving WebP
+    /// (`decode=N`) is a different repair from an unreachable one (`connect=N`).
+    /// Only non-zero classes appear; `"none"` if there are no errors at all.
+    fn error_breakdown(&self) -> String {
+        let mut parts = Vec::new();
+        let mut push = |label: &str, n: usize| {
+            if n > 0 { parts.push(format!("{}={}", label, n)); }
+        };
+        push("timeout", self.err_timeout.load(Ordering::Relaxed));
+        push("connect", self.err_connect.load(Ordering::Relaxed));
+        push("HTTP_429_rate_limited", self.err_http_429.load(Ordering::Relaxed));
+        push("HTTP_4xx", self.err_http_4xx.load(Ordering::Relaxed));
+        push("HTTP_5xx", self.err_http_5xx.load(Ordering::Relaxed));
+        push("decode", self.err_decode.load(Ordering::Relaxed));
+        push("other", self.err_other.load(Ordering::Relaxed));
+        if parts.is_empty() { "none".to_string() } else { parts.join(", ") }
+    }
+
     fn log_summary(&self, elapsed: f64) {
         let ok = self.ok_count.load(Ordering::Relaxed);
         let total = self.total_tiles();
@@ -418,22 +440,12 @@ impl DownloadStats {
 
         let errs = self.total_errors();
         if errs > 0 {
-            let mut parts = Vec::new();
+            eprintln!("[Stats] ERRORS ({}): {}", errs, self.error_breakdown());
+
+            // The hints below need three of the counts back.
             let t = self.err_timeout.load(Ordering::Relaxed);
             let c = self.err_connect.load(Ordering::Relaxed);
             let r429 = self.err_http_429.load(Ordering::Relaxed);
-            let r4xx = self.err_http_4xx.load(Ordering::Relaxed);
-            let r5xx = self.err_http_5xx.load(Ordering::Relaxed);
-            let d = self.err_decode.load(Ordering::Relaxed);
-            let o = self.err_other.load(Ordering::Relaxed);
-            if t > 0 { parts.push(format!("timeout={}", t)); }
-            if c > 0 { parts.push(format!("connect={}", c)); }
-            if r429 > 0 { parts.push(format!("HTTP_429_rate_limited={}", r429)); }
-            if r4xx > 0 { parts.push(format!("HTTP_4xx={}", r4xx)); }
-            if r5xx > 0 { parts.push(format!("HTTP_5xx={}", r5xx)); }
-            if d > 0 { parts.push(format!("decode={}", d)); }
-            if o > 0 { parts.push(format!("other={}", o)); }
-            eprintln!("[Stats] ERRORS ({}): {}", errs, parts.join(", "));
 
             if r429 > 0 {
                 eprintln!("[Stats] >>> Server rate-limiting detected (HTTP 429). Reduce download connections.");
@@ -1213,6 +1225,54 @@ fn fetch_failure_is_fatal(failed: usize, attempted: usize) -> bool {
     attempted > 0 && failed * 2 > attempted
 }
 
+/// Removes the `.abt` files a run created, unless it reached [`AbtCleanup::keep`].
+///
+/// Every output file is created with a valid header *before* the first tile is
+/// fetched and is sized to full length once assembly ends, while tiles that
+/// never arrived stay 0 m — so a run that bails out afterwards leaves a
+/// complete, plausible-looking `.abt` of sea-level terrain behind. Callers pool
+/// tiles by filename, so that file is a cache hit for every later run: one
+/// refusal poisons the pool with flat ocean. A failed download must therefore
+/// leave nothing reusable behind.
+///
+/// It is a drop guard rather than a cleanup call at the fatal branch because
+/// that branch is not the only way out: the tile-assembly `h.await??`, the
+/// buildings post-pass and every other `?` between file creation and the end of
+/// the run exit with the same half-written files on disk.
+#[cfg(feature = "native")]
+#[derive(Default)]
+struct AbtCleanup {
+    paths: Vec<PathBuf>,
+}
+
+#[cfg(feature = "native")]
+impl AbtCleanup {
+    /// Register a file as provisional. Called before it is created, so a file
+    /// that only half-exists (created, then the header write failed) also goes.
+    fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    /// The run succeeded — the files are real output now, so keep them.
+    fn keep(mut self) {
+        self.paths.clear();
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for AbtCleanup {
+    fn drop(&mut self) {
+        let removed = self.paths.iter().filter(|p| fs::remove_file(p).is_ok()).count();
+        if removed > 0 {
+            eprintln!(
+                "[Download] Removed {} incomplete .abt file(s) — a failed download \
+                 leaves nothing reusable behind; the next run must fetch again.",
+                removed
+            );
+        }
+    }
+}
+
 #[cfg(feature = "native")]
 async fn run_download_async(job: DownloadJob) -> Result<()> {
     let start = Instant::now();
@@ -1292,12 +1352,17 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         .build()?;
 
     // 4. Prepare .abt files (write headers, then close — assembly reopens per-strip).
+    //    Everything created from here on is provisional: until `cleanup.keep()`
+    //    at the end of a successful run, any exit removes these files again
+    //    rather than leaving flat 0 m tiles for the next run to pool as a hit.
     fs::create_dir_all(&job.output_dir)?;
+    let mut cleanup = AbtCleanup::default();
     let abt_specs: Vec<(SubTileSpec, PathBuf)> = {
         let mut specs = Vec::new();
         for spec in &job.tiles {
             let pd = spec.resolution_m / 111_111.0;
             let path = job.output_dir.join(&spec.filename);
+            cleanup.track(path.clone());
             let writer = AbtWriter::create(&path, spec.size_px, spec.ul_lat, spec.ul_lon, pd)?;
             writer.finish()?;
             specs.push((spec.clone(), path));
@@ -1594,18 +1659,22 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     // never arrived is never copied into the just-`fill(0.0)`-ed mini-grid, so
     // it is written out as 0 m — flat terrain at sea level, indistinguishable
     // downstream from real data. Report it as the failure it is instead of
-    // exiting 0 with an ocean-flat .abt.
+    // exiting 0 with an ocean-flat .abt, and name the error class: "could not
+    // be fetched" alone reads as a network fault even when the real cause is a
+    // source serving WebP to a PNG decoder. `cleanup` takes the files with it.
     let failed = stats.total_errors();
     let attempted = stats.total_tiles();
     if fetch_failure_is_fatal(failed, attempted) {
         stats.log_summary(start.elapsed().as_secs_f64());
         anyhow::bail!(
             "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
-             the output would be mostly flat 0 m, not terrain. Check that the tile \
-             source serves zoom {} over this area and that the network is reachable.",
+             the output would be mostly flat 0 m, not terrain. Errors: {}. Check that \
+             the tile source serves zoom {} over this area and that the network is \
+             reachable.",
             failed,
             attempted,
             failed * 100 / attempted.max(1),
+            stats.error_breakdown(),
             job.zoom
         );
     }
@@ -1617,6 +1686,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     let elapsed = start.elapsed().as_secs_f64();
     stats.log_summary(elapsed);
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
+    cleanup.keep();
     Ok(())
 }
 
@@ -2309,6 +2379,51 @@ mod tests {
         assert!(fetch_failure_is_fatal(1369, 1369));
         assert!(fetch_failure_is_fatal(1000, 1369));
         assert!(fetch_failure_is_fatal(1, 1), "a one-tile job that fetched nothing");
+    }
+
+    #[test]
+    fn the_error_breakdown_names_only_the_classes_that_occurred() {
+        let s = DownloadStats::new();
+        assert_eq!(s.error_breakdown(), "none");
+
+        // The MapTiler Terrain-RGB v2 case: WebP into a PNG decoder. Reported
+        // as a decode fault, never as a network one.
+        s.err_decode.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(s.error_breakdown(), "decode=3");
+
+        s.err_connect.fetch_add(1, Ordering::Relaxed);
+        s.err_http_4xx.fetch_add(2, Ordering::Relaxed);
+        assert_eq!(s.error_breakdown(), "connect=1, HTTP_4xx=2, decode=3");
+    }
+
+    // ── Failed-run cleanup ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_cleanup_guard_removes_what_a_failed_run_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.abt"), dir.path().join("b.abt"));
+        for p in [&a, &b] { fs::write(p, b"AETH").unwrap(); }
+
+        {
+            let mut g = AbtCleanup::default();
+            g.track(a.clone());
+            g.track(b.clone());
+        } // dropped without keep(): every exit path, not just the fatal branch
+
+        assert!(!a.exists() && !b.exists(), "a refused run must cache nothing reusable");
+    }
+
+    #[test]
+    fn the_cleanup_guard_leaves_a_successful_run_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.abt");
+        fs::write(&a, b"AETH").unwrap();
+
+        let mut g = AbtCleanup::default();
+        g.track(a.clone());
+        g.keep();
+
+        assert!(a.exists(), "a run that reached keep() owns its output");
     }
 
     #[test]

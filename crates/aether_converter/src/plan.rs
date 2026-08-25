@@ -117,7 +117,34 @@ pub fn build_plan(
         bail!("--south ({south}) must be strictly less than --north ({north})");
     }
     if west >= east {
-        bail!("--west ({west}) must be strictly less than --east ({east})");
+        // west > east is how a bbox that wraps the antimeridian arrives from a
+        // map canvas. Say so: "make --west smaller" is not the fix, and the
+        // grid below has no wrapping in it to fall back on.
+        let wrap = if west > 0.0 && east < 0.0 {
+            " — a bbox wrapping the antimeridian is not supported; split it at \
+             ±180 and plan each half separately"
+        } else {
+            ""
+        };
+        bail!("--west ({west}) must be strictly less than --east ({east}){wrap}");
+    }
+    // The grid is plain WGS84 degrees and wraps nowhere: a bbox reaching past
+    // ±180 / ±90 would be enumerated as if 180.4 were a real longitude, and
+    // the run would write tiles for ground that does not exist. Refuse it here
+    // — the plugin aborts on any `plan` failure, so this is the loud failure
+    // the antimeridian case needs.
+    if west < -180.0 || east > 180.0 {
+        bail!(
+            "longitude out of range: --west ({west}) and --east ({east}) must lie \
+             within [-180, 180] — a bbox crossing the antimeridian is not supported; \
+             split it at ±180 and plan each half separately"
+        );
+    }
+    if south < -90.0 || north > 90.0 {
+        bail!(
+            "latitude out of range: --south ({south}) and --north ({north}) must lie \
+             within [-90, 90]"
+        );
     }
     if resolutions.is_empty() {
         bail!("--resolutions must list at least one integer resolution in metres, e.g. 30,90");

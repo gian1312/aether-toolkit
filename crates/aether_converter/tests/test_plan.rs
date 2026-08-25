@@ -135,6 +135,24 @@ fn empty_or_zero_resolutions_are_refused() {
 }
 
 #[test]
+fn a_bbox_outside_the_globe_is_refused() {
+    // The Fiji torture case: 179.6 -> 180.4 straddles the antimeridian. The
+    // grid wraps nowhere, so planning it would enumerate tiles for ground that
+    // does not exist. It has to fail loudly instead.
+    let err = build_plan(-18.3, -17.9, 179.6, 180.4, &[30]).unwrap_err().to_string();
+    assert!(err.contains("antimeridian") && err.contains("180"), "got {err:?}");
+    let err = build_plan(-18.3, -17.9, -180.4, -179.6, &[30]).unwrap_err().to_string();
+    assert!(err.contains("longitude out of range"), "got {err:?}");
+    let err = build_plan(-90.5, -89.9, 8.1, 8.4, &[30]).unwrap_err().to_string();
+    assert!(err.contains("latitude out of range"), "got {err:?}");
+    // The other spelling of the same wrap: west east of east.
+    let err = build_plan(-18.3, -17.9, 179.6, -179.6, &[30]).unwrap_err().to_string();
+    assert!(err.contains("antimeridian"), "got {err:?}");
+    // ...and the exact domain limits stay legal.
+    assert!(build_plan(-90.0, 90.0, -180.0, 180.0, &[250]).is_ok());
+}
+
+#[test]
 fn an_absurd_bbox_fails_as_too_large_instead_of_hanging() {
     // The whole globe at 2 m: ~ (180/0.1)*(360/0.1) = 6.48M tiles > 2M.
     let err = build_plan(-90.0, 90.0, -180.0, 180.0, &[2]).unwrap_err().to_string();

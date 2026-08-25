@@ -7,7 +7,9 @@
 use anyhow::{anyhow, Result};
 use prost::Message;
 
-use crate::buildings::{Building, BuildingHeight, HeightSource};
+use crate::buildings::{
+    parse_leading_metres, resolve_building_height, Building, BuildingHeight, HeightSource,
+};
 
 // ── Protobuf message definitions (MVT spec v2.1) ──────────────
 
@@ -220,16 +222,15 @@ fn zigzag(n: u32) -> i32 {
 
 // ── Building extraction ────────────────────────────────────────
 
-const DEFAULT_HEIGHT: f64 = 6.0;
-
-fn resolve_height(feature: &Feature, layer: &Layer) -> f64 {
-    resolve_height_detailed(feature, layer).0
-}
-
-/// Returns (height_m, source). The ladder is: an explicit `render_height`, then
-/// a storey count via `building:levels`, then [`DEFAULT_HEIGHT`]. The source is
-/// carried out so callers can report how much of a result was guessed.
-fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, HeightSource) {
+/// The numeric value of the tag named *key* on *feature*, whatever protobuf
+/// wire type it arrived in.
+///
+/// A string value goes through [`parse_leading_metres`], so `"12 m"` reads the
+/// same off an MVT tag as it does off a FlatGeobuf attribute column. The sign
+/// is preserved: rejecting non-positive values is the ladder's job, not this
+/// function's, so that a `render_height` of `0` falls through to the next rung
+/// instead of being mistaken for an absent tag.
+fn tag_number(feature: &Feature, layer: &Layer, key: &str) -> Option<f64> {
     let mut i = 0;
     while i + 1 < feature.tags.len() {
         let key_idx = feature.tags[i] as usize;
@@ -237,26 +238,36 @@ fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, HeightSour
         i += 2;
 
         if key_idx >= layer.keys.len() || val_idx >= layer.values.len() { continue; }
-        let key = &layer.keys[key_idx];
-        let val = &layer.values[val_idx];
+        if layer.keys[key_idx] != key { continue; }
 
-        if key == "render_height" {
-            if let Some(v) = val.float_val { if v > 0.0 { return (v as f64, HeightSource::ExplicitHeight); } }
-            if let Some(v) = val.double_val { if v > 0.0 { return (v, HeightSource::ExplicitHeight); } }
-            if let Some(v) = val.int_val { if v > 0 { return (v as f64, HeightSource::ExplicitHeight); } }
-            if let Some(v) = val.uint_val { if v > 0 { return (v as f64, HeightSource::ExplicitHeight); } }
-            if let Some(v) = val.sint_val { if v > 0 { return (v as f64, HeightSource::ExplicitHeight); } }
-        }
-        if key == "building:levels" {
-            if let Some(v) = val.int_val { if v > 0 { return (v as f64 * 3.0, HeightSource::Levels); } }
-            if let Some(v) = val.uint_val { if v > 0 { return (v as f64 * 3.0, HeightSource::Levels); } }
-            if let Some(v) = val.sint_val { if v > 0 { return (v as f64 * 3.0, HeightSource::Levels); } }
-            if let Some(ref s) = val.string_val {
-                if let Ok(n) = s.parse::<f64>() { if n > 0.0 { return (n * 3.0, HeightSource::Levels); } }
-            }
+        let val = &layer.values[val_idx];
+        let n = val
+            .float_val
+            .map(f64::from)
+            .or(val.double_val)
+            .or(val.int_val.map(|v| v as f64))
+            .or(val.uint_val.map(|v| v as f64))
+            .or(val.sint_val.map(|v| v as f64))
+            .or_else(|| val.string_val.as_deref().and_then(parse_leading_metres));
+        if n.is_some() {
+            return n;
         }
     }
-    (DEFAULT_HEIGHT, HeightSource::Default)
+    None
+}
+
+/// This feature's height above ground, and which rung of the ladder it is from.
+///
+/// The ladder itself lives in [`crate::buildings::resolve_building_height`] and
+/// is shared with the FlatGeobuf reader; all this does is tell it how to read a
+/// tag off an MVT feature. Vector tiles carry no geometry Z, so the top rung
+/// (an absolute roof) never applies here — every value out of this is metres
+/// **above ground**, which is why [`BuildingPolygon::to_building`] can wrap it
+/// in [`BuildingHeight::AboveGround`] unconditionally.
+fn resolve_height_detailed(feature: &Feature, layer: &Layer) -> (f64, HeightSource) {
+    let (height, source) =
+        resolve_building_height(None, |key| tag_number(feature, layer, key));
+    (height.metres(), source)
 }
 
 /// Count building features using raw protobuf wire parsing (no prost).

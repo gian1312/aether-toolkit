@@ -16,6 +16,8 @@ use aether_converter::ingest::{process_tile_with_cache, IngestJob, VOID_ELEV};
 enum Samples {
     I16(Vec<i16>),
     F32(Vec<f32>),
+    U16(Vec<u16>),
+    F64(Vec<f64>),
 }
 
 struct TiffSpec<'a> {
@@ -47,6 +49,14 @@ fn write_geotiff(path: &Path, spec: &TiffSpec) {
         Samples::F32(v) => {
             assert_eq!(v.len(), (spec.w * spec.h) as usize);
             (32, 3, v.iter().flat_map(|x| x.to_le_bytes()).collect())
+        }
+        Samples::U16(v) => {
+            assert_eq!(v.len(), (spec.w * spec.h) as usize);
+            (16, 1, v.iter().flat_map(|x| x.to_le_bytes()).collect())
+        }
+        Samples::F64(v) => {
+            assert_eq!(v.len(), (spec.w * spec.h) as usize);
+            (64, 3, v.iter().flat_map(|x| x.to_le_bytes()).collect())
         }
     };
 
@@ -763,4 +773,140 @@ fn a_missing_source_file_is_fatal_not_a_warning() {
     job["sources"] = serde_json::json!([{"path": dir.path().join("nope.tif")}]);
     let err = format!("{:?}", run_job(job).unwrap_err());
     assert!(err.contains("nope.tif"), "must name the file: {err:?}");
+}
+
+// ── Coverage: a run that produced no terrain must not exit 0 ──────────────
+//
+// The library call keeps writing the tile — a partially covered tile is
+// normal, and `void_fill_m` is a legitimate way to ask for 0 m outside the
+// data. The refusal is the CLI's, over the WHOLE run, because that is the only
+// level at which "no source reached anything" is unambiguous. These tests
+// therefore drive the binary, not `process_tile_with_cache`.
+
+/// A 4x4 source of flat 55 m ground at *(lon, lat)*, one arc-second per pixel.
+fn ground_at(dir: &Path, name: &str, lon: f64, lat: f64) -> PathBuf {
+    let p = dir.join(name);
+    write_geotiff(
+        &p,
+        &TiffSpec {
+            w: 4,
+            h: 4,
+            geotransform: Some((lon, lat, 0.001)),
+            geokey: Some((2048, 4326)),
+            nodata: None,
+            samples: Samples::I16(vec![55; 16]),
+        },
+    );
+    p
+}
+
+/// Run the real CLI over *json*; `(exit ok, stdout + stderr)`.
+fn run_cli(dir: &Path, json: serde_json::Value) -> (bool, String) {
+    let job_file = dir.join("job.json");
+    std::fs::write(&job_file, serde_json::to_vec(&json).unwrap()).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_aether_converter"))
+        .args(["ingest", "--job-file"])
+        .arg(&job_file)
+        .output()
+        .unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), said)
+}
+
+#[test]
+fn a_tile_no_source_covered_is_refused_instead_of_exiting_0() {
+    let dir = tempfile::tempdir().unwrap();
+    // Ground in the Pacific; the tile is over Bern.
+    let far = ground_at(dir.path(), "far.tif", -150.0, 20.0);
+    let mut job = straddle_json(dir.path(), "void.abt");
+    job["sources"] = serde_json::json!([{"path": far}]);
+    let (ok, said) = run_cli(dir.path(), job);
+    assert!(!ok, "an all-void tile must not exit 0: {said}");
+    assert!(said.contains("void.abt"), "must name the tile: {said}");
+    assert!(said.to_lowercase().contains("void"), "must say why: {said}");
+}
+
+#[test]
+fn void_fill_does_not_disguise_a_tile_no_source_covered() {
+    // The evidence is destroyed on the way to disk — with void_fill_m every
+    // pixel is a plausible 0 m — so coverage is counted before the fill.
+    let dir = tempfile::tempdir().unwrap();
+    let far = ground_at(dir.path(), "far.tif", -150.0, 20.0);
+    let mut job = straddle_json(dir.path(), "filled.abt");
+    job["sources"] = serde_json::json!([{"path": far}]);
+    job["void_fill_m"] = serde_json::json!(0.0);
+    let (ok, said) = run_cli(dir.path(), job);
+    assert!(!ok, "a filled all-void tile must not exit 0 either: {said}");
+}
+
+#[test]
+fn a_tile_the_source_does_cover_still_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let near = ground_at(dir.path(), "near.tif", 7.4177, 46.9995);
+    let mut job = straddle_json(dir.path(), "real.abt");
+    job["sources"] = serde_json::json!([{"path": near}]);
+    let (ok, said) = run_cli(dir.path(), job);
+    assert!(ok, "a covered tile must convert: {said}");
+}
+
+#[test]
+fn a_batch_keeps_its_uncovered_edge_tiles() {
+    // The refusal is run-wide on purpose: the edge tiles of any area fall
+    // outside the sources, and failing per tile would refuse ordinary runs.
+    let dir = tempfile::tempdir().unwrap();
+    let near = ground_at(dir.path(), "near.tif", 7.4177, 46.9995);
+    let mut covered = straddle_json(dir.path(), "covered.abt");
+    covered["sources"] = serde_json::json!([{"path": near}]);
+    let mut edge = straddle_json(dir.path(), "edge.abt");
+    edge["ul_lon"] = serde_json::json!(20.0);
+    edge["sources"] = serde_json::json!([{"path": near}]);
+    let (ok, said) = run_cli(dir.path(), serde_json::json!([covered, edge]));
+    assert!(ok, "one covered tile is enough for the batch: {said}");
+    assert!(dir.path().join("edge.abt").exists(), "the edge tile is still written");
+}
+
+// ── Sample formats ────────────────────────────────────────────────────────
+
+/// A 4x4 source of flat 100 m ground over the straddle tile, in *samples*.
+fn ground_typed(dir: &Path, name: &str, samples: Samples) -> PathBuf {
+    let p = dir.join(name);
+    write_geotiff(
+        &p,
+        &TiffSpec {
+            w: 4,
+            h: 4,
+            geotransform: Some((7.4177, 46.9995, 0.001)),
+            geokey: Some((2048, 4326)),
+            nodata: None,
+            samples,
+        },
+    );
+    p
+}
+
+#[test]
+fn every_sample_format_the_decoder_returns_is_terrain() {
+    // The reader used to handle I16/I32/F32 and answer "Unsupported TIF
+    // format" to everything else — including UInt16, the commonest national
+    // DEM type, and Float64, which is what QGIS's own raster writer hands the
+    // converter for an ASCII grid. All four must decode to the same ground.
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        ("i16.tif", Samples::I16(vec![100; 16])),
+        ("f32.tif", Samples::F32(vec![100.0; 16])),
+        ("u16.tif", Samples::U16(vec![100; 16])),
+        ("f64.tif", Samples::F64(vec![100.0; 16])),
+    ];
+    for (name, samples) in cases {
+        let src = ground_typed(dir.path(), name, samples);
+        let mut job = straddle_json(dir.path(), &format!("{name}.abt"));
+        job["sources"] = serde_json::json!([{"path": src}]);
+        let px = payload(&run_job(job).unwrap(), 16);
+        let flat: Vec<i16> = px.iter().flatten().copied().collect();
+        assert!(flat.contains(&200), "{name}: 100 m must read as 200 half-metres");
+    }
 }

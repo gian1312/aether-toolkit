@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::fs;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "native")]
 use rayon::prelude::*;
 #[cfg(feature = "native")]
@@ -102,7 +102,22 @@ fn main() -> anyhow::Result<()> {
 
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
                 println!("[Rust] Processing single tile: {:?}", job.output_path);
-                ingest::process_tile_with_cache(job, texture_cache)?;
+                let out_path = job.output_path.clone();
+                let stats = ingest::process_tile_with_cache(job, texture_cache)?;
+                // An all-void tile is not terrain, and exiting 0 on one hands
+                // the caller a file it will read as ground 4999.5 m below sea
+                // level (or, with void_fill_m, a flat plain at the fill). The
+                // usual cause is a source that does not cover this tile at all
+                // — a wrong CRS, or an area outside the dataset.
+                if stats.covered_px == 0 {
+                    anyhow::bail!(
+                        "no source covered any pixel of {:?}: all {} samples are void, so \
+                         the tile holds no terrain. Check that the sources overlap this \
+                         tile's area and that their CRS is right.",
+                        out_path,
+                        stats.total_px
+                    );
+                }
             } else if let Ok(jobs) = serde_json::from_str::<Vec<ingest::IngestJob>>(&content) {
 
                 // --- OOM FIX 1: CALCULATE SAFE THREAD COUNT ---
@@ -183,6 +198,10 @@ fn main() -> anyhow::Result<()> {
                 let total = jobs.len();
                 let progress = AtomicUsize::new(0);
                 let failures = AtomicUsize::new(0);
+                // Coverage is judged over the WHOLE batch, never per tile: the
+                // edge tiles of any area legitimately fall outside the sources,
+                // and failing on those would refuse every ordinary run.
+                let covered = AtomicU64::new(0);
 
                 // Run all jobs in parallel using the constrained pool
                 pool.install(|| {
@@ -191,9 +210,14 @@ fn main() -> anyhow::Result<()> {
                             Some(dir) => pbf_sets.get(dir),
                             None => None,
                         };
-                        if let Err(e) = ingest::process_tile(job, texture_cache.clone(), pbf) {
-                            println!("[Error] Failed to process tile: {}", e);
-                            failures.fetch_add(1, Ordering::Relaxed);
+                        match ingest::process_tile(job, texture_cache.clone(), pbf) {
+                            Ok(stats) => {
+                                covered.fetch_add(stats.covered_px, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                println!("[Error] Failed to process tile: {}", e);
+                                failures.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
 
                         let curr = progress.fetch_add(1, Ordering::Relaxed) + 1;
@@ -226,6 +250,14 @@ fn main() -> anyhow::Result<()> {
                 let n_failed = failures.load(Ordering::Relaxed);
                 if n_failed > 0 {
                     anyhow::bail!("{} of {} tiles failed to convert", n_failed, total);
+                }
+                if covered.load(Ordering::Relaxed) == 0 {
+                    anyhow::bail!(
+                        "{} tile(s) were written and not one pixel of any of them came \
+                         from a source: the batch holds no terrain. Check that the \
+                         sources overlap the requested area and that their CRS is right.",
+                        total
+                    );
                 }
             } else {
                 // Neither a single job nor a batch parsed. The old code fell

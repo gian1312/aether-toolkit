@@ -60,6 +60,19 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    extension); it is self-describing and sampled like a geographic GeoTIFF.
 >    `crs`/`nodata` on such a source, a truncated/corrupt header, or a BC6H
 >    (version 2) tile are hard errors.
+> 11. **`buildings_file` heights and exit code (§9a).** A `buildings_file`
+>    used to take the roof from the geometry Z **only**; a 2D FlatGeobuf —
+>    the ordinary shape of an OSM extract — therefore drew nothing and the
+>    run exited 0 with a tile identical to the building-less one. Geometry Z
+>    is still the top rung, unchanged and byte-identical where it exists, but
+>    a geometry without one now falls back to the same attribute ladder the
+>    vector-tile path uses (**above-ground** metres; see §9a "Building height
+>    ladder"). Consequences: a 2D source that previously changed nothing now
+>    raises the surface; a `buildings_file` that cannot be **read** now fails
+>    the run instead of warning and exiting 0; and every burn prints one
+>    `[Buildings]` line, where the ingest path previously printed nothing at
+>    all on success. Same release also fixes two reads that dropped or
+>    mangled geometry regardless of dimension — see the note in §9a.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -214,6 +227,20 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   be loaded fails the tile (and thus the run) instead of warning and writing a
   terrain-less tile. CRS/georeferencing problems are hard errors naming the
   file and the fix (§9a).
+* **An ingest that covered nothing exits non-zero.** A run in which **no
+  source supplied a sample for a single pixel of a single tile** fails
+  (`no source covered any pixel of …` for one job, `… came from a source` for
+  a batch) instead of exiting 0 with a tile that is nothing but void. Coverage
+  is counted **before** `void_fill_m` is applied, so filling the holes with
+  0 m does not disguise it, and it is judged **over the whole run**, never per
+  tile: the edge tiles of any area legitimately fall outside the sources, and
+  those are still written. The usual cause is a source that does not overlap
+  the requested area at all, or the wrong CRS on one.
+
+  > **Consumer note.** A caller that today treats exit 0 as "terrain exists"
+  > keeps working. A caller that deliberately converts an area with no data —
+  > to pre-create empty tiles — must now pass `void_fill_m` **and** at least
+  > one overlapping source, or handle the non-zero exit.
 * **`plan` (new in v2.0, additive).** Enumerates, without downloading or
   converting anything, exactly the `.abt` tiles an area/resolution request
   produces: one JSON document on stdout with `schema: "aether-plan/1"`,
@@ -224,9 +251,12 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   **exactly** (extent ladder, u16-stride guard, outward snap on the finest
   sub-tile grid, 6-decimal stepping); the plugin cross-checks its own
   enumeration against this output and aborts on mismatch. Validation is
-  strict: non-finite coordinates, `south >= north`, `west >= east`, an empty
-  or non-positive resolution list, and requests over 2,000,000 tiles
-  (`bbox too large`) all fail with a non-zero exit.
+  strict: non-finite coordinates, `south >= north`, `west >= east`, a bbox
+  reaching outside `[-180, 180] x [-90, 90]` (`longitude out of range` /
+  `latitude out of range` — the grid wraps nowhere, so an antimeridian
+  crossing is refused rather than planned), an empty or non-positive
+  resolution list, and requests over 2,000,000 tiles (`bbox too large`) all
+  fail with a non-zero exit.
 * **Download progress** (stderr):
   `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight`.
 
@@ -283,11 +313,36 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   ```rust
   anyhow::bail!(
       "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
-       the output would be mostly flat 0 m, not terrain. Check that the tile \
-       source serves zoom {} over this area and that the network is reachable.",
-      failed, attempted, pct, job.zoom
+       the output would be mostly flat 0 m, not terrain. Errors: {}. Check that \
+       the tile source serves zoom {} over this area and that the network is \
+       reachable.",
+      failed, attempted, pct, stats.error_breakdown(), job.zoom
   );
   ```
+
+  `Errors:` names the **failure class**. It renders the same per-class tally as
+  the `[Stats] ERRORS` line — one builder, `DownloadStats::error_breakdown()` —
+  so the two can never disagree: `timeout`, `connect`,
+  `HTTP_429_rate_limited`, `HTTP_4xx`, `HTTP_5xx`, `decode`, `other`, in that
+  order, only the non-zero ones, comma-separated. A real message reads (one
+  line, wrapped here):
+
+  ```
+  Tile download failed: 2 of 2 terrain tiles (100%) could not be fetched; the
+  output would be mostly flat 0 m, not terrain. Errors: decode=2. Check that the
+  tile source serves zoom 12 over this area and that the network is reachable.
+  ```
+
+  Without it, "could not be fetched" reads as a network fault for every cause.
+  It is not one: a source that serves **WebP** to this PNG decoder (MapTiler's
+  Terrain-RGB v2 does) fails every tile with `decode=N`, and the repair is a
+  different tile source, not a different network.
+
+  > **Behaviour change for consumers.** The `Errors: {}.` sentence is new; it
+  > is inserted before the `Check that the tile source…` sentence, and the text
+  > up to `not terrain.` is unchanged. A consumer matching the `Tile download
+  > failed:` prefix (as documented below) is unaffected; one matching the whole
+  > former string exactly must drop the tail from its pattern.
 
   > **Behavior change for consumers.** Previously *every* download exited 0,
   > including one where all tiles 404'd — the classic cause being a requested
@@ -301,6 +356,34 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   > threshold is deliberately a *majority*, and a minority loss is still only
   > reported through `[Stats] ERRORS`. Match `Tile download failed:` if you
   > need to distinguish this from the disk-space failure.
+
+* **A failed `download` deletes its own `.abt` outputs.** Every output file is
+  created with a valid 44-byte `AETH` header *before* the first tile is fetched
+  and is padded to full length once assembly ends, so a run that fails leaves a
+  complete, well-formed `.abt` behind — one that is 0 m everywhere the tiles
+  never arrived. Consumers pool tiles by filename, so that file is a cache hit
+  for every later run: one refusal poisons the pool with flat sea. A run that
+  ends in **any** error therefore removes the `.abt` files it created (a drop
+  guard, so this covers the fatal tile-fetch branch, an assembly error, a
+  buildings post-pass error, and cancellation alike) and logs one line to
+  stderr before the error:
+
+  ```
+  [Download] Removed {n} incomplete .abt file(s) — a failed download leaves nothing reusable behind; the next run must fetch again.
+  ```
+
+  A **successful** run keeps its files, unchanged. The output directory itself
+  is never removed, only the `.abt` files this run created — and note that a
+  failed re-run also removes tiles of the same name that existed beforehand,
+  because they were already truncated and rewritten as headers at step 4 and
+  were gone regardless.
+
+  > **Behaviour change for consumers.** A consumer that harvested whatever the
+  > `download` job left on disk after a non-zero exit now finds nothing to
+  > harvest. That output was flat 0 m terrain, never usable data; a consumer
+  > that re-runs on failure needs no change, and one that reports a missing
+  > file as "download failed" is now correct where it was previously fooled by
+  > a full-size sea-level tile. Nothing changes for a run that exits 0.
 
 ### 1.3 `aether_export`
 
@@ -945,12 +1028,85 @@ a **single object** or a **JSON array** of such objects (batch).
 | `void_fill_m` | f64? | optional (v2.0) | A pixel **no** source covers is written as `round(void_fill_m * 2)` half-metres (saturating i16) instead of the `-9999` sentinel. Buildings rasterize after, unchanged. Absent keeps the sentinel. |
 | `base_tif` | string? | **DEPRECATED** | Alias: normalized to a trailing `sources` entry with `crs "EPSG:4326"`. Slated for removal in the next major version. |
 | `swiss_tifs` | array of string | **DEPRECATED**, no longer required | Alias: normalized to leading `sources` entries with `crs "EPSG:2056"` (in order — which preserves the old per-pixel priority: this stack first, `base_tif` as fallback). Slated for removal in the next major version. |
-| `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in. Height comes from the geometry Z, read as an **absolute roof elevation (AMSL)**. |
-| `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Height comes from `render_height`, then `building:levels × 3`, then a 6 m default, and is read as **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
+| `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in — one `.fgb`, or a directory of them (a directory holding no `.fgb` is an error, not an empty burn). Height follows the **building height ladder** below: geometry Z as an **absolute roof elevation (AMSL)** where the geometry has one, else the attribute rungs as **above-ground** metres. A source that cannot be opened, parsed or scanned fails the run rather than silently producing building-less tiles. |
+| `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Vector tiles carry no geometry Z, so height starts at the ladder's attribute rungs and is always **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
 
 Both building fields are optional and additive; a job that omits them behaves
 exactly as before. They may be combined, in which case FlatGeobuf is applied
 first.
+
+**Building height ladder (both sources).** One ladder, walked in this order,
+stopping at the first rung that yields a **finite, strictly positive** value.
+A value that is zero, negative or unparseable does not stop the walk — it
+falls through to the next rung.
+
+| # | Rung | Datum | Units |
+|---|------|-------|-------|
+| 1 | geometry Z (FlatGeobuf 3D; the maximum Z of the ring) | **absolute**, metres above mean sea level | m AMSL |
+| 2 | attribute `height`, `render_height`, `building:height` (first present wins, in that order) | **above ground** | m |
+| 3 | attribute `levels`, `building:levels`, `building_levels` (first present wins, in that order) × **3.0 m** per storey | **above ground** | storeys → m |
+| 4 | default **6.0 m** | **above ground** | m |
+
+* **Rungs 2–4 are never absolute.** An attribute height is metres from the
+  ground to the top of the building, the OSM convention. Reading one as an
+  elevation would put a 12 m building 528 m below Bern's terrain, where the
+  `max` write rule silently discards it — the failure mode this ladder
+  replaced.
+* **Attribute values are text.** The leading decimal number is taken and the
+  rest ignored, so `"12"`, `"12.5"` and `"12 m"` all read as the same height.
+  Numeric columns and MVT numeric tag values are read directly.
+* Rung 1 applies only where the geometry actually carries Z. A 2D geometry in
+  an otherwise 3D file falls to rung 2, per feature.
+* An absolute roof that lands below zero in half-metre units is dropped, as
+  it always has been; an above-ground height is screened by the rasterizer
+  against real terrain instead.
+
+> **Behaviour change for consumers.** A 2D `buildings_file` used to draw
+> **nothing at all** and exit 0 — the output was byte-identical to the
+> building-less tile. It now draws, at rung 2, 3 or 4. A consumer that cached
+> such tiles under a buildings-keyed identity was caching terrain; those
+> entries are stale and must be rebuilt. Output for a source whose geometry
+> carries Z is unchanged, byte for byte.
+>
+> Two further reads were wrong for **any** dimension and are fixed in the same
+> release, so a 3D source may also start drawing where it did not before:
+> a FlatGeobuf writes its geometry type once in the **header** and repeats it
+> per feature only in a mixed-type file, so reading it off the feature alone
+> saw `Unknown` and skipped every feature of an ordinary single-type file;
+> and a polygon's ring `ends` count **points**, not coordinate slots, so a
+> multi-ring footprint was read at half length and discarded as degenerate.
+
+**`[Buildings]` on ingest (additive).** A `buildings_file` burn prints one
+line per tile to stdout, opening with the same `[Buildings]` marker `download`
+has always used (§1.2). Both the drew-something and the drew-nothing case are
+reported; the ingest path previously printed nothing whatsoever on a
+successful burn, so a consumer could not tell a burn from a no-op. The counts
+after the marker are diagnostic and not frozen — match the marker, not the
+wording.
+
+```
+[Buildings] <source>: <n> polygon feature(s) → <n> footprint(s), <n> with a height from the data (<n> at the 6 m default), <n> drawn, <n> px raised
+[Buildings] <source>: <n> polygon feature(s) in this tile's extent, no footprint to draw
+```
+
+**A `buildings_file` that cannot be read fails the run.** Opening, parsing or
+scanning the source, and a directory holding no `.fgb`, are hard errors naming
+the file, and the tile is **not** written — matching what `buildings_pbf_dir`
+has done since v2.0. Finding no buildings *over a given tile* is not that: an
+edge tile legitimately has none, so it is reported and its terrain written.
+The message keeps the phrase **`failed to apply buildings`** that the earlier
+warning used, so a consumer already grepping for it still matches:
+
+```
+failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; refusing to write a building-less tile
+```
+
+> **Behaviour change for consumers.** This used to be one `[Warn] Failed to
+> apply buildings: …` line and exit 0, which handed back building-*less*
+> terrain under an identity claiming buildings — a permanent cache hit. A
+> consumer that treated exit 0 as "buildings applied" was wrong then and is
+> right now; one that already parsed the warning needs no change beyond
+> tolerating the non-zero exit.
 
 **Sources (v2.0).** Each `sources` entry is `{path, crs?, nodata?}`:
 
@@ -987,7 +1143,9 @@ first.
   Int32-widening rules of §6 apply unchanged on top.
 * Supplying `sources` **and** either legacy field in one job is a **hard
   error** (the priority order would be ambiguous). A job with none of the
-  three writes an all-void (or all-`void_fill_m`) tile, as before.
+  three writes an all-void (or all-`void_fill_m`) tile as before at the
+  library level, but the CLI refuses a whole run that covered nothing (§1.2,
+  "An ingest that covered nothing exits non-zero").
 * A listed source that cannot be opened or decoded **fails the tile** —
   never a warning.
 
@@ -998,9 +1156,11 @@ first.
 > the same message `download` has always used. A single-zoom directory — the
 > only kind that ever produced correct output — is unaffected.
 
-**Building write rule (both sources).** Every height is normalised to an
-absolute roof elevation and composited with `max` against the surface —
-never added to it. Consequences callers can rely on:
+**Building write rule (both sources).** Every height off the ladder above is
+normalised to an absolute roof elevation — an above-ground rung by adding the
+terrain under its own footprint, read before anything is written — and
+composited with `max` against the surface, never added to it. Consequences
+callers can rely on:
 
 * a roof is **flat**, even where the terrain under the footprint slopes;
 * overlapping footprints do **not** accumulate;
@@ -1023,7 +1183,7 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
 | `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. |
-| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and height ladder as §9's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
+| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 
 `SubTileSpec`:
