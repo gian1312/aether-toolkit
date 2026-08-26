@@ -73,6 +73,21 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    `[Buildings]` line, where the ingest path previously printed nothing at
 >    all on success. Same release also fixes two reads that dropped or
 >    mangled geometry regardless of dimension — see the note in §9a.
+> 12. **Multi-band / colour GeoTIFF sources refused (§9a).** A source whose
+>    TIFF colortype is anything but single-band greyscale (RGB(A), palette,
+>    GrayA, CMYK, YCbCr — a rendered basemap export, a hillshade, a photo)
+>    is now a **hard error naming the file**: reading a picture's colour
+>    values as metres produced confident garbage terrain, and the extra
+>    samples per pixel additionally sheared the sampling grid (the samplers
+>    index `y·w+x`). Genuine single-band DEMs of any sample type — UInt8
+>    included — remain ingestable. A decode returning anything but exactly
+>    `w·h` samples is likewise refused.
+> 13. **TIN / PolyhedralSurface buildings burn (§9a, additive).** A
+>    `buildings_file` feature with `TIN`, `PolyhedralSurface` or `Triangle`
+>    geometry — what GDAL's FlatGeobuf driver writes for swissBUILDINGS3D
+>    3.0 — was silently skipped by the Polygon/MultiPolygon type filter and
+>    the burn drew nothing; those types now burn like MultiPolygon, each
+>    part at its own max Z.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -1094,6 +1109,16 @@ scanning the source, and a directory holding no `.fgb`, are hard errors naming
 the file, and the tile is **not** written — matching what `buildings_pbf_dir`
 has done since v2.0. Finding no buildings *over a given tile* is not that: an
 edge tile legitimately has none, so it is reported and its terrain written.
+
+**Accepted geometry types (additive).** Features whose geometry is `Polygon`,
+`MultiPolygon`, **`TIN`**, **`PolyhedralSurface`** or **`Triangle`** are
+burned; anything else is skipped per feature (points/lines are not
+footprints). TIN and PolyhedralSurface — the shape GDAL's FlatGeobuf driver
+writes for swissBUILDINGS3D 3.0 solids/roofs — walk exactly like a
+MultiPolygon: parts recurse, rings split on `ends`, and each part takes its
+own max Z as the absolute roof. They were previously skipped silently, so a
+whole TIN dataset burned nothing with only the "no footprint to draw" line as
+a trace.
 The message keeps the phrase **`failed to apply buildings`** that the earlier
 warning used, so a consumer already grepping for it still matches:
 
@@ -1126,6 +1151,12 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
   `ModelTransformation` tag, or `ModelTiepoint` + `ModelPixelScale`); a file
   without one is a **hard error** naming the file. Georeferencing is **never**
   derived from file names (the old filename fallback is gone).
+  A GeoTIFF `path` must also be **single-band** (greyscale colortype, one
+  sample per pixel, any sample type): an RGB(A)/palette/GrayA file is a
+  picture — a rendered basemap, hillshade or photo — and is a **hard error**
+  naming the file (*"… not an elevation raster"*), raised before any sample
+  is decoded. A decode that yields anything but exactly `w·h` samples is
+  refused the same way.
 * `crs` — `"EPSG:nnnn"` or a raw proj string starting with `+`. Optional:
   when absent, the file's GeoKeyDirectory is read — `ProjectedCSTypeGeoKey`
   (3072) first, else `GeographicTypeGeoKey` (2048). An absent key, or the

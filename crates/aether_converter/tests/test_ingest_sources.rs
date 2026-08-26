@@ -910,3 +910,21 @@ fn every_sample_format_the_decoder_returns_is_terrain() {
         assert!(flat.contains(&200), "{name}: 100 m must read as 200 half-metres");
     }
 }
+
+#[test]
+fn an_rgba_picture_is_refused_as_imagery() {
+    // A rendered basemap/hillshade export is a picture, not terrain. Reading
+    // its colour bytes as metres used to "succeed" (and the 4x sample count
+    // then sheared the grid); it must be a hard error naming the file,
+    // before a single sample is decoded.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("basemap.tif");
+    let file = std::fs::File::create(&p).unwrap();
+    let mut enc = tiff::encoder::TiffEncoder::new(file).unwrap();
+    enc.write_image::<tiff::encoder::colortype::RGBA8>(4, 4, &[255u8; 64]).unwrap();
+    let mut job = straddle_json(dir.path(), "x.abt");
+    job["sources"] = serde_json::json!([{"path": p, "crs": "EPSG:4326"}]);
+    let err = format!("{:#}", run_job(job).unwrap_err());
+    assert!(err.contains("basemap.tif"), "must name the file: {err:?}");
+    assert!(err.contains("not an elevation raster"), "got {err:?}");
+}

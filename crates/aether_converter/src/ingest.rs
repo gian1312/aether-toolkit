@@ -524,6 +524,25 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
     let mut decoder = Decoder::new(reader)?.with_limits(Limits::unlimited());
     let (w, h) = decoder.dimensions()?;
 
+    // A picture is not terrain. Elevation rasters carry ONE sample per
+    // pixel; an RGB(A)/palette source — a rendered WMS/XYZ basemap export,
+    // a hillshade — would have its colour values read as metres and produce
+    // confident garbage. Refuse by band count/photometric, never by sample
+    // type: genuine UInt8 single-band DEMs stay ingestable.
+    let color = decoder.colortype()?;
+    match color {
+        tiff::ColorType::Gray(_) => {}
+        tiff::ColorType::Multiband { num_samples: 1, .. } => {}
+        other => anyhow::bail!(
+            "source {:?}: {:?} pixels — this is an image (a rendered map, \
+             photo or hillshade), not an elevation raster. Elevation sources \
+             are single-band; converting a picture would read its colour \
+             values as metres. Use a real DEM for this area instead.",
+            path,
+            other
+        ),
+    }
+
     let model_trans = decoder.get_tag_f64_vec(Tag::ModelTransformationTag).unwrap_or_default();
     let tiepoints = decoder.get_tag_f64_vec(Tag::ModelTiepointTag).unwrap_or_default();
     let pixel_scales = decoder.get_tag_f64_vec(Tag::ModelPixelScaleTag).unwrap_or_default();
@@ -624,6 +643,20 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
             None => v.iter().map(|&x| f64_sample_to_half_metres(x)).collect(),
         },
     };
+
+    // Belt over the braces above: the samplers index `y*w + x`, so a decode
+    // that returned anything but exactly w*h samples (interleaved bands,
+    // truncated strips) must never reach them.
+    if data.len() != w as usize * h as usize {
+        anyhow::bail!(
+            "source {:?}: decoded {} samples for a {}x{} raster — the file \
+             is not a single-band elevation grid",
+            path,
+            data.len(),
+            w,
+            h
+        );
+    }
 
     let limit_n = origin_n - (h as f64 * scale);
     let limit_e = origin_e + (w as f64 * scale);
@@ -1431,7 +1464,20 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
                 GeometryType::Unknown => header_type,
                 t => t,
             };
-            if g_type != GeometryType::MultiPolygon && g_type != GeometryType::Polygon {
+            // TIN and PolyhedralSurface are polygon collections (the shape
+            // GDAL writes for swissBUILDINGS3D 3.0 solids/roofs); a Triangle
+            // is a 3-point ring. All walk through `collect_fgb_buildings`
+            // exactly like a MultiPolygon — parts recurse, rings split on
+            // `ends` — so refusing them dropped whole national datasets on
+            // the floor with nothing but the "no footprint to draw" line.
+            if !matches!(
+                g_type,
+                GeometryType::Polygon
+                    | GeometryType::MultiPolygon
+                    | GeometryType::PolyhedralSurface
+                    | GeometryType::TIN
+                    | GeometryType::Triangle
+            ) {
                 continue;
             }
             features_seen += 1;

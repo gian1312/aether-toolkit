@@ -529,3 +529,23 @@ fn a_buildings_directory_with_no_fgb_in_it_fails_the_run() {
     assert!(!ok, "an empty buildings directory must fail the run: {said}");
     assert!(said.contains("holds no .fgb file"), "{said}");
 }
+
+// ── TIN geometry (swissBUILDINGS3D 3.0) ───────────────────────────────────
+
+#[test]
+fn a_tin_z_flatgeobuf_burns_its_triangles() {
+    // swissBUILDINGS3D 3.0 arrives as TIN Z, and GDAL's FlatGeobuf driver
+    // writes the TIN natively (promoting it to multi instead yields
+    // MultiSurface, which the FGB writer refuses feature by feature). The
+    // type filter used to allow only Polygon and MultiPolygon, so a whole
+    // national dataset burned nothing and the only trace was the "no
+    // footprint to draw" line. The fixture is GDAL-written (tests/data/
+    // README.md), i.e. the exact encoding the plugin's conversion produces.
+    let fixture =
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/tin_roofs_z.fgb"));
+    let dir = tempfile::tempdir().unwrap();
+    let tile = run(job(dir.path(), "tin.abt", Some(fixture)));
+    assert_eq!(at(&tile, 7.4234, 46.9571), 550.0, "triangle A roof from Z");
+    assert_eq!(at(&tile, 7.4256, 46.9561), 560.0, "triangle B roof from Z");
+    assert!(raised_px(&tile) > 0, "TIN triangles must raise pixels");
+}
