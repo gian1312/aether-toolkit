@@ -371,6 +371,50 @@ fn the_half_no_tile_covered_is_void_and_the_half_that_arrived_is_terrain() {
 }
 
 #[test]
+fn a_missing_tile_with_a_live_parent_is_repaired_not_voided() {
+    // Same straddle as above, but the 404'd east tile's z-1 ancestor IS on
+    // the server, carrying 300 m. The wholly-missing tile must be repaired
+    // from it — upsampled parent terrain, not a void hole — and the tile
+    // then counts as fetched, so the run succeeds with a complete output.
+    const Z: u32 = 12;
+    let (tx, ty) = (lon2tx(8.5, Z), lat2ty(47.0, Z));
+    let w = tx2lon(tx + 1, Z) - tx2lon(tx, Z);
+    let parent_x = (tx + 1) >> 1;
+    let parent_y = ty >> 1;
+
+    let port = serve_tiles(move |z, x, y| match (z, x, y) {
+        (Z, x, _) if x == tx => Some(terrarium_tile(256, |_, _| 100.0)),
+        (z, x, y) if z == Z - 1 && x == parent_x && y == parent_y => {
+            Some(terrarium_tile(256, |_, _| 300.0))
+        }
+        _ => None,
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let size = 64usize;
+    let pd = w / size as f64;
+    let (job, abt) = write_job_at(
+        dir.path(), port, ty2lat(ty, Z), tx2lon(tx, Z) + w * 0.5, size as u32, pd,
+    );
+
+    run_download(&job).unwrap();
+    let g = read_abt(&abt, size);
+
+    for y in 0..size {
+        for x in 0..size {
+            let v = g[y * size + x];
+            if x < size / 2 {
+                assert_eq!(v, 200, "({x},{y}) is under the tile that arrived: 100 m");
+            } else {
+                assert_eq!(v, 600, "({x},{y}) lost its tile but has a z-1 \
+                                    parent: 300 m upsampled, not a void");
+            }
+        }
+    }
+    assert!(!g.contains(&-9999), "a repairable loss must leave no hole");
+}
+
+#[test]
 fn a_512_px_source_lands_on_the_same_ground_as_a_256_px_one() {
     // MapTiler's terrain-rgb serves 512 px (@2x) tiles; Terrarium serves 256.
     // Both are the same ground at the same zoom — the larger tile just carries

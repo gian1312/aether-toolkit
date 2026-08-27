@@ -112,6 +112,20 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >      byte-for-byte unchanged. A **non-square** tile, one that is not 8 bits
 >      per channel, and a source that **mixes** tile sizes within one run are
 >      now hard errors naming the offending dimensions (§9b).
+> 16. **`download` repairs a wholly-missing tile from coarser parents
+>    (§1.2).** The parent backfill that already repaired in-tile voids never
+>    fired for a tile whose fetch failed outright — the `Ok(...)` guard in
+>    front of `fill_from_parents` skipped it — so a 404'd tile stayed void
+>    (item 15) even when its z-1 ancestor was on the server. It is now
+>    repaired from the first ancestor that decodes (down to the same minimum
+>    zoom the in-tile repair uses); a tile with no usable ancestor at any
+>    zoom stays fully void. A **repaired tile counts as OK**, not as an
+>    error: `[Stats] Tiles: N/M OK` and the >50%-loss fatal guard both see
+>    it as fetched (the request failure still appears in the error-class
+>    log lines), and a new line — `[Stats] Repaired from coarser parent
+>    tiles: N` — reports the repairs. **Bytes change for any run that lost
+>    a tile an ancestor covers**: those pixels were `-9999` (or, before
+>    item 15, fake 0 m) and are now upsampled parent terrain.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -396,15 +410,19 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   > `[Stats] ERRORS`. Match `Tile download failed:` if you need to distinguish
   > this from the disk-space failure.
 
-  > **Behaviour change for consumers — a lost tile is now a hole, not sea
-  > level.** A tile that never arrives is never copied into the assembly grid.
-  > That grid used to be zero-filled, so the pixels it covered were written as
-  > **0 m** — a valid sea-level elevation, indistinguishable downstream from
-  > surveyed ground, which is how a partly-404'd run produced confident flat
-  > ocean. Those pixels are now the **`-9999` void sentinel** of §6, the same
-  > value `ingest` writes for a pixel no source covered. The same applies to
-  > any output pixel whose footprint falls outside the fetched tile grid at
-  > all. **`.abt` bytes therefore change for every run that lost a tile**; a
+  > **Behaviour change for consumers — a lost tile is repaired or a hole,
+  > never sea level.** A tile that never arrives is first offered to the
+  > same parent backfill that repairs in-tile voids (changelog item 16): the
+  > first coarser ancestor that decodes supplies all of its pixels,
+  > upsampled, and the tile then counts as OK (`[Stats] Repaired from
+  > coarser parent tiles: N`). Only a tile with **no usable ancestor at any
+  > zoom** stays a hole — and a hole is now the **`-9999` void sentinel** of
+  > §6, the same value `ingest` writes for a pixel no source covered, never
+  > **0 m** as before (a valid sea-level elevation, indistinguishable
+  > downstream from surveyed ground, which is how a partly-404'd run
+  > produced confident flat ocean). The same sentinel applies to any output
+  > pixel whose footprint falls outside the fetched tile grid at all.
+  > **`.abt` bytes therefore change for every run that lost a tile**; a
   > run in which every tile arrived is byte-for-byte unchanged. A consumer
   > that reads `-9999` as an elevation sees -4999.5 m; one that already
   > handles the `ingest` sentinel needs no change, and one that filled or

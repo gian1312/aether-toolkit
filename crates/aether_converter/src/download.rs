@@ -372,20 +372,34 @@ async fn fetch_decode_raw(
 }
 
 /// Fill the NODATA pixels of a zoom-`z` tile from progressively coarser parents.
+///
+/// `have` is the decoded tile, or `None` when the tile itself never arrived. A
+/// tile that 404'd is a tile that is 100 % void, and the ancestor covering it is
+/// exactly as good a source for all of its pixels as it is for a few of them.
+/// With `None` the first ancestor that decodes fixes the tile edge, so the grid
+/// synthesised here has the stride the rest of the run assembles at. `None` comes
+/// back only when nothing was available at any zoom — a genuine hole, which the
+/// caller must keep writing as void rather than as 0 m.
 async fn fill_from_parents(
     client: &reqwest::Client, url_template: &str, z: u32, x: u32, y: u32,
-    dec: fn(u8, u8, u8) -> f32, mut grid: Vec<f32>, ts: usize,
-) -> Vec<f32> {
+    dec: fn(u8, u8, u8) -> f32, have: Option<(Vec<f32>, usize)>,
+) -> Option<(Vec<f32>, usize)> {
+    let (mut grid, mut ts) = have.map_or_else(|| (Vec::new(), 0), |(g, t)| (g, t));
     let mut missing: Vec<usize> =
         (0..grid.len()).filter(|&i| grid[i] <= NODATA_M).collect();
     let mut level = 1u32;
-    while !missing.is_empty() && z >= level + NODATA_FILL_MIN_ZOOM {
+    while (ts == 0 || !missing.is_empty()) && z >= level + NODATA_FILL_MIN_ZOOM {
         let (az, ax, ay) = (z - level, x >> level, y >> level);
         let url = url_template
             .replace("{z}", &az.to_string())
             .replace("{x}", &ax.to_string())
             .replace("{y}", &ay.to_string());
         if let Some((anc, aedge)) = fetch_decode_raw(client, &url, dec).await {
+            if ts == 0 {
+                ts = aedge;
+                grid = vec![NO_TILE_M; ts * ts];
+                missing = (0..grid.len()).collect();
+            }
             // The parent has to be the same tile size as the child — one
             // service, one grid. A parent of a different size is not a parent
             // this pixel mapping can address, so skip it rather than fold it.
@@ -403,7 +417,7 @@ async fn fill_from_parents(
         }
         level += 1;
     }
-    grid
+    if ts == 0 { None } else { Some((grid, ts)) }
 }
 
 /// The XYZ tile edge this run assembles for, taken from the tiles themselves.
@@ -474,6 +488,7 @@ struct DownloadStats {
     tile_us_max: AtomicU64,
     tile_us_min: AtomicU64,
     slow_logged: AtomicUsize,
+    backfilled: AtomicUsize,
 }
 
 impl DownloadStats {
@@ -495,6 +510,7 @@ impl DownloadStats {
             tile_us_max: AtomicU64::new(0),
             tile_us_min: AtomicU64::new(u64::MAX),
             slow_logged: AtomicUsize::new(0),
+            backfilled: AtomicUsize::new(0),
         }
     }
 
@@ -548,6 +564,11 @@ impl DownloadStats {
             mb, elapsed, throughput);
         let retries = self.retries.load(Ordering::Relaxed);
         eprintln!("[Stats] Retries: {} (up to 3 per failed tile)", retries);
+        let repaired = self.backfilled.load(Ordering::Relaxed);
+        if repaired > 0 {
+            eprintln!("[Stats] Repaired from coarser parent tiles: {} \
+                       (missing at this zoom, present at a lower one)", repaired);
+        }
         eprintln!("[Stats] Peak concurrent requests: {}",
             self.peak_in_flight.load(Ordering::Relaxed));
 
@@ -781,14 +802,25 @@ async fn download_strip(
                 // Terrarium NODATA voids: if this tile came back with blank
                 // pixels, backfill only those from real (upsampled) data in the
                 // coarser parent tiles instead of leaving a -16 km pit / stripe.
-                if matches!(&result, Ok((g, _)) if g.iter().any(|&v| v <= NODATA_M)) {
+                // A tile that never arrived at all is the same hole at a
+                // larger scale, so it gets the same repair. `result` keeps the
+                // failure, so the error stats below still see the 404: the
+                // backfill supplies pixels, it does not un-fail the request.
+                let mut repair: Option<(Vec<f32>, usize)> = None;
+                if result.is_err() {
+                    repair = fill_from_parents(
+                        &client, url_template, zoom, tx, ty, dec, None,
+                    ).await;
+                    if repair.is_some() {
+                        stats.backfilled.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else if matches!(&result, Ok((g, _)) if g.iter().any(|&v| v <= NODATA_M)) {
                     if let Ok((g, ts)) = result {
-                        result = Ok((
-                            fill_from_parents(
-                                &client, url_template, zoom, tx, ty, dec, g, ts,
-                            ).await,
-                            ts,
-                        ));
+                        result = fill_from_parents(
+                            &client, url_template, zoom, tx, ty, dec, Some((g, ts)),
+                        )
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("unreachable: edge was known"));
                     }
                 }
 
@@ -800,55 +832,64 @@ async fn download_strip(
                 stats.tile_us_min.fetch_min(tile_us, Ordering::Relaxed);
 
                 // Classify final result (only after all retries exhausted).
-                match &result {
-                    Ok(_) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
-                    Err(e) => {
-                        let msg = format!("{:#}", e);
-                        if msg.contains("HTTP ") {
-                            let code: u16 = msg.split("HTTP ")
-                                .nth(1)
-                                .and_then(|s| s.split_whitespace().next())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            match code {
-                                429 => { stats.err_http_429.fetch_add(1, Ordering::Relaxed); }
-                                400..=499 => { stats.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
-                                500..=599 => { stats.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
-                                _ => { stats.err_other.fetch_add(1, Ordering::Relaxed); }
-                            }
-                        } else if msg.contains("timed out")
-                            || msg.contains("operation timed out")
-                        {
-                            let prev = stats.err_timeout.fetch_add(1, Ordering::Relaxed);
-                            if prev == 0 {
-                                eprintln!("[Download] first timeout: z={}/x={}/y={}",
-                                    zoom, tx, ty);
-                            }
-                        } else if msg.contains("onnect")
-                            || msg.contains("dns")
-                            || msg.contains("resolve")
-                        {
-                            let prev = stats.err_connect.fetch_add(1, Ordering::Relaxed);
-                            if prev == 0 {
-                                eprintln!("[Download] first connect error: z={}/x={}/y={} — {}",
-                                    zoom, tx, ty, msg);
-                            }
-                        } else if msg.contains("decode")
-                            || msg.contains("png")
-                            || msg.contains("PNG")
-                            || msg.contains("nvalid")
-                            || msg.contains(TILE_GEOMETRY_ERR)
-                        {
-                            let prev = stats.err_decode.fetch_add(1, Ordering::Relaxed);
-                            if prev == 0 {
-                                eprintln!("[Download] first decode error: z={}/x={}/y={} — {}",
-                                    zoom, tx, ty, msg);
-                            }
-                        } else {
-                            let prev = stats.err_other.fetch_add(1, Ordering::Relaxed);
-                            if prev == 0 {
-                                eprintln!("[Download] first unknown error: z={}/x={}/y={} — {}",
-                                    zoom, tx, ty, msg);
+                // A tile the parent backfill repaired counts as OK, not as an
+                // error: `total_tiles()` is ok+errors and feeds both the
+                // fatal-failure guard and the plugin's success-rate parser, so
+                // counting a repaired tile as a failure would abort a run whose
+                // output is complete. Repairs get their own [Stats] line.
+                if repair.is_some() {
+                    stats.ok_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    match &result {
+                        Ok(_) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
+                        Err(e) => {
+                            let msg = format!("{:#}", e);
+                            if msg.contains("HTTP ") {
+                                let code: u16 = msg.split("HTTP ")
+                                    .nth(1)
+                                    .and_then(|s| s.split_whitespace().next())
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                match code {
+                                    429 => { stats.err_http_429.fetch_add(1, Ordering::Relaxed); }
+                                    400..=499 => { stats.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
+                                    500..=599 => { stats.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
+                                    _ => { stats.err_other.fetch_add(1, Ordering::Relaxed); }
+                                }
+                            } else if msg.contains("timed out")
+                                || msg.contains("operation timed out")
+                            {
+                                let prev = stats.err_timeout.fetch_add(1, Ordering::Relaxed);
+                                if prev == 0 {
+                                    eprintln!("[Download] first timeout: z={}/x={}/y={}",
+                                        zoom, tx, ty);
+                                }
+                            } else if msg.contains("onnect")
+                                || msg.contains("dns")
+                                || msg.contains("resolve")
+                            {
+                                let prev = stats.err_connect.fetch_add(1, Ordering::Relaxed);
+                                if prev == 0 {
+                                    eprintln!("[Download] first connect error: z={}/x={}/y={} — {}",
+                                        zoom, tx, ty, msg);
+                                }
+                            } else if msg.contains("decode")
+                                || msg.contains("png")
+                                || msg.contains("PNG")
+                                || msg.contains("nvalid")
+                                || msg.contains(TILE_GEOMETRY_ERR)
+                            {
+                                let prev = stats.err_decode.fetch_add(1, Ordering::Relaxed);
+                                if prev == 0 {
+                                    eprintln!("[Download] first decode error: z={}/x={}/y={} — {}",
+                                        zoom, tx, ty, msg);
+                                }
+                            } else {
+                                let prev = stats.err_other.fetch_add(1, Ordering::Relaxed);
+                                if prev == 0 {
+                                    eprintln!("[Download] first unknown error: z={}/x={}/y={} — {}",
+                                        zoom, tx, ty, msg);
+                                }
                             }
                         }
                     }
@@ -890,7 +931,7 @@ async fn download_strip(
                     );
                 }
 
-                (tx, ty, result)
+                (tx, ty, repair.map(Ok).unwrap_or(result))
             }
         })
         .buffer_unordered(concurrency)
