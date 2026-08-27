@@ -88,6 +88,30 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    3.0 — was silently skipped by the Polygon/MultiPolygon type filter and
 >    the burn drew nothing; those types now burn like MultiPolygon, each
 >    part at its own max Z.
+> 14. **`ingest` sampling registration (§6, §9a).** The area-average window
+>    is now anchored on each output cell's **centre** (the footprint §6
+>    always promised) instead of its NW corner, and a `GTRasterTypeGeoKey`
+>    of `RasterPixelIsPoint` shifts the source origin to the pixel corner on
+>    load instead of being ignored. `.abt` payload bytes move for every
+>    `ingest` input (up to one source sample); see the Correction in §6.
+> 15. **`download` voids and XYZ tile size (§1.2, §6, §9b).** Two changes to
+>    the download path, both changing `.abt` bytes:
+>    * A tile that never arrived is now written as the `-9999` **void**
+>      sentinel, not as **0 m**. The assembly grid used to be zero-filled and
+>      a failed tile simply never copied in, so a 404'd tile became flat
+>      sea-level terrain that no consumer could tell from surveyed ground.
+>      **Bytes change for any run that lost a tile** — and for any output
+>      pixel whose footprint fell outside the fetched tile grid, which was
+>      likewise 0 m. A run that lost nothing is byte-for-byte unchanged.
+>    * The XYZ tile edge is now read from the PNG instead of assumed to be
+>      256 px. MapTiler's terrain-rgb serves **512 px** (`@2x`) tiles; those
+>      were indexed with a 256 px row stride, which folded each tile in half
+>      (west half onto the even output rows, east half onto the odd) for
+>      terrain that looked plausible and was ~555 m out at p95. **Bytes change
+>      for every 512 px source**; a 256 px source (AWS Terrarium) is
+>      byte-for-byte unchanged. A **non-square** tile, one that is not 8 bits
+>      per channel, and a source that **mixes** tile sizes within one run are
+>      now hard errors naming the offending dimensions (§9b).
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -328,7 +352,7 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   ```rust
   anyhow::bail!(
       "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
-       the output would be mostly flat 0 m, not terrain. Errors: {}. Check that \
+       the output would be mostly void, not terrain. Errors: {}. Check that \
        the tile source serves zoom {} over this area and that the network is \
        reachable.",
       failed, attempted, pct, stats.error_breakdown(), job.zoom
@@ -344,7 +368,7 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
 
   ```
   Tile download failed: 2 of 2 terrain tiles (100%) could not be fetched; the
-  output would be mostly flat 0 m, not terrain. Errors: decode=2. Check that the
+  output would be mostly void, not terrain. Errors: decode=2. Check that the
   tile source serves zoom 12 over this area and that the network is reachable.
   ```
 
@@ -354,30 +378,44 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   different tile source, not a different network.
 
   > **Behaviour change for consumers.** The `Errors: {}.` sentence is new; it
-  > is inserted before the `Check that the tile source…` sentence, and the text
-  > up to `not terrain.` is unchanged. A consumer matching the `Tile download
-  > failed:` prefix (as documented below) is unaffected; one matching the whole
+  > is inserted before the `Check that the tile source…` sentence. The clause
+  > `{} of {} terrain tiles ({}%) could not be fetched` is frozen alongside the
+  > prefix; the words between it and `Errors:` are not — they described the
+  > output as `mostly flat 0 m` until missing tiles became void, and now read
+  > `mostly void`. A consumer matching the `Tile download failed:` prefix (as
+  > documented below), or that clause, is unaffected; one matching the whole
   > former string exactly must drop the tail from its pattern.
 
   > **Behavior change for consumers.** Previously *every* download exited 0,
   > including one where all tiles 404'd — the classic cause being a requested
-  > zoom the tile source does not serve. A tile that never arrives is not a
-  > hole: the assembly grid is zero-filled and the missing tile is simply never
-  > copied in, so it is written as **0 m, sea level**, and a fully-failed run
-  > produced a complete set of plausible-looking flat `.abt` files. Consumers
-  > that treated exit 0 as "tiles are usable" were wrong then and are right
-  > now; consumers that treated any non-zero exit as fatal need no change.
-  > Sparse 404s at the edge of a provider's coverage remain non-fatal — the
-  > threshold is deliberately a *majority*, and a minority loss is still only
-  > reported through `[Stats] ERRORS`. Match `Tile download failed:` if you
-  > need to distinguish this from the disk-space failure.
+  > zoom the tile source does not serve. Consumers that treated exit 0 as
+  > "tiles are usable" were wrong then and are right now; consumers that
+  > treated any non-zero exit as fatal need no change. Sparse 404s at the edge
+  > of a provider's coverage remain non-fatal — the threshold is deliberately a
+  > *majority*, and a minority loss is still only reported through
+  > `[Stats] ERRORS`. Match `Tile download failed:` if you need to distinguish
+  > this from the disk-space failure.
+
+  > **Behaviour change for consumers — a lost tile is now a hole, not sea
+  > level.** A tile that never arrives is never copied into the assembly grid.
+  > That grid used to be zero-filled, so the pixels it covered were written as
+  > **0 m** — a valid sea-level elevation, indistinguishable downstream from
+  > surveyed ground, which is how a partly-404'd run produced confident flat
+  > ocean. Those pixels are now the **`-9999` void sentinel** of §6, the same
+  > value `ingest` writes for a pixel no source covered. The same applies to
+  > any output pixel whose footprint falls outside the fetched tile grid at
+  > all. **`.abt` bytes therefore change for every run that lost a tile**; a
+  > run in which every tile arrived is byte-for-byte unchanged. A consumer
+  > that reads `-9999` as an elevation sees -4999.5 m; one that already
+  > handles the `ingest` sentinel needs no change, and one that filled or
+  > flagged 0 m regions as suspect can now distinguish "no data" from "sea".
 
 * **A failed `download` deletes its own `.abt` outputs.** Every output file is
   created with a valid 44-byte `AETH` header *before* the first tile is fetched
   and is padded to full length once assembly ends, so a run that fails leaves a
-  complete, well-formed `.abt` behind — one that is 0 m everywhere the tiles
-  never arrived. Consumers pool tiles by filename, so that file is a cache hit
-  for every later run: one refusal poisons the pool with flat sea. A run that
+  complete, well-formed `.abt` behind — void everywhere the tiles never arrived
+  (0 m, before the change above). Consumers pool tiles by filename, so that file
+  is a cache hit for every later run: one refusal poisons the pool. A run that
   ends in **any** error therefore removes the `.abt` files it created (a drop
   guard, so this covers the fatal tile-fetch branch, an assembly error, a
   buildings post-pass error, and cancellation alike) and logs one line to
@@ -395,10 +433,11 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
 
   > **Behaviour change for consumers.** A consumer that harvested whatever the
   > `download` job left on disk after a non-zero exit now finds nothing to
-  > harvest. That output was flat 0 m terrain, never usable data; a consumer
-  > that re-runs on failure needs no change, and one that reports a missing
-  > file as "download failed" is now correct where it was previously fooled by
-  > a full-size sea-level tile. Nothing changes for a run that exits 0.
+  > harvest. That output was mostly empty terrain — flat 0 m before the void
+  > sentinel — and never usable data; a consumer that re-runs on failure needs
+  > no change, and one that reports a missing file as "download failed" is now
+  > correct where it was previously fooled by a full-size sea-level tile.
+  > Nothing changes for a run that exits 0.
 
 ### 1.3 `aether_export`
 
@@ -849,8 +888,10 @@ but a bathymetric source below -2500 m would be discarded.
 > narrowed to `i16` (keeping only the low 16 bits, which are zero) before
 > scaling. Those pixels now decode to `-9999`. **`.abt` bytes therefore change
 > for any input that used Float32-NaN or Int32-minimum no-data**; every other
-> input is byte-for-byte unchanged. `download`-produced tiles are unaffected —
-> that path never had the bug.
+> input is byte-for-byte unchanged. `download`-produced tiles never had *that*
+> bug — but the download path had its own 0-for-void defect, fixed separately:
+> see changelog item 15 and §1.2, where a pixel no XYZ tile covered was written
+> as 0 m and is now this same `-9999`.
 >
 > The `download` path has a different no-data convention on its *input* side: a
 > Terrarium tile pixel decoding below **-11000 m** is a void and is backfilled
@@ -864,8 +905,9 @@ and rounded once at the end. Two rules qualify it:
 
 * **No-data is excluded from the mean, never averaged into it.** A footprint
   that mixes ground and no-data averages only the ground; a footprint that holds
-  nothing but no-data stays no-data (`ingest` falls through to its next source
-  and ultimately writes `-9999`; `download` passes the void through).
+  nothing but no-data stays no-data — `ingest` falls through to its next source
+  and ultimately writes `-9999`, and `download` writes `-9999` too, whether the
+  footprint held a source void (a blank Terrarium pixel) or no tile at all.
 * **A source at or coarser than the target is not interpolated.** The footprint
   then holds no source-sample centre at all, and the pixel takes the single
   source sample it sits inside — the same sample the previous point sampler took.
@@ -896,6 +938,23 @@ and rounded once at the end. Two rules qualify it:
 > output" claim made for the earlier E1 building/ingest work — must re-baseline.
 > The fixtures in `fixtures/formats/` are **unaffected**: `tiny_16x16.abt` is
 > synthesized by `tools/make_fixtures.py`, not produced by the converter.
+
+> **Correction (changes `.abt` payload bytes again — `ingest` registration).**
+> The area-average above was specified over "the ground footprint that pixel
+> stands for", but `ingest` anchored the ±half-pixel window on each output
+> cell's **NW corner** instead of its centre, sampling everything half an
+> output pixel to the north-west of the promised footprint. Compounding it,
+> `GTRasterTypeGeoKey` (1025) was ignored, so a **RasterPixelIsPoint** source
+> (Copernicus GLO, SRTM) was additionally misregistered half a *source* pixel
+> to the east and south — together nearly a full source pixel at ratio 1,
+> enough to void a pixel whose true footprint sits one pixel from a no-data
+> boundary. Both are corrected: the window is now centred on the cell centre
+> (§6 above now holds as written) and PixelIsPoint origins are shifted to the
+> pixel corner on load (§9a). `.abt` payload bytes move for every `ingest`
+> input; header, stride and sentinel are untouched. `download` is unaffected
+> (its assembly-grid lookup was already centre-corrected above). Consumers
+> that cache tiles keyed on converter behaviour must invalidate (the Waveshed
+> plugin bumps its pool cache schema for this).
 
 **Row stride details.**
 * `row_stride` is a stored `u16`, so it caps the maximum tile width at
@@ -1151,6 +1210,11 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
   `ModelTransformation` tag, or `ModelTiepoint` + `ModelPixelScale`); a file
   without one is a **hard error** naming the file. Georeferencing is **never**
   derived from file names (the old filename fallback is gone).
+  `GTRasterTypeGeoKey` (1025) is honoured: when it is `2`
+  (**RasterPixelIsPoint** — how Copernicus GLO and SRTM ship), the origin
+  names the *centre* of pixel (0,0) and is shifted by half a source pixel to
+  the NW corner before sampling, exactly as GDAL does on read. Absent key or
+  `1` (RasterPixelIsArea) reads the origin as the corner unchanged.
   A GeoTIFF `path` must also be **single-band** (greyscale colortype, one
   sample per pixel, any sample type): an RGB(A)/palette/GrayA file is a
   picture — a rendered basemap, hillshade or photo — and is a **hard error**
@@ -1226,6 +1290,34 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `ul_lon` | f64 | Upper-left longitude (east-positive). |
 | `size_px` | u32 | Tile side (px). |
 | `resolution_m` | f64 | Metres per pixel; the writer sets `scale_x = scale_y = resolution_m / 111111`. |
+
+**Tile size is read, never assumed.** The job says nothing about how large the
+source's XYZ tiles are, and services disagree: AWS Terrarium serves **256 px**
+tiles, MapTiler's `terrain-rgb` serves **512 px** ones (its `tiles.json`
+declares `"scale": "2.000000"`, i.e. `@2x`). The edge is therefore taken from
+the first PNG that decodes and held for the rest of the run; the assembly grid,
+its row stride and the per-tile-row sample count all follow it.
+
+This does **not** change the ground resolution: `zoom` is the caller's choice
+and is untouched. A 512 px z12 tile covers exactly the ground a 256 px z12 tile
+covers, with four times the samples, and the area-averaging of §6 absorbs them.
+
+Three tile-geometry faults are **hard errors**, each naming what arrived. They
+abort the whole run rather than counting as one lost tile, because tile geometry
+is a property of the service and every other tile is wrong the same way:
+
+| Fault | Message (prefix `XYZ tile geometry:`) |
+|-------|----------------------------------------|
+| Non-square tile | `tile is {w}x{h} px; XYZ tiles must be square` |
+| Not 8 bits per channel | `tile is {n}-bit; XYZ terrain tiles must be 8 bits per channel` |
+| Mixed sizes in one run | `tile x={x} y={y} is {a}x{a} px but this source already served {b}x{b} px tiles; one XYZ service cannot mix tile sizes — the assembly grid has one stride.` |
+
+These are distinct from the `Tile download failed:` refusal above: that one
+counts lost tiles against a majority threshold, whereas any single tile with
+unusable geometry stops the run. Both remove the `.abt` files the run created.
+
+Anything else a tile source does wrong — a 404, a timeout, a WebP body — stays a
+per-tile failure, tallied in `[Stats] ERRORS` and judged by the majority rule.
 
 ---
 

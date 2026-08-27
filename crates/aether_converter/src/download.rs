@@ -98,7 +98,34 @@ pub fn dec_mapbox(r: u8, g: u8, b: u8) -> f32 {
     -10000.0 + (r as f32 * 6553.6 + g as f32 * 25.6 + b as f32 * 0.1)
 }
 
-pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
+/// Marks a decode failure that condemns the whole run rather than one tile.
+///
+/// Tile geometry is a property of the *service*: a source that answers with a
+/// non-square or a 16-bit tile answers every request that way, so counting it
+/// as one lost tile and carrying on assembles nothing but folded or garbage
+/// terrain. Both the retry classifier and the assembly loop key off this
+/// prefix — the first tile carrying it stops the run naming what arrived.
+pub const TILE_GEOMETRY_ERR: &str = "XYZ tile geometry";
+
+/// The tile edge assumed before any tile has been decoded — the XYZ default.
+const DEFAULT_TILE_PX: usize = 256;
+
+/// The largest tile edge a service is assumed to serve, for sizing estimates
+/// made before the first tile arrives. MapTiler's `@2x` terrain-RGB is 512.
+const MAX_TILE_PX: usize = 512;
+
+/// Decode one terrain PNG into metres, with the square tile edge it came at.
+///
+/// The edge is returned rather than assumed: MapTiler's terrain-RGB v1 serves
+/// **512 px** (`"scale": "2.000000"`) tiles where AWS Terrarium serves 256, and
+/// indexing a 512-wide tile with a 256-wide row stride folds it in half — the
+/// west half onto the even output rows, the east half onto the odd ones. That
+/// produced terrain off by ~555 m at p95 while looking entirely plausible.
+///
+/// Anything this loop cannot read as 8-bit RGB(A) is refused instead of being
+/// decoded into confident nonsense: a non-square tile has no assembly stride,
+/// and a 16-bit tile puts two bytes where the decoder reads one channel.
+pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<(Vec<f32>, usize)> {
     let decoder = png::Decoder::new(std::io::Cursor::new(body));
     let mut reader = decoder.read_info()?;
     let info = reader.info().clone();
@@ -106,6 +133,15 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
     let frame = reader.next_frame(&mut buf)?;
     let bytes = &buf[..frame.buffer_size()];
     let (w, h) = (info.width as usize, info.height as usize);
+    if w != h || w == 0 {
+        anyhow::bail!("{TILE_GEOMETRY_ERR}: tile is {w}x{h} px; XYZ tiles must be square");
+    }
+    if info.bit_depth != png::BitDepth::Eight {
+        anyhow::bail!(
+            "{TILE_GEOMETRY_ERR}: tile is {}-bit; XYZ terrain tiles must be 8 bits per channel",
+            info.bit_depth as u8
+        );
+    }
     let ch = if info.color_type == png::ColorType::Rgba { 4 } else { 3 };
     let mut out = vec![0.0f32; w * h];
     for i in 0..w * h {
@@ -114,7 +150,7 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
             out[i] = dec(bytes[o], bytes[o + 1], bytes[o + 2]);
         }
     }
-    Ok(out)
+    Ok((out, w))
 }
 
 // Terrarium NODATA backfill ---------------------------------------------------
@@ -128,6 +164,20 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<Vec<f32>> {
 
 const NODATA_M: f32 = -11000.0; // below the deepest ocean -> anything lower is a void
 const NODATA_FILL_MIN_ZOOM: u32 = 6;
+
+/// The assembly-grid value for "no tile ever covered this sample".
+///
+/// Distinct from a source void (a blank Terrarium pixel, ~-32768 m) only in
+/// magnitude, and far below [`NODATA_M`], so the void-exclusion in [`avg_cell`]
+/// already keeps it out of any mean it shares a footprint with. It exists so
+/// that a tile which never arrived reads as *absent* rather than as 0 m: 0 is a
+/// perfectly valid sea-level elevation, and writing it marks fabricated ocean
+/// as real ground that no consumer can tell from surveyed terrain.
+const NO_TILE_M: f32 = -1.0e30;
+
+/// The `.abt` no-data sentinel, shared with the ingest path — one convention
+/// for "no terrain here" across both writers (§6 of the contract).
+use crate::ingest::VOID_ELEV;
 
 // Assembly resampling ---------------------------------------------------------
 //
@@ -176,7 +226,10 @@ fn grid_span(lo: f64, hi: f64, n: usize) -> (usize, usize) {
     (0, 0)
 }
 
-/// The source rows of a 256-row tile-row that one output row covers.
+/// The source rows of an `n`-row tile-row that one output row covers.
+///
+/// `n` is the decoded tile edge, not a constant: a 512 px `@2x` tile carries
+/// twice the rows a 256 px one does over the same ground.
 ///
 /// Callers only reach this for an output row whose centre lies inside the
 /// tile-row, so an empty span is a floating-point edge case at the boundary;
@@ -185,12 +238,12 @@ fn grid_span(lo: f64, hi: f64, n: usize) -> (usize, usize) {
 /// averaged over the part of its footprint this tile-row holds, because the
 /// assembly only ever has one tile-row of the grid in memory.
 #[inline]
-fn tile_row_span(lo: f64, hi: f64) -> (usize, usize) {
-    let (a, b) = grid_span(lo, hi, 256);
+fn tile_row_span(lo: f64, hi: f64, n: usize) -> (usize, usize) {
+    let (a, b) = grid_span(lo, hi, n);
     if a < b {
         (a, b)
     } else {
-        let c = (((lo + hi) * 0.5) as usize).min(255);
+        let c = (((lo + hi) * 0.5) as usize).min(n.saturating_sub(1));
         (c, c + 1)
     }
 }
@@ -199,8 +252,8 @@ fn tile_row_span(lo: f64, hi: f64) -> (usize, usize) {
 ///
 /// Column `x` covers `[ul_lon + x*pd, ul_lon + (x+1)*pd)`; `gul_lon`/`gpx` place
 /// and scale the grid. A column whose footprint misses the grid entirely gets an
-/// empty span, which [`avg_cell`] writes as 0 m — what a missing tile already
-/// produces.
+/// empty span, which [`avg_cell`] writes as the `-9999` void sentinel — the same
+/// thing a tile that never arrived writes.
 fn x_span_table(
     sz: usize, ul_lon: f64, pd: f64, gul_lon: f64, gpx: f64, gw: usize,
 ) -> Vec<(u32, u32)> {
@@ -229,21 +282,23 @@ fn half_metres(v: f32) -> i16 {
 /// Area-average one output cell out of the assembly grid, in half-metres.
 ///
 /// Voids are excluded from the mean rather than averaged into it: a Terrarium
-/// pixel the parent-tile backfill could not repair is ~-32768 m, and letting one
-/// into a mean would drag the whole cell into a pit. A cell with nothing but
-/// voids under it passes one through, exactly as the point sample did, and a
-/// cell whose footprint misses the grid entirely stays 0 m — what a tile that
-/// failed to download already writes.
+/// pixel the parent-tile backfill could not repair is ~-32768 m, a sample no
+/// tile ever covered is [`NO_TILE_M`], and letting either into a mean would drag
+/// the whole cell into a pit. A cell with nothing but voids under it, and a cell
+/// whose footprint misses the grid entirely, are written as the `-9999`
+/// [`VOID_ELEV`] sentinel — **not** as 0 m, which is a valid sea-level elevation
+/// and would present a tile that never downloaded as real ocean.
 ///
 /// One-sample cells (the target finer than the source) skip the accumulator
 /// entirely, so they cost what the nearest-neighbour lookup cost.
 #[inline(always)]
 fn avg_cell(grid: &[f32], gw: usize, c0: usize, c1: usize, r0: usize, r1: usize) -> i16 {
     if c0 >= c1 {
-        return 0;
+        return VOID_ELEV;
     }
     if c1 - c0 == 1 && r1 - r0 == 1 {
-        return half_metres(grid[r0 * gw + c0]);
+        let v = grid[r0 * gw + c0];
+        return if v <= NODATA_M { VOID_ELEV } else { half_metres(v) };
     }
     // Sum and track the minimum in one branchless pass. A void is far below any
     // terrain, so the minimum alone says whether one is present, and the
@@ -273,9 +328,24 @@ fn avg_cell(grid: &[f32], gw: usize, c0: usize, c1: usize, r0: usize, r1: usize)
         }
     }
     if cnt == 0 {
-        return half_metres(grid[r0 * gw + c0]);
+        return VOID_ELEV;
     }
     half_metres(vsum * recip(cnt as usize))
+}
+
+/// One `.abt` row of void, padded to `stride` — what a row no tile covered
+/// looks like on disk.
+///
+/// The `size_px * 2` payload bytes are the `-9999` sentinel; the stride padding
+/// stays zero, because it is alignment slack and not pixel data (§6 of the
+/// contract puts the row payload at `44 + row*stride`, `size_px` samples wide).
+fn void_row_bytes(size_px: usize, stride: usize) -> Vec<u8> {
+    let mut row = vec![0u8; stride];
+    let void = VOID_ELEV.to_le_bytes();
+    for x in 0..size_px {
+        row[x * 2..x * 2 + 2].copy_from_slice(&void);
+    }
+    row
 }
 
 /// `1.0 / n`, from a table for the small counts a footprint actually has.
@@ -289,10 +359,10 @@ fn recip(n: usize) -> f32 {
     if n < R.len() { R[n] } else { 1.0 / n as f32 }
 }
 
-/// One fetch + decode of a single tile (no retry) -> 256x256 grid, or None.
+/// One fetch + decode of a single tile (no retry) -> (grid, tile edge), or None.
 async fn fetch_decode_raw(
     client: &reqwest::Client, url: &str, dec: fn(u8, u8, u8) -> f32,
-) -> Option<Vec<f32>> {
+) -> Option<(Vec<f32>, usize)> {
     let resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -304,7 +374,7 @@ async fn fetch_decode_raw(
 /// Fill the NODATA pixels of a zoom-`z` tile from progressively coarser parents.
 async fn fill_from_parents(
     client: &reqwest::Client, url_template: &str, z: u32, x: u32, y: u32,
-    dec: fn(u8, u8, u8) -> f32, mut grid: Vec<f32>,
+    dec: fn(u8, u8, u8) -> f32, mut grid: Vec<f32>, ts: usize,
 ) -> Vec<f32> {
     let mut missing: Vec<usize> =
         (0..grid.len()).filter(|&i| grid[i] <= NODATA_M).collect();
@@ -315,14 +385,18 @@ async fn fill_from_parents(
             .replace("{z}", &az.to_string())
             .replace("{x}", &ax.to_string())
             .replace("{y}", &ay.to_string());
-        if let Some(anc) = fetch_decode_raw(client, &url, dec).await {
-            if anc.len() == 256 * 256 {
-                let (base_x, base_y) = (ax as u64 * 256, ay as u64 * 256);
+        if let Some((anc, aedge)) = fetch_decode_raw(client, &url, dec).await {
+            // The parent has to be the same tile size as the child — one
+            // service, one grid. A parent of a different size is not a parent
+            // this pixel mapping can address, so skip it rather than fold it.
+            if aedge == ts && anc.len() == ts * ts {
+                let t = ts as u64;
+                let (base_x, base_y) = (ax as u64 * t, ay as u64 * t);
                 missing.retain(|&i| {
-                    let (px, py) = ((i % 256) as u64, (i / 256) as u64);
-                    let apx = (((x as u64) * 256 + px) >> level) - base_x;
-                    let apy = (((y as u64) * 256 + py) >> level) - base_y;
-                    let v = anc[(apy * 256 + apx) as usize];
+                    let (px, py) = ((i % ts) as u64, (i / ts) as u64);
+                    let apx = (((x as u64) * t + px) >> level) - base_x;
+                    let apy = (((y as u64) * t + py) >> level) - base_y;
+                    let v = anc[(apy * t + apx) as usize];
                     if v > NODATA_M { grid[i] = v; false } else { true }
                 });
             }
@@ -330,6 +404,55 @@ async fn fill_from_parents(
         level += 1;
     }
     grid
+}
+
+/// The XYZ tile edge this run assembles for, taken from the tiles themselves.
+///
+/// Tile size is a property of the service, not of the job: MapTiler's
+/// terrain-rgb serves 512 px (`@2x`) tiles, AWS Terrarium serves 256, and the
+/// URL says nothing about which. So the first tile that decodes fixes the edge
+/// for the run, and any later tile that disagrees stops it — one assembly grid
+/// has one stride, and guessing which of the two sizes is "right" would fold
+/// half the tiles either way.
+///
+/// The zoom, and therefore the ground resolution, is the caller's choice and is
+/// untouched by this: a 512 px z12 tile simply carries finer samples over the
+/// same ground, and the area-averaging in [`avg_cell`] absorbs them.
+#[derive(Default)]
+struct TileSize {
+    edge: Option<usize>,
+}
+
+impl TileSize {
+    /// Adopt this strip's tiles and return the edge to assemble it with.
+    ///
+    /// Fails on a mixed-size source, and on any tile whose decode was refused
+    /// for its geometry — both are the source being wrong for every tile, not
+    /// one tile being lost. Returns [`DEFAULT_TILE_PX`] while nothing has
+    /// decoded yet; such a strip has no tile data to place, so the grid it
+    /// sizes is written out as void whatever the edge.
+    fn adopt(&mut self, results: &[(u32, u32, Result<(Vec<f32>, usize)>)]) -> Result<usize> {
+        for (tx, ty, r) in results {
+            match r {
+                Ok((_, edge)) => match self.edge {
+                    None => self.edge = Some(*edge),
+                    Some(e) if e != *edge => anyhow::bail!(
+                        "{TILE_GEOMETRY_ERR}: tile x={tx} y={ty} is {edge}x{edge} px but \
+                         this source already served {e}x{e} px tiles; one XYZ service \
+                         cannot mix tile sizes — the assembly grid has one stride."
+                    ),
+                    _ => {}
+                },
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if msg.contains(TILE_GEOMETRY_ERR) {
+                        anyhow::bail!("{msg} (tile x={tx} y={ty})");
+                    }
+                }
+            }
+        }
+        Ok(self.edge.unwrap_or(DEFAULT_TILE_PX))
+    }
 }
 
 // -- Download diagnostics -----------------------------------------------------
@@ -567,7 +690,7 @@ async fn download_strip(
     on_progress: Option<&(dyn Fn(usize, usize) + Send + Sync)>,
     #[cfg(target_arch = "wasm32")]
     on_progress: Option<&dyn Fn(usize, usize)>,
-) -> Vec<(u32, u32, Result<Vec<f32>>)> {
+) -> Vec<(u32, u32, Result<(Vec<f32>, usize)>)> {
     let coords: Vec<_> = (strip_y0..=strip_y1)
         .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
         .collect();
@@ -600,7 +723,8 @@ async fn download_strip(
                 // — clearing the deterministic stripe without lowering the
                 // connection count for the bulk download.
                 const MAX_RETRIES: u32 = 5;
-                let mut result: Result<Vec<f32>> = Err(anyhow::anyhow!("not started"));
+                let mut result: Result<(Vec<f32>, usize)> =
+                    Err(anyhow::anyhow!("not started"));
                 let mut retryable;
 
                 for attempt in 0..=MAX_RETRIES {
@@ -644,6 +768,7 @@ async fn download_strip(
                             || msg.contains("png")
                             || msg.contains("PNG")
                             || msg.contains("nvalid")
+                            || msg.contains(TILE_GEOMETRY_ERR)
                         {
                             retryable = false; // Decode errors won't fix themselves.
                         }
@@ -656,11 +781,14 @@ async fn download_strip(
                 // Terrarium NODATA voids: if this tile came back with blank
                 // pixels, backfill only those from real (upsampled) data in the
                 // coarser parent tiles instead of leaving a -16 km pit / stripe.
-                if matches!(&result, Ok(g) if g.iter().any(|&v| v <= NODATA_M)) {
-                    if let Ok(g) = result {
-                        result = Ok(fill_from_parents(
-                            &client, url_template, zoom, tx, ty, dec, g,
-                        ).await);
+                if matches!(&result, Ok((g, _)) if g.iter().any(|&v| v <= NODATA_M)) {
+                    if let Ok((g, ts)) = result {
+                        result = Ok((
+                            fill_from_parents(
+                                &client, url_template, zoom, tx, ty, dec, g, ts,
+                            ).await,
+                            ts,
+                        ));
                     }
                 }
 
@@ -709,6 +837,7 @@ async fn download_strip(
                             || msg.contains("png")
                             || msg.contains("PNG")
                             || msg.contains("nvalid")
+                            || msg.contains(TILE_GEOMETRY_ERR)
                         {
                             let prev = stats.err_decode.fetch_add(1, Ordering::Relaxed);
                             if prev == 0 {
@@ -1209,12 +1338,12 @@ pub fn run_download(job_file: &Path) -> Result<()> {
 
 /// Whether losing *failed* of *attempted* XYZ tiles must fail the whole run.
 ///
-/// A tile that never arrived is not a hole in the output — it is written as
-/// 0 m, sea level, because the assembly grid is zero-filled and the failed tile
-/// is simply never copied in. So a download that 404s everything (the classic
-/// cause: a max zoom the tile source does not serve) still produces a full set
-/// of plausible-looking flat `.abt` files, and `run_download` used to return
-/// `Ok(())` for it.
+/// A tile that never arrived is written as the `-9999` void sentinel, so the
+/// hole is at least visible now — but a download that 404s everything (the
+/// classic cause: a max zoom the tile source does not serve) still produces a
+/// full set of well-formed, entirely empty `.abt` files, and `run_download`
+/// used to return `Ok(())` for it. (Before the void sentinel it produced a full
+/// set of *plausible-looking flat* ones, which was worse.)
 ///
 /// Sparse 404s at the edge of a provider's coverage are normal and must stay
 /// non-fatal, so the line is drawn at a **majority** of the requested tiles:
@@ -1228,11 +1357,11 @@ fn fetch_failure_is_fatal(failed: usize, attempted: usize) -> bool {
 /// Removes the `.abt` files a run created, unless it reached [`AbtCleanup::keep`].
 ///
 /// Every output file is created with a valid header *before* the first tile is
-/// fetched and is sized to full length once assembly ends, while tiles that
-/// never arrived stay 0 m — so a run that bails out afterwards leaves a
-/// complete, plausible-looking `.abt` of sea-level terrain behind. Callers pool
-/// tiles by filename, so that file is a cache hit for every later run: one
-/// refusal poisons the pool with flat ocean. A failed download must therefore
+/// fetched and is sized to full length once assembly ends — so a run that bails
+/// out afterwards leaves a complete, well-formed `.abt` behind, void where the
+/// tiles never arrived and real terrain where a few did. Callers pool tiles by
+/// filename, so that file is a cache hit for every later run: one refusal
+/// poisons the pool with a mostly-empty tile. A failed download must therefore
 /// leave nothing reusable behind.
 ///
 /// It is a drop guard rather than a cleanup call at the fatal branch because
@@ -1305,8 +1434,12 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     let gul_lat = ty2lat(y0, job.zoom);
     let glr_lon = tx2lon(x1 + 1, job.zoom);
     let glr_lat = ty2lat(y1 + 1, job.zoom);
-    let gw = nx * 256;
-    let gpx = (glr_lon - gul_lon) / gw as f64;
+
+    // The assembly grid is `nx * tile_edge` samples wide, and the tile edge is
+    // not known until a tile has been decoded — see `TileSize`. Geometry is
+    // therefore derived per strip, below; only the RAM estimate has to guess,
+    // and it guesses high.
+    let mut tile_size = TileSize::default();
 
     let tile_size_kb = 200;
     let est_mb = total * tile_size_kb / 1024;
@@ -1397,10 +1530,13 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     }
 
     // Dynamic prefetch depth: keep total buffered tile data within RAM budget.
-    let bytes_per_tile_data: usize = 256 * 256 * 4; // f32 per XYZ tile pixel
+    // Sized for the largest tile a service is assumed to serve: this runs
+    // before the first fetch, so the real edge is still unknown, and guessing
+    // 256 for a 512 px source would under-budget the pipeline fourfold.
+    let bytes_per_tile_data: usize = MAX_TILE_PX * MAX_TILE_PX * 4; // f32 per tile pixel
     let actual_strip_rows = (strip_rows as usize).min(ny);
     let strip_mem = nx * actual_strip_rows * bytes_per_tile_data;
-    let mini_grid_mem = gw * 256 * 4;
+    let mini_grid_mem = nx * MAX_TILE_PX * MAX_TILE_PX * 4;
 
     let mut sys = System::new();
     sys.refresh_memory();
@@ -1425,7 +1561,8 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(conns));
     let asm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_ASM));
 
-    type StripHandle = tokio::task::JoinHandle<Vec<(u32, u32, Result<Vec<f32>>)>>;
+    type StripHandle =
+        tokio::task::JoinHandle<Vec<(u32, u32, Result<(Vec<f32>, usize)>)>>;
 
     let spawn_strip = |sy0: u32, sy1: u32, cl: reqwest::Client, ut: Arc<String>,
                        pr: Arc<AtomicUsize>, st: Arc<DownloadStats>,
@@ -1459,14 +1596,15 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
 
     for strip_idx in 0..strips.len() {
         let (sy0, sy1) = strips[strip_idx];
-        let sny = (sy1 - sy0 + 1) as usize;
-        let sh = sny * 256;
-        let sul = ty2lat(sy0, zoom);
-        let slr = ty2lat(sy1 + 1, zoom);
-        let spy = (sul - slr) / sh as f64;
-
         // Await the front of the pipeline.
         let results = pipeline.pop_front().unwrap().await?;
+
+        // Fix (or re-check) the tile edge this run assembles for, and derive
+        // the grid from it. A source that mixes sizes, or that served a tile
+        // this decoder refused on its geometry, stops the run here.
+        let ts = tile_size.adopt(&results)?;
+        let gw = nx * ts;
+        let gpx = (glr_lon - gul_lon) / gw as f64;
 
         // Log strip download results.
         let strip_ok = results.iter().filter(|(_, _, r)| r.is_ok()).count();
@@ -1510,7 +1648,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                     let t_setup = Instant::now();
                     let mut tiles_by_row: Vec<Vec<(u32, &[f32])>> = vec![Vec::new(); sny];
                     for (tx, ty, r) in &results {
-                        if let Ok(elev) = r {
+                        if let Ok((elev, _)) = r {
                             tiles_by_row[(*ty - sy0) as usize]
                                 .push((*tx, elev.as_slice()));
                         }
@@ -1534,9 +1672,9 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                     let mut sought = vec![false; specs.len()];
                     let setup_ms = t_setup.elapsed().as_millis();
 
-                    // Process one tile-row at a time. Grid = gw×256 ≈ 36 MB (fits in L3).
+                    // Process one tile-row at a time. Grid = gw×ts ≈ 36 MB (fits in L3).
                     let t_work = Instant::now();
-                    let mut mini_grid = vec![0.0f32; gw * 256];
+                    let mut mini_grid = vec![NO_TILE_M; gw * ts];
                     let mut total_rows = 0usize;
                     let mut total_px = 0usize;
                     const PAD: [u8; 256] = [0u8; 256];
@@ -1544,22 +1682,24 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                     for tr in 0..sny {
                         let ty = sy0 + tr as u32;
 
-                        // Clear mini-grid so failed tiles don't leak stale data
-                        // from previous tile-rows.
-                        mini_grid.fill(0.0);
+                        // Clear the mini-grid so failed tiles don't leak stale
+                        // data from previous tile-rows. The clear value is
+                        // "no tile", not 0 m: whatever a failed tile leaves
+                        // behind is what gets written out for it.
+                        mini_grid.fill(NO_TILE_M);
 
                         for &(tx, elev) in &tiles_by_row[tr] {
-                            let col = (tx - x0) as usize * 256;
-                            for py in 0..256usize {
-                                let cw = 256.min(gw - col);
+                            let col = (tx - x0) as usize * ts;
+                            for py in 0..ts {
+                                let cw = ts.min(gw - col);
                                 mini_grid[py * gw + col..py * gw + col + cw]
-                                    .copy_from_slice(&elev[py * 256..py * 256 + cw]);
+                                    .copy_from_slice(&elev[py * ts..py * ts + cw]);
                             }
                         }
 
                         let tr_top = ty2lat(ty, zoom);
                         let tr_bot = ty2lat(ty + 1, zoom);
-                        let tr_spy = (tr_top - tr_bot) / 256.0;
+                        let tr_spy = (tr_top - tr_bot) / ts as f64;
 
                         // Sample + write output rows that fall within this tile-row.
                         // Parallel across sub-tiles (each writes to its own file).
@@ -1583,6 +1723,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                                     let (r0, r1) = tile_row_span(
                                         (tr_top - (spec.ul_lat - y as f64 * pd)) / tr_spy,
                                         (tr_top - (spec.ul_lat - (y + 1) as f64 * pd)) / tr_spy,
+                                        ts,
                                     );
 
                                     let mut row_data = vec![0i16; sz];
@@ -1641,34 +1782,52 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         h.await??;
     }
 
-    // Set final file sizes — fills any unwritten trailing rows with zeros.
-    // (Needed because we skipped set_len pre-allocation.)
+    // Bring every file to full length — assembly only wrote the rows some
+    // tile-row covered, and `AbtWriter::create` deliberately skips the
+    // `set_len` pre-allocation. The tail is written as void rather than
+    // `set_len`'s zeros, for the same reason the grid is: 0 m is sea level.
     for (spec, path) in &abt_specs {
-        let bpr = spec.size_px as u64 * 2;
-        let stride = (bpr + 255) & !255;
-        let expected = 44 + stride * spec.size_px as u64;
-        if let Ok(f) = fs::OpenOptions::new().write(true).open(path) {
+        let sz = spec.size_px as usize;
+        let stride = ((sz * 2) + 255) & !255;
+        let expected = 44 + stride as u64 * sz as u64;
+        if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
             let actual = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if actual < expected {
+            if actual >= expected {
+                continue;
+            }
+            // Rows are written whole, so the tail starts on a row boundary;
+            // a partial one (an interrupted flush) is rewritten from its start.
+            let written = actual.saturating_sub(44) / stride as u64;
+            let row = void_row_bytes(sz, stride);
+            let wrote = (|| -> Result<()> {
+                f.seek(SeekFrom::Start(44 + written * stride as u64))?;
+                let mut w = BufWriter::with_capacity(1 << 20, &mut f);
+                for _ in written..sz as u64 {
+                    w.write_all(&row)?;
+                }
+                w.flush()?;
+                Ok(())
+            })();
+            if wrote.is_err() {
                 let _ = f.set_len(expected);
             }
         }
     }
 
     // A run that fetched almost nothing is not a successful run. A tile that
-    // never arrived is never copied into the just-`fill(0.0)`-ed mini-grid, so
-    // it is written out as 0 m — flat terrain at sea level, indistinguishable
-    // downstream from real data. Report it as the failure it is instead of
-    // exiting 0 with an ocean-flat .abt, and name the error class: "could not
-    // be fetched" alone reads as a network fault even when the real cause is a
-    // source serving WebP to a PNG decoder. `cleanup` takes the files with it.
+    // never arrived is never copied into the mini-grid, so it is written out as
+    // the `-9999` void sentinel — a visible hole, but still nothing a consumer
+    // can build terrain from. Report it as the failure it is instead of exiting
+    // 0 with an empty .abt, and name the error class: "could not be fetched"
+    // alone reads as a network fault even when the real cause is a source
+    // serving WebP to a PNG decoder. `cleanup` takes the files with it.
     let failed = stats.total_errors();
     let attempted = stats.total_tiles();
     if fetch_failure_is_fatal(failed, attempted) {
         stats.log_summary(start.elapsed().as_secs_f64());
         anyhow::bail!(
             "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
-             the output would be mostly flat 0 m, not terrain. Errors: {}. Check that \
+             the output would be mostly void, not terrain. Errors: {}. Check that \
              the tile source serves zoom {} over this area and that the network is \
              reachable.",
             failed,
@@ -1804,13 +1963,13 @@ pub async fn run_download_mem(
     let total = nx * ny;
     let gul_lon = tx2lon(x0, job.zoom);
     let glr_lon = tx2lon(x1 + 1, job.zoom);
-    let gw = nx * 256;
-    let gpx = (glr_lon - gul_lon) / gw as f64;
 
     eprintln!("[DownloadMem] z={} tiles={}x{}={} connections={}",
         job.zoom, nx, ny, total, conns);
 
-    // 3. Prepare in-memory .abt buffers (pre-allocate with header + zeroed body).
+    // 3. Prepare in-memory .abt buffers (header + a body of void).
+    //    The body is pre-filled with the `-9999` sentinel so a pixel no tile
+    //    ever covered reads as absent; a zeroed body would read as sea level.
     struct MemAbt {
         filename: String,
         buf: Vec<u8>,
@@ -1826,8 +1985,15 @@ pub async fn run_download_mem(
         let pd = spec.resolution_m / 111_111.0;
         let bpr = spec.size_px as usize * 2;
         let stride = (bpr + 255) & !255;
-        let total_bytes = 44 + stride * spec.size_px as usize;
+        let sz = spec.size_px as usize;
+        let total_bytes = 44 + stride * sz;
         let mut buf = vec![0u8; total_bytes];
+        {
+            let row = void_row_bytes(sz, stride);
+            for y in 0..sz {
+                buf[44 + y * stride..44 + (y + 1) * stride].copy_from_slice(&row);
+            }
+        }
 
         // Write 44-byte .abt header (identical to AbtWriter::create).
         {
@@ -1854,10 +2020,17 @@ pub async fn run_download_mem(
         });
     }
 
-    // 4. Pre-compute x-lookup tables (pixel x → source column span).
-    let x_luts: Vec<Vec<(u32, u32)>> = abt_bufs.iter().map(|abt| {
-        x_span_table(abt.size_px as usize, abt.ul_lon, abt.pd, gul_lon, gpx, gw)
-    }).collect();
+    // 4. The x-lookup tables (pixel x → source column span) and the assembly
+    //    grid both scale with the XYZ tile edge, which is not known until a
+    //    tile has been decoded — see `TileSize`. They are built on the first
+    //    strip that decodes anything and rebuilt only if the edge changes,
+    //    which it can do at most once (a second change is a fatal mixed-size
+    //    source).
+    let mut tile_size = TileSize::default();
+    let mut ts = 0usize;
+    let mut gw = 0usize;
+    let mut x_luts: Vec<Vec<(u32, u32)>> = Vec::new();
+    let mut mini_grid: Vec<f32> = Vec::new();
 
     // 5. Build strip ranges.
     let strip_rows: u32 = 32;
@@ -1898,7 +2071,6 @@ pub async fn run_download_mem(
     // WASM: tiles already downloaded via download_all_tiles_web (browser fetch).
     //       Strip loop only decodes PNGs and assembles.
     // Native: downloads per-strip via reqwest (download_strip_raw), then decodes.
-    let mut mini_grid = vec![0.0f32; gw * 256];
 
     #[cfg(target_arch = "wasm32")]
     let mut decoded_count: usize = 0;
@@ -1927,14 +2099,14 @@ pub async fn run_download_mem(
 
         // Phase 2: Decode PNGs sequentially, then classify decode errors.
 
-        let mut results: Vec<(u32, u32, Result<Vec<f32>>)> =
+        let mut results: Vec<(u32, u32, Result<(Vec<f32>, usize)>)> =
             Vec::with_capacity(raw_results.len());
         for (tx, ty, raw) in raw_results {
             match raw {
                 Ok(png_bytes) => {
                     match decode_png(&png_bytes, dec) {
-                        Ok(elev) => {
-                            results.push((tx, ty, Ok(elev)));
+                        Ok(tile) => {
+                            results.push((tx, ty, Ok(tile)));
 
                             // Report decode progress every 5 % (phase 1).
                             #[cfg(target_arch = "wasm32")]
@@ -1987,10 +2159,24 @@ pub async fn run_download_mem(
                 strip_idx + 1, strips.len(), strip_total, strip_ok, strip_err);
         }
 
+        // Fix (or re-check) the tile edge, and size the grid to it. A source
+        // that mixes tile sizes, or that served a tile this decoder refused on
+        // its geometry, stops the run here rather than folding the assembly.
+        let strip_ts = tile_size.adopt(&results)?;
+        if strip_ts != ts {
+            ts = strip_ts;
+            gw = nx * ts;
+            let gpx = (glr_lon - gul_lon) / gw as f64;
+            x_luts = abt_bufs.iter().map(|abt| {
+                x_span_table(abt.size_px as usize, abt.ul_lon, abt.pd, gul_lon, gpx, gw)
+            }).collect();
+            mini_grid = vec![NO_TILE_M; gw * ts];
+        }
+
         // Group tiles by row within the strip.
         let mut tiles_by_row: Vec<Vec<(u32, &[f32])>> = vec![Vec::new(); sny];
         for (tx, ty, r) in &results {
-            if let Ok(elev) = r {
+            if let Ok((elev, _)) = r {
                 tiles_by_row[(*ty - sy0) as usize].push((*tx, elev.as_slice()));
             }
         }
@@ -1999,23 +2185,23 @@ pub async fn run_download_mem(
         for tr in 0..sny {
             let ty = sy0 + tr as u32;
 
-            // Clear mini-grid so failed tiles don't leak stale data
-            // from previous tile-rows.
-            mini_grid.fill(0.0);
+            // Clear the mini-grid so failed tiles don't leak stale data from
+            // previous tile-rows. The clear value is "no tile", not 0 m.
+            mini_grid.fill(NO_TILE_M);
 
             // Fill mini-grid from downloaded tile data.
             for &(tx, elev) in &tiles_by_row[tr] {
-                let col = (tx - x0) as usize * 256;
-                for py in 0..256usize {
-                    let cw = 256.min(gw - col);
+                let col = (tx - x0) as usize * ts;
+                for py in 0..ts {
+                    let cw = ts.min(gw - col);
                     mini_grid[py * gw + col..py * gw + col + cw]
-                        .copy_from_slice(&elev[py * 256..py * 256 + cw]);
+                        .copy_from_slice(&elev[py * ts..py * ts + cw]);
                 }
             }
 
             let tr_top = ty2lat(ty, zoom);
             let tr_bot = ty2lat(ty + 1, zoom);
-            let tr_spy = (tr_top - tr_bot) / 256.0;
+            let tr_spy = (tr_top - tr_bot) / ts as f64;
 
             // Sample output rows from the mini-grid into each abt buffer.
             for (sti, abt) in abt_bufs.iter_mut().enumerate() {
@@ -2034,6 +2220,7 @@ pub async fn run_download_mem(
                     let (r0, r1) = tile_row_span(
                         (tr_top - (abt.ul_lat - y as f64 * abt.pd)) / tr_spy,
                         (tr_top - (abt.ul_lat - (y + 1) as f64 * abt.pd)) / tr_spy,
+                        ts,
                     );
 
                     let buf_offset = 44 + y * abt.stride;
@@ -2048,7 +2235,7 @@ pub async fn run_download_mem(
                         abt.buf[byte_off..byte_off + 2]
                             .copy_from_slice(&val.to_le_bytes());
                     }
-                    // Stride padding is already zeroed from vec![0u8; ...].
+                    // Stride padding is already zeroed by `void_row_bytes`.
                 }
             }
         }
@@ -2147,6 +2334,93 @@ mod tests {
         assert!((dec_mapbox(1, 173, 176) - 1000.0).abs() < 1e-2);
     }
 
+    /// A `w`x`h` Terrarium PNG of uniform 100 m terrain (RGB 128,100,0).
+    #[cfg(test)]
+    fn terrarium_png(w: u32, h: u32, depth: png::BitDepth) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, w, h);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(depth);
+            let mut wr = enc.write_header().unwrap();
+            let n = (w * h) as usize * 3 * if depth == png::BitDepth::Sixteen { 2 } else { 1 };
+            let px: Vec<u8> = if depth == png::BitDepth::Sixteen {
+                [0u8, 128, 0, 100, 0, 0].iter().copied().cycle().take(n).collect()
+            } else {
+                [128u8, 100, 0].iter().copied().cycle().take(n).collect()
+            };
+            wr.write_image_data(&px).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn the_decoder_reports_the_tile_edge_it_actually_read() {
+        // MapTiler's terrain-rgb serves 512 px (@2x); Terrarium serves 256.
+        // Assuming either is how a 512 px tile got folded in half.
+        for edge in [256u32, 512] {
+            let (grid, ts) =
+                decode_png(&terrarium_png(edge, edge, png::BitDepth::Eight), dec_terrarium)
+                    .unwrap();
+            assert_eq!(ts, edge as usize);
+            assert_eq!(grid.len(), (edge * edge) as usize);
+            assert_eq!(grid[0], 100.0);
+        }
+    }
+
+    #[test]
+    fn a_tile_the_assembly_cannot_place_is_refused_naming_what_arrived() {
+        // No square grid to fold into: refuse rather than guess a stride.
+        let e = decode_png(&terrarium_png(256, 128, png::BitDepth::Eight), dec_terrarium)
+            .unwrap_err().to_string();
+        assert!(e.contains("256x128"), "the dimensions must be named; got {e:?}");
+        assert!(e.contains(TILE_GEOMETRY_ERR), "must be classed as geometry; got {e:?}");
+
+        // 16 bits per channel puts two bytes where this decoder reads one.
+        let e = decode_png(&terrarium_png(256, 256, png::BitDepth::Sixteen), dec_terrarium)
+            .unwrap_err().to_string();
+        assert!(e.contains("16-bit"), "the depth must be named; got {e:?}");
+        assert!(e.contains(TILE_GEOMETRY_ERR), "must be classed as geometry; got {e:?}");
+    }
+
+    #[test]
+    fn the_run_takes_its_tile_size_from_the_first_tile_and_holds_it() {
+        let ok = |edge: usize| (0u32, 0u32, Ok((vec![0.0f32; 1], edge)));
+
+        let mut ts = TileSize::default();
+        assert_eq!(ts.adopt(&[]).unwrap(), DEFAULT_TILE_PX, "nothing decoded yet");
+        assert_eq!(ts.adopt(&[ok(512)]).unwrap(), 512);
+        assert_eq!(ts.adopt(&[]).unwrap(), 512, "the edge holds across strips");
+
+        // One service, one stride: a second size is a server bug, not a grid
+        // to guess at, and half the tiles would fold whichever way we guessed.
+        let e = ts.adopt(&[ok(256)]).unwrap_err().to_string();
+        assert!(e.contains("mix tile sizes"), "got {e:?}");
+        assert!(e.contains("256x256") && e.contains("512x512"), "both sizes named; got {e:?}");
+
+        // A geometry refusal condemns the run, not just the tile that carried it.
+        let mut ts = TileSize::default();
+        let bad = vec![(3u32, 4u32, Err(anyhow::anyhow!(
+            "{TILE_GEOMETRY_ERR}: tile is 256x128 px; XYZ tiles must be square")))];
+        let e = ts.adopt(&bad).unwrap_err().to_string();
+        assert!(e.contains("256x128") && e.contains("x=3") && e.contains("y=4"), "got {e:?}");
+
+        // An ordinary lost tile is not: sparse 404s are normal at coverage edges.
+        let mut ts = TileSize::default();
+        let lost = vec![(0u32, 0u32, Err(anyhow::anyhow!("HTTP 404")))];
+        assert_eq!(ts.adopt(&lost).unwrap(), DEFAULT_TILE_PX);
+    }
+
+    #[test]
+    fn a_void_row_carries_the_sentinel_and_leaves_the_padding_alone() {
+        let row = void_row_bytes(6, 256);
+        assert_eq!(row.len(), 256);
+        for x in 0..6 {
+            assert_eq!(i16::from_le_bytes([row[x * 2], row[x * 2 + 1]]), VOID_ELEV);
+        }
+        assert!(row[12..].iter().all(|&b| b == 0), "stride slack is not pixel data");
+    }
+
     #[test]
     fn a_blank_terrarium_tile_decodes_below_the_nodata_floor() {
         // The void backfill keys off this: RGB 0,0,0 is -32768 m, not ground.
@@ -2182,19 +2456,25 @@ mod tests {
         assert_eq!(grid_span(0.0, 0.5, 4), (0, 1));
         assert_eq!(grid_span(0.5, 1.0, 4), (0, 1));
         assert_eq!(grid_span(1.0, 1.5, 4), (1, 2));
-        // Off the grid entirely: empty, which `avg_cell` writes as 0 m — what a
-        // tile that failed to download already produces.
+        // Off the grid entirely: empty, which `avg_cell` writes as the void
+        // sentinel — what a tile that failed to download already produces.
         assert_eq!(grid_span(-4.0, -3.5, 4), (0, 0));
         assert_eq!(grid_span(9.0, 9.5, 4), (0, 0));
     }
 
     #[test]
     fn an_output_row_is_clipped_to_the_tile_row_held_in_memory() {
-        // Assembly only ever has one 256-row tile-row of the grid, so a
-        // footprint reaching past it is clipped — but never to nothing.
-        for (lo, hi) in [(0.0, 1.2), (127.4, 128.6), (254.5, 256.5), (255.6, 256.4)] {
-            let (a, b) = tile_row_span(lo, hi);
-            assert!(a < b && b <= 256, "{lo}..{hi} gave {a}..{b}");
+        // Assembly only ever has one tile-row of the grid, so a footprint
+        // reaching past it is clipped — but never to nothing. The tile edge is
+        // whatever the source served, so the clip has to follow it: a 512 px
+        // `@2x` tile-row holds 512 rows, not 255.
+        for ts in [256usize, 512] {
+            let e = ts as f64;
+            for (lo, hi) in [(0.0, 1.2), (e / 2.0 - 0.6, e / 2.0 + 0.6),
+                             (e - 1.5, e + 0.5), (e - 0.4, e + 0.4)] {
+                let (a, b) = tile_row_span(lo, hi, ts);
+                assert!(a < b && b <= ts, "ts={ts} {lo}..{hi} gave {a}..{b}");
+            }
         }
     }
 
@@ -2217,8 +2497,22 @@ mod tests {
         assert_eq!(avg_cell(&grid, 4, 0, 2, 0, 2), 500);
         // One sample: the value the point sample wrote, unchanged.
         assert_eq!(avg_cell(&grid, 4, 1, 2, 0, 1), 400);
-        // A footprint off the grid stays 0 m.
-        assert_eq!(avg_cell(&grid, 4, 0, 0, 0, 1), 0);
+        // A footprint off the grid is a hole, not sea level: 0 m is a valid
+        // elevation and would pass fabricated ocean off as surveyed ground.
+        assert_eq!(avg_cell(&grid, 4, 0, 0, 0, 1), VOID_ELEV);
+    }
+
+    #[test]
+    fn a_cell_no_tile_covered_is_void_and_never_drags_a_neighbour_down() {
+        // What the assembly grid holds where a tile 404'd.
+        let grid = vec![NO_TILE_M; 4];
+        assert_eq!(avg_cell(&grid, 2, 0, 2, 0, 2), VOID_ELEV, "averaged");
+        assert_eq!(avg_cell(&grid, 2, 0, 1, 0, 1), VOID_ELEV, "single sample");
+
+        // Half a footprint missing: the half that arrived is the answer, and
+        // the missing half is excluded rather than averaged in.
+        let edge = vec![1000.0f32, NO_TILE_M, 1000.0, NO_TILE_M];
+        assert_eq!(avg_cell(&edge, 2, 0, 2, 0, 2), 2000);
     }
 
     #[test]
@@ -2228,10 +2522,13 @@ mod tests {
         let grid = vec![1000.0f32, -32768.0, 1000.0, 1000.0];
         assert_eq!(avg_cell(&grid, 2, 0, 2, 0, 2), 2000);
 
-        // Nothing but voids: the pit passes through rather than becoming
-        // invented ground, exactly as the point sample passed it through.
+        // Nothing but voids: the cell is a hole. It is not invented ground,
+        // and it is not the raw -32768 m pit passed through either — that
+        // number is a Terrarium encoding artefact, and `.abt` has one
+        // convention for "no terrain here".
         let all_void = vec![-32768.0f32; 4];
-        assert_eq!(avg_cell(&all_void, 2, 0, 2, 0, 2), half_metres(-32768.0));
+        assert_eq!(avg_cell(&all_void, 2, 0, 2, 0, 2), VOID_ELEV);
+        assert_eq!(avg_cell(&all_void, 2, 0, 1, 0, 1), VOID_ELEV, "single sample");
     }
 
     // ── .abt writer ────────────────────────────────────────────────────────
@@ -2375,7 +2672,7 @@ mod tests {
     #[test]
     fn a_near_total_fetch_failure_fails_the_run() {
         // The case this exists for: a max zoom the source does not serve, so
-        // every tile 404s and every .abt is written as flat 0 m.
+        // every tile 404s and every .abt is written as nothing but void.
         assert!(fetch_failure_is_fatal(1369, 1369));
         assert!(fetch_failure_is_fatal(1000, 1369));
         assert!(fetch_failure_is_fatal(1, 1), "a one-tile job that fetched nothing");

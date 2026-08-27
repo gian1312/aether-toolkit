@@ -26,10 +26,10 @@ struct TiffSpec<'a> {
     /// (origin_e, origin_n, scale) — written as ModelTiepoint + ModelPixelScale.
     /// `None` writes a file with NO geotransform (the hard-error case).
     geotransform: Option<(f64, f64, f64)>,
-    /// GeoKeyDirectory entry `(key_id, code)`, e.g. `(3072, 2056)` for a
-    /// projected CRS or `(2048, 4326)` for a geographic one. `None` omits the
+    /// GeoKeyDirectory entries `(key_id, code)`, e.g. `(3072, 2056)` for a
+    /// projected CRS or `(2048, 4326)` for a geographic one. Empty omits the
     /// tag entirely.
-    geokey: Option<(u16, u16)>,
+    geokeys: &'a [(u16, u16)],
     /// GDAL_NODATA ascii tag content.
     nodata: Option<&'a str>,
     samples: Samples,
@@ -70,10 +70,15 @@ fn write_geotiff(path: &Path, spec: &TiffSpec) {
         }
         b
     });
-    // GeoKeyDirectory: header (version, revision, minor, key count) + 1 key
-    // entry (key_id, tag_location=0, count=1, value).
-    let geokeys: Option<Vec<u16>> =
-        spec.geokey.map(|(key, code)| vec![1, 1, 0, 1, key, 0, 1, code]);
+    // GeoKeyDirectory: header (version, revision, minor, key count) + one
+    // 4-u16 entry per key (key_id, tag_location=0, count=1, value).
+    let geokeys: Option<Vec<u16>> = (!spec.geokeys.is_empty()).then(|| {
+        let mut dir = vec![1, 1, 0, spec.geokeys.len() as u16];
+        for &(key, code) in spec.geokeys {
+            dir.extend_from_slice(&[key, 0, 1, code]);
+        }
+        dir
+    });
 
     let n_entries = 10
         + if spec.geotransform.is_some() { 2 } else { 0 }
@@ -200,7 +205,7 @@ fn projected_ramp(path: &Path) {
             w,
             h,
             geotransform: Some((2_598_500.0, 1_206_000.0, 10.0)),
-            geokey: Some((3072, 2056)),
+            geokeys: &[(3072, 2056)],
             nodata: None,
             samples: Samples::I16(data),
         },
@@ -216,7 +221,7 @@ fn geographic_base(path: &Path) {
             w,
             h,
             geotransform: Some((7.40, 47.00, 0.001)),
-            geokey: Some((2048, 4326)),
+            geokeys: &[(2048, 4326)],
             nodata: None,
             samples: Samples::I16(vec![300; (w * h) as usize]),
         },
@@ -253,7 +258,7 @@ fn legacy_and_sources_jobs_produce_identical_bytes() {
             w,
             h,
             geotransform: Some((2_599_200.0, 1_206_000.0, 10.0)),
-            geokey: Some((3072, 2056)),
+            geokeys: &[(3072, 2056)],
             nodata: None,
             samples: Samples::I16(ramp),
         },
@@ -357,7 +362,7 @@ fn stacked_pair(dir: &Path) -> (PathBuf, PathBuf) {
             w,
             h,
             geotransform: Some((7.40, 47.00, 0.001)),
-            geokey: Some((2048, 4326)),
+            geokeys: &[(2048, 4326)],
             nodata: None,
             samples: Samples::F32(data_a),
         },
@@ -368,7 +373,7 @@ fn stacked_pair(dir: &Path) -> (PathBuf, PathBuf) {
             w,
             h,
             geotransform: Some((7.40, 47.00, 0.001)),
-            geokey: Some((2048, 4326)),
+            geokeys: &[(2048, 4326)],
             nodata: None,
             samples: Samples::I16(vec![222; (w * h) as usize]),
         },
@@ -423,7 +428,7 @@ fn nodata_tagged(dir: &Path) -> PathBuf {
             w,
             h,
             geotransform: Some((7.40, 47.00, 0.001)),
-            geokey: Some((2048, 4326)),
+            geokeys: &[(2048, 4326)],
             nodata: Some("77"),
             samples: Samples::I16(data),
         },
@@ -497,7 +502,7 @@ fn a_file_without_geokeys_and_without_crs_is_refused_naming_the_file() {
             w: 4,
             h: 4,
             geotransform: Some((7.40, 47.00, 0.001)),
-            geokey: None,
+            geokeys: &[],
             nodata: None,
             samples: Samples::I16(vec![1; 16]),
         },
@@ -519,7 +524,7 @@ fn a_user_defined_projection_geokey_is_refused_like_an_absent_one() {
             w: 4,
             h: 4,
             geotransform: Some((7.40, 47.00, 0.001)),
-            geokey: Some((3072, 32767)), // user-defined
+            geokeys: &[(3072, 32767)], // user-defined
             nodata: None,
             samples: Samples::I16(vec![1; 16]),
         },
@@ -528,6 +533,50 @@ fn a_user_defined_projection_geokey_is_refused_like_an_absent_one() {
     job["sources"] = serde_json::json!([{"path": p}]);
     let err = run_job(job).unwrap_err().to_string();
     assert!(err.contains("user_defined.tif") && err.contains("crs"), "got {err:?}");
+}
+
+#[test]
+fn a_pixel_is_point_tiepoint_is_shifted_to_the_pixel_corner() {
+    // GTRasterType (1025) = 2, RasterPixelIsPoint: the tiepoint names the
+    // CENTRE of pixel (0,0) — Copernicus and SRTM ship this way. The same
+    // ground written both ways must produce byte-identical tiles; ignoring
+    // the key sampled everything half a source pixel to the north-west.
+    let dir = tempfile::tempdir().unwrap();
+    let (w, h, s) = (40u32, 40u32, 0.001f64);
+    let data: Vec<i16> = (0..w * h).map(|i| (i * 7 % 500) as i16).collect();
+    let area = dir.path().join("area.tif");
+    write_geotiff(
+        &area,
+        &TiffSpec {
+            w,
+            h,
+            geotransform: Some((7.40, 47.00, s)), // NW corner of pixel (0,0)
+            geokeys: &[(2048, 4326)],
+            nodata: None,
+            samples: Samples::I16(data.clone()),
+        },
+    );
+    let point = dir.path().join("point.tif");
+    write_geotiff(
+        &point,
+        &TiffSpec {
+            w,
+            h,
+            // Centre of pixel (0,0): half a pixel in from the corner.
+            geotransform: Some((7.40 + 0.5 * s, 47.00 - 0.5 * s, s)),
+            geokeys: &[(2048, 4326), (1025, 2)],
+            nodata: None,
+            samples: Samples::I16(data),
+        },
+    );
+    let mut job_a = tile_json(dir.path(), "area.abt", 16);
+    job_a["sources"] = serde_json::json!([{"path": area}]);
+    let mut job_p = tile_json(dir.path(), "point.abt", 16);
+    job_p["sources"] = serde_json::json!([{"path": point}]);
+    let bytes_a = run_job(job_a).unwrap();
+    let bytes_p = run_job(job_p).unwrap();
+    assert!(payload(&bytes_a, 16).iter().flatten().any(|&v| v != VOID_ELEV));
+    assert_eq!(payload(&bytes_a, 16), payload(&bytes_p, 16));
 }
 
 #[test]
@@ -578,7 +627,7 @@ fn a_file_without_a_geotransform_is_refused_naming_the_file() {
             w: 4,
             h: 4,
             geotransform: None,
-            geokey: Some((3072, 2056)),
+            geokeys: &[(3072, 2056)],
             nodata: None,
             samples: Samples::I16(vec![1; 16]),
         },
@@ -692,7 +741,7 @@ fn an_abt_source_area_averages_like_a_geographic_geotiff() {
     };
     for y in 1..4 {
         for x in 1..4 {
-            assert_eq!(px[y][x], block_mean(3 * x, 3 * y), "pixel ({x},{y})");
+            assert_eq!(px[y][x], block_mean(3 * x + 1, 3 * y + 1), "pixel ({x},{y})");
         }
     }
 }
@@ -792,7 +841,7 @@ fn ground_at(dir: &Path, name: &str, lon: f64, lat: f64) -> PathBuf {
             w: 4,
             h: 4,
             geotransform: Some((lon, lat, 0.001)),
-            geokey: Some((2048, 4326)),
+            geokeys: &[(2048, 4326)],
             nodata: None,
             samples: Samples::I16(vec![55; 16]),
         },
@@ -880,7 +929,7 @@ fn ground_typed(dir: &Path, name: &str, samples: Samples) -> PathBuf {
             w: 4,
             h: 4,
             geotransform: Some((7.4177, 46.9995, 0.001)),
-            geokey: Some((2048, 4326)),
+            geokeys: &[(2048, 4326)],
             nodata: None,
             samples,
         },

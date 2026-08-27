@@ -303,14 +303,14 @@ const SPAN_EPS: f64 = 1e-9;
 /// would lower to a libm call on a baseline x86-64 target, twice per axis per
 /// output pixel.)
 ///
-/// **Upsampling degrades to the old behaviour.** When the output cell is finer
+/// **Upsampling falls back to the centre pixel.** When the output cell is finer
 /// than a source pixel the span can be empty — no source centre lands in it.
 /// Rather than divide by zero or leave the cell void it falls back to the pixel
-/// containing the cell's *centre*, and callers centre the cell on the point the
-/// old code sampled, so an upsampling job keeps its exact bytes. It is also the
-/// continuous limit of the span rule: at ratio 1 the one pixel whose centre is
-/// inside the cell is the one containing the cell's centre, so nothing jumps
-/// half a pixel as the ratio crosses 1.
+/// containing the cell's *centre* (callers anchor the window on the cell
+/// centre, so lo/hi straddle it). It is also the continuous limit of the span
+/// rule: at ratio 1 the one pixel whose centre is inside the cell is the one
+/// containing the cell's centre, so nothing jumps half a pixel as the ratio
+/// crosses 1.
 #[inline]
 fn sample_span(lo: f64, hi: f64, dim: u32) -> (u32, u32) {
     if dim == 0 {
@@ -437,6 +437,27 @@ fn epsg_from_geokeys(dir: &[u16]) -> Option<String> {
     }
 }
 
+/// Inline value of one SHORT-valued GeoKey out of a raw GeoKeyDirectory
+/// (tag 34735). Keys whose TIFFTagLocation != 0 store their value in another
+/// tag and are not readable here — `None`.
+fn geokey_short(dir: &[u16], wanted: u16) -> Option<u16> {
+    if dir.len() < 4 {
+        return None;
+    }
+    let n_keys = dir[3] as usize;
+    for i in 0..n_keys {
+        let off = 4 + i * 4;
+        if off + 4 > dir.len() {
+            break;
+        }
+        let (key_id, location, value) = (dir[off], dir[off + 1], dir[off + 3]);
+        if key_id == wanted && location == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 /// Resolve a `crs` string (`"EPSG:nnnn"` or a raw `+proj=…` string) to a proj
 /// string. Hard errors name the source file and how to fix the job.
 fn crs_to_proj_string(crs: &str, path: &Path) -> Result<String> {
@@ -546,8 +567,9 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
     let model_trans = decoder.get_tag_f64_vec(Tag::ModelTransformationTag).unwrap_or_default();
     let tiepoints = decoder.get_tag_f64_vec(Tag::ModelTiepointTag).unwrap_or_default();
     let pixel_scales = decoder.get_tag_f64_vec(Tag::ModelPixelScaleTag).unwrap_or_default();
+    let geokey_dir = decoder.get_tag_u16_vec(Tag::GeoKeyDirectoryTag).ok();
 
-    let (origin_e, origin_n, scale) = if model_trans.len() == 16 {
+    let (mut origin_e, mut origin_n, scale) = if model_trans.len() == 16 {
         (model_trans[3], model_trans[7], model_trans[0].abs())
     } else if tiepoints.len() >= 6 && pixel_scales.len() >= 2 {
         (tiepoints[3], tiepoints[4], pixel_scales[0])
@@ -564,10 +586,20 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
         );
     };
 
-    let embedded_crs = decoder
-        .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
-        .ok()
-        .and_then(|dir| epsg_from_geokeys(&dir));
+    // GTRasterTypeGeoKey (1025) = 2, RasterPixelIsPoint: the origin above
+    // names the CENTRE of pixel (0,0), not its NW corner (Copernicus and
+    // SRTM ship this way). Shift to the corner so sampling is not half a
+    // source pixel off. GDAL applies the same correction on read.
+    if geokey_dir
+        .as_deref()
+        .and_then(|dir| geokey_short(dir, 1025))
+        == Some(2)
+    {
+        origin_e -= 0.5 * scale;
+        origin_n += 0.5 * scale;
+    }
+
+    let embedded_crs = geokey_dir.as_deref().and_then(epsg_from_geokeys);
 
     // Per-source nodata: the explicit job field wins; else the GDAL_NODATA
     // ascii tag (trimmed, NUL-stripped; "nan"/"NaN" parse to f64 NaN and the
@@ -1041,6 +1073,11 @@ pub fn process_tile(
 
     let deg_per_meter = 1.0 / 111111.0;
     let pixel_deg = job.resolution_m * deg_per_meter;
+    // Cell-CENTRE grid (CONTRACT §6: a pixel averages the ground footprint it
+    // stands for). Anchoring the ±half-pixel window on the NW corner instead
+    // sampled everything half an output pixel to the north-west.
+    let ul_lon_c = job.ul_lon + 0.5 * pixel_deg;
+    let ul_lat_c = job.ul_lat - 0.5 * pixel_deg;
     let out_size = job.size_px as usize;
     let total_pixels = out_size * out_size;
     let mut buffer = vec![0i16; total_pixels];
@@ -1076,7 +1113,7 @@ pub fn process_tile(
                 Some(
                     (0..out_size)
                         .map(|x| {
-                            let pixel_lon = job.ul_lon + (x as f64 * pixel_deg);
+                            let pixel_lon = ul_lon_c + (x as f64 * pixel_deg);
                             if pixel_lon >= img.origin_e && pixel_lon < img.limit_e {
                                 let px_f = (pixel_lon - img.origin_e) / img.scale;
                                 if px_f >= 0.0 && (px_f as u32) < img.width {
@@ -1111,19 +1148,19 @@ pub fn process_tile(
     let covered_px = AtomicU64::new(0);
     iter.enumerate().for_each(|(y, row_buffer)| {
         let mut row_covered: u64 = 0;
-        let row_lat = job.ul_lat - (y as f64 * pixel_deg);
+        let row_lat = ul_lat_c - (y as f64 * pixel_deg);
 
-        // The projected geometry of this row, one per CRS group. The south
-        // edge (`row_lat - pixel_deg`) gets its own transforms because
-        // area-averaging needs the cell's footprint, not just the corner the
-        // old point sample read, and a projected northing of a WGS84 parallel
-        // drifts along the row.
+        // The projected geometry of this row, one per CRS group. `row_lat` is
+        // the row's cell-centre parallel; the second latitude one pixel south
+        // gets its own transforms because the cell footprint (±half a pixel
+        // around the centre) needs a northing extent, and a projected northing
+        // of a WGS84 parallel drifts along the row.
         let row_geoms: Vec<Option<RowGeom>> = groups
             .iter()
             .map(|g| {
                 make_row_geom(
                     &wgs84, &g.proj, row_lat, row_lat - pixel_deg,
-                    job.ul_lon, pixel_deg, out_size, g.min_scale,
+                    ul_lon_c, pixel_deg, out_size, g.min_scale,
                 )
             })
             .collect();
@@ -1186,13 +1223,11 @@ pub fn process_tile(
                     }
                     RowSrc::Prj { img, inv, geom_idx } => {
                         if *geom_idx != cached_geom {
-                            // The cell this output pixel stands for, centred on
-                            // the point the old code point-sampled: one output
-                            // pixel wide and one output row tall. Centring it
-                            // there is what keeps a source at or below the
-                            // target resolution on the pixel it already used —
-                            // the average is taken *around* the old sample,
-                            // never offset from it.
+                            // The cell this output pixel stands for: one
+                            // output pixel wide and one output row tall,
+                            // centred on the cell's own centre (e, n) — the
+                            // ground footprint CONTRACT §6 promises the
+                            // average is taken over.
                             let geom = row_geoms[*geom_idx].as_ref().unwrap();
                             let seg = &geom.segs[x >> geom.shift];
                             let lx = (x & geom.mask) as f64;
@@ -1811,9 +1846,9 @@ mod tests {
 
     #[test]
     fn an_output_cell_is_the_mean_of_the_source_block_under_it() {
-        // Base three times finer than the target: every interior output pixel
-        // owns a clean 3x3 block, centred on the pixel the old code point-
-        // sampled. 3x3 = 9 samples of which the old code kept one.
+        // Base three times finer than the target: every output pixel owns the
+        // clean 3x3 block that IS its ground footprint — cell (x,y) covers
+        // source pixels [3x, 3x+3) x [3y, 3y+3), centred on (3x+1, 3y+1).
         let mut job = empty_job(PathBuf::new());
         job.size_px = 4;
         let pixel_deg = job.resolution_m / 111111.0;
@@ -1828,9 +1863,9 @@ mod tests {
             }
             ((s * 2 + 9) / 18) as i16 // round half away from zero, 9 samples
         };
-        let expect: Vec<(usize, usize, i16)> = (1..4)
-            .flat_map(|y| (1..4).map(move |x| (x, y, 0)))
-            .map(|(x, y, _)| (x, y, block_mean(3 * x, 3 * y)))
+        let expect: Vec<(usize, usize, i16)> = (0..4)
+            .flat_map(|y| (0..4).map(move |x| (x, y, 0)))
+            .map(|(x, y, _)| (x, y, block_mean(3 * x + 1, 3 * y + 1)))
             .collect();
 
         let out = convert_with_base(job, src);
@@ -1885,16 +1920,16 @@ mod tests {
         // One source pixel per four output pixels.
         let scale = pixel_deg * 4.0;
         let src = img(4, 4, job.ul_lon, job.ul_lat, scale, ramp(4, 4));
-        // What the point sampler this replaced would have written, spelled the
-        // way it spelled it — including the truncation, so the comparison holds
-        // on the cells where the arithmetic lands a hair either side of a
-        // source-pixel boundary.
+        // The fallback takes the source pixel the cell's CENTRE sits in,
+        // spelled with the same truncation the code uses, so the comparison
+        // holds on the cells where the arithmetic lands a hair either side of
+        // a source-pixel boundary.
         let expect: Vec<Vec<i16>> = (0..8)
             .map(|y| {
-                let py = ((job.ul_lat - (job.ul_lat - y as f64 * pixel_deg)) / scale) as usize;
+                let py = (((y as f64 + 0.5) * pixel_deg) / scale) as usize;
                 (0..8)
                     .map(|x| {
-                        let px = ((job.ul_lon + x as f64 * pixel_deg - job.ul_lon) / scale) as usize;
+                        let px = (((x as f64 + 0.5) * pixel_deg) / scale) as usize;
                         src.data[py * 4 + px]
                     })
                     .collect()
