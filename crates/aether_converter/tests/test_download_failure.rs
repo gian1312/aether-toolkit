@@ -294,10 +294,13 @@ fn a_source_that_serves_webp_fails_naming_the_decode_class() {
 }
 
 #[test]
-fn a_source_that_404s_fails_naming_the_http_class() {
-    // Same refusal, different class: the message must distinguish a zoom the
-    // source does not serve from a source that serves the wrong image format.
-    let port = serve("404 Not Found", "text/plain", b"nope".to_vec());
+fn a_source_that_403s_fails_naming_the_http_class() {
+    // Same refusal, different class: the message must distinguish a key the
+    // source rejects from a source that serves the wrong image format. 403 is
+    // "the data is there and you may not have it" — unlike 404, it stays a
+    // failure, because filling an expired-key run with sea would be the exact
+    // silent flat-terrain failure the majority guard exists for.
+    let port = serve("403 Forbidden", "text/plain", b"bad key".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let (job, abts) = write_job(dir.path(), port, 1);
 
@@ -307,6 +310,75 @@ fn a_source_that_404s_fails_naming_the_http_class() {
     assert!(msg.contains("HTTP_4xx=1"), "the failure class must be named; got: {msg}");
     assert!(!msg.contains("decode="), "the body was never decoded; got: {msg}");
     assert!(!abts[0].exists(), "a refused run left {:?} behind", abts[0]);
+}
+
+#[test]
+fn a_source_that_404s_everything_succeeds_as_all_void() {
+    // The no-data contract (decided 2026-08-31): HTTP 404 is the service
+    // answering "no tile here", and however many arrive — all of them
+    // included — the run SUCCEEDS. A bounded source (the torture set's
+    // Bern-box fixture, a regional DEM service) 404s the whole world outside
+    // its coverage, and a run outside that coverage is a legitimate run whose
+    // output is entirely void; consumers that fill voids (Waveshed Site
+    // Analysis, `void_fill_m: 0.0`) read it as 0 m sea level, and the
+    // `[Stats] NO-DATA` line is the loud part. The old contract aborted here
+    // blaming zoom and network — which made the checklist's own "run 1.3b
+    // over the reference AOI at 30 m" step impossible.
+    let port = serve("404 Not Found", "text/plain", b"no tile here".to_vec());
+    let dir = tempfile::tempdir().unwrap();
+    let (job, abts) = write_job(dir.path(), port, 1);
+
+    run_download(&job).unwrap();
+
+    // The tile is kept, full-size, and every sample is the void sentinel —
+    // never 0 m, which is a real elevation only the consumer may fill in.
+    let g = read_abt(&abts[0], 64);
+    assert!(g.iter().all(|&v| v == -9999),
+            "no data means void everywhere, nothing invented");
+}
+
+#[test]
+fn a_majority_of_404s_keeps_the_minority_of_terrain() {
+    // The 1.3b-over-the-box shape: one `.abt` whose ground reaches well past
+    // a bounded source, so ~85% of the XYZ fetches answer 404 and only the
+    // north-west corner has data. Under the old majority rule the whole run
+    // aborted and the drop guard deleted the corner that WAS terrain.
+    const Z: u32 = 12;
+    let (tx, ty) = (lon2tx(8.5, Z), lat2ty(47.0, Z));
+    let w = tx2lon(tx + 1, Z) - tx2lon(tx, Z);
+    let h = ty2lat(ty, Z) - ty2lat(ty + 1, Z);
+
+    let port = serve_tiles(move |_z, x, y| {
+        (x == tx && y == ty).then(|| terrarium_tile(256, |_, _| 100.0))
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let size = 64usize;
+    let pd = 2.0 * w / size as f64; // two XYZ tiles wide, ~three tall
+    let (job, abt) = write_job_at(
+        dir.path(), port, ty2lat(ty, Z), tx2lon(tx, Z), size as u32, pd,
+    );
+
+    run_download(&job).unwrap();
+    let g = read_abt(&abt, size);
+
+    // Rows covered by the served tile: its lat span over the output's pixel
+    // height. Stay a pixel inside each boundary — the boundary cell averages
+    // whatever mix of served and missing samples falls into it.
+    let served_rows = (h / pd) as usize;
+    for y in 0..size {
+        for x in 0..size {
+            let v = g[y * size + x];
+            if x < size / 2 - 1 && y + 1 < served_rows {
+                assert_eq!(v, 200, "({x},{y}) is under the one tile that exists");
+            } else if x > size / 2 && y > served_rows {
+                assert_eq!(v, -9999, "({x},{y}) is outside the source: void");
+            }
+        }
+    }
+    let voids = g.iter().filter(|&&v| v == -9999).count();
+    assert!(voids * 2 > g.len(), "the majority of this ground has no data");
+    assert!(!g.contains(&0), "0 m is an elevation, never a marker for absence");
 }
 
 #[test]

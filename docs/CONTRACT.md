@@ -126,6 +126,36 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    tiles: N` — reports the repairs. **Bytes change for any run that lost
 >    a tile an ancestor covers**: those pixels were `-9999` (or, before
 >    item 15, fake 0 m) and are now upsampled parent terrain.
+> 17. **`download` HTTP 404 is no-data, never failure (§1.2; 2026-08-31).**
+>    A 404 is the service answering "no tile here" — a bounded source (a
+>    regional DEM service, a local fixture) answers it for the whole world
+>    outside its coverage. 404s are now tallied in their own error class
+>    (`HTTP_404_no_data`), reported on a new `[Stats] NO-DATA (HTTP 404):`
+>    line, and **excluded from the >50% fatal guard**, which now counts only
+>    genuine failures (timeout, connect, 403/429/4xx-other, 5xx, decode,
+>    other). A run whose only losses are 404s — **all** of them included —
+>    exits 0 and keeps its output, void where no tile exists; consumers that
+>    fill voids (Waveshed Site Analysis, `void_fill_m: 0.0`) read those areas
+>    as 0 m sea level and are expected to tell the user so. Behavior change:
+>    a majority-404 run previously exited non-zero and deleted its output.
+>    Consumers matching `Tile download failed:` are unaffected in the cases
+>    where it still fires; consumers that RELIED on majority-404 aborting
+>    must now read the `[Stats] NO-DATA` line instead. `.abt` bytes are
+>    unchanged for any run that previously succeeded.
+> 18. **`ingest` batch with zero covered pixels is no-data, not an error
+>    (§9a; 2026-08-31).** The same ruling as item 17, one path over: a batch
+>    whose tiles took not one pixel from any source previously failed
+>    (`anyhow::bail!`, "the batch holds no terrain"). It now exits 0, keeps
+>    its tiles — void, or `void_fill_m` where the job sets it — and prints
+>    one loud line (frozen prefix):
+>    `[Warn] NO-DATA batch: <n> tile(s) were written and not one pixel of any
+>    of them came from a source — …`. A run over ground outside a bounded
+>    DEM is legitimate (Waveshed Site Analysis reads it as 0 m sea level and
+>    warns from the source bounds); a wrong-CRS mistake produces the same
+>    shape, and this line — plus the caller's own bounds check — is what
+>    keeps it visible. Consumers that relied on the bail must match the
+>    `[Warn] NO-DATA batch:` prefix. Per-tile partial coverage was always
+>    exit 0 and is unchanged.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -357,28 +387,36 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   > addition to*, not instead of, `insufficient disk`. Do not change the
   > `Insufficient disk space` prefix without a major bump.
 
-* **Tile-fetch failure — new failure mode.** When **more than half** of the
-  requested XYZ terrain tiles could not be fetched, `download` **fails**
+* **Tile-fetch failure.** When **more than half** of the requested XYZ
+  terrain tiles **genuinely failed to fetch** — timeout, connect, 403, 429,
+  other 4xx, 5xx, decode, other; **HTTP 404 is excluded** (changelog item
+  17: a 404 is the service answering "no tile here", tallied as
+  `HTTP_404_no_data` and reported on its own `[Stats] NO-DATA (HTTP 404):`
+  line, never fatal in any quantity) — `download` **fails**
   (`anyhow::bail!`, non-zero exit) after emitting the usual `[Stats]` block.
   The emitted string (`crates/aether_converter/src/download.rs`, guarded by
-  `fetch_failure_is_fatal`) is:
+  `fetch_failure_is_fatal` over `DownloadStats::fatal_errors()`) is:
 
   ```rust
   anyhow::bail!(
       "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
-       the output would be mostly void, not terrain. Errors: {}. Check that \
+       the output would be mostly void, not terrain. Errors: {}.{} Check that \
        the tile source serves zoom {} over this area and that the network is \
        reachable.",
-      failed, attempted, pct, stats.error_breakdown(), job.zoom
+      failed, attempted, pct, stats.error_breakdown(),
+      /* when 404s also occurred: */
+      " (A further {n} tile(s) answered HTTP 404 — no data there — which alone \
+       would not fail the run.)",
+      job.zoom
   );
   ```
 
   `Errors:` names the **failure class**. It renders the same per-class tally as
   the `[Stats] ERRORS` line — one builder, `DownloadStats::error_breakdown()` —
   so the two can never disagree: `timeout`, `connect`,
-  `HTTP_429_rate_limited`, `HTTP_4xx`, `HTTP_5xx`, `decode`, `other`, in that
-  order, only the non-zero ones, comma-separated. A real message reads (one
-  line, wrapped here):
+  `HTTP_429_rate_limited`, `HTTP_404_no_data`, `HTTP_4xx`, `HTTP_5xx`,
+  `decode`, `other`, in that order, only the non-zero ones, comma-separated.
+  A real message reads (one line, wrapped here):
 
   ```
   Tile download failed: 2 of 2 terrain tiles (100%) could not be fetched; the
@@ -404,11 +442,30 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   > including one where all tiles 404'd — the classic cause being a requested
   > zoom the tile source does not serve. Consumers that treated exit 0 as
   > "tiles are usable" were wrong then and are right now; consumers that
-  > treated any non-zero exit as fatal need no change. Sparse 404s at the edge
-  > of a provider's coverage remain non-fatal — the threshold is deliberately a
-  > *majority*, and a minority loss is still only reported through
-  > `[Stats] ERRORS`. Match `Tile download failed:` if you need to distinguish
-  > this from the disk-space failure.
+  > treated any non-zero exit as fatal need no change. Sparse *transport*
+  > failures remain non-fatal — the threshold is deliberately a *majority*,
+  > and a minority loss is still only reported through `[Stats] ERRORS`.
+  > Match `Tile download failed:` if you need to distinguish this from the
+  > disk-space failure.
+
+  > **Behavior change for consumers (changelog item 17, 2026-08-31).** 404s
+  > no longer count toward the fatal majority at all: a run whose only losses
+  > are 404s exits 0 — however many, all of them included — and keeps its
+  > output, void where no tile exists. Alongside `[Stats] ERRORS` the summary
+  > then carries a machine-readable line (frozen prefix, parsed by the
+  > Waveshed plugin):
+  >
+  > ```
+  > [Stats] NO-DATA (HTTP 404): <n> of <total> tile(s) — the service has no
+  > data there; written as void
+  > ```
+  >
+  > (one line; wrapped here). Match `NO-DATA (HTTP 404): <n>` to learn how
+  > much of the request had no data. A consumer that fills voids
+  > (`void_fill_m`) reads those areas as its fill value — Waveshed Site
+  > Analysis fills 0 m sea level and warns the user; a consumer that keeps
+  > voids (the Map Converter) sees the `-9999` sentinel. Consumers that
+  > relied on a majority-404 run aborting must switch to this line.
 
   > **Behaviour change for consumers — a lost tile is repaired or a hole,
   > never sea level.** A tile that never arrives is first offered to the

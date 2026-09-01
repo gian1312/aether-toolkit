@@ -478,6 +478,14 @@ struct DownloadStats {
     err_timeout: AtomicUsize,
     err_connect: AtomicUsize,
     err_http_429: AtomicUsize,
+    /// HTTP 404 — the service answered, and the answer is "no tile here".
+    /// Counted apart from every other error because it is DATA, not failure:
+    /// a bounded source (a local fixture, a regional DEM service) answers 404
+    /// for the whole world outside its coverage, and those pixels are written
+    /// as void — which consumers that fill voids (Waveshed Site Analysis,
+    /// `void_fill_m: 0.0`) read as 0 m sea level. However many there are,
+    /// they never make the run fatal; see [`fetch_failure_is_fatal`].
+    err_http_404: AtomicUsize,
     err_http_4xx: AtomicUsize,
     err_http_5xx: AtomicUsize,
     err_decode: AtomicUsize,
@@ -500,6 +508,7 @@ impl DownloadStats {
             err_timeout: AtomicUsize::new(0),
             err_connect: AtomicUsize::new(0),
             err_http_429: AtomicUsize::new(0),
+            err_http_404: AtomicUsize::new(0),
             err_http_4xx: AtomicUsize::new(0),
             err_http_5xx: AtomicUsize::new(0),
             err_decode: AtomicUsize::new(0),
@@ -518,10 +527,27 @@ impl DownloadStats {
         self.err_timeout.load(Ordering::Relaxed)
             + self.err_connect.load(Ordering::Relaxed)
             + self.err_http_429.load(Ordering::Relaxed)
+            + self.err_http_404.load(Ordering::Relaxed)
             + self.err_http_4xx.load(Ordering::Relaxed)
             + self.err_http_5xx.load(Ordering::Relaxed)
             + self.err_decode.load(Ordering::Relaxed)
             + self.err_other.load(Ordering::Relaxed)
+    }
+
+    /// Requests the service answered with HTTP 404 — "no tile here".
+    fn no_data_count(&self) -> usize {
+        self.err_http_404.load(Ordering::Relaxed)
+    }
+
+    /// Errors that mean the download itself FAILED — everything except 404.
+    ///
+    /// A timeout, a refused connection, a 403 (bad key), a 429, a 5xx or a
+    /// decode error says "I could not get the data that is there"; a 404 says
+    /// "there is no data there". Only the first kind can make a run fatal —
+    /// judging fatality on the sum let a bounded source's legitimate
+    /// off-coverage 404s abort a run whose in-coverage half was perfect.
+    fn fatal_errors(&self) -> usize {
+        self.total_errors() - self.no_data_count()
     }
 
     fn total_tiles(&self) -> usize {
@@ -543,6 +569,7 @@ impl DownloadStats {
         push("timeout", self.err_timeout.load(Ordering::Relaxed));
         push("connect", self.err_connect.load(Ordering::Relaxed));
         push("HTTP_429_rate_limited", self.err_http_429.load(Ordering::Relaxed));
+        push("HTTP_404_no_data", self.err_http_404.load(Ordering::Relaxed));
         push("HTTP_4xx", self.err_http_4xx.load(Ordering::Relaxed));
         push("HTTP_5xx", self.err_http_5xx.load(Ordering::Relaxed));
         push("decode", self.err_decode.load(Ordering::Relaxed));
@@ -585,6 +612,23 @@ impl DownloadStats {
         let errs = self.total_errors();
         if errs > 0 {
             eprintln!("[Stats] ERRORS ({}): {}", errs, self.error_breakdown());
+
+            // No-data is not failure, so it gets its own machine-readable
+            // line: callers (the Waveshed plugin parses this) turn it into a
+            // user-facing "part of your area has no data and reads as 0 m sea
+            // level" warning instead of a network diagnosis.
+            let n404 = self.no_data_count();
+            if n404 > 0 {
+                eprintln!("[Stats] NO-DATA (HTTP 404): {} of {} tile(s) — the \
+                           service has no data there; written as void", n404, total);
+                if ok == 0 {
+                    eprintln!("[Stats] >>> every answered request was 404 — the \
+                               area is entirely outside this service's coverage, \
+                               or the source does not serve this zoom. The output \
+                               is all void (0 m sea level where the consumer \
+                               fills voids).");
+                }
+            }
 
             // The hints below need three of the counts back.
             let t = self.err_timeout.load(Ordering::Relaxed);
@@ -852,6 +896,9 @@ async fn download_strip(
                                     .unwrap_or(0);
                                 match code {
                                     429 => { stats.err_http_429.fetch_add(1, Ordering::Relaxed); }
+                                    // 404 is data ("no tile here"), not failure —
+                                    // never fatal, whatever the count.
+                                    404 => { stats.err_http_404.fetch_add(1, Ordering::Relaxed); }
                                     400..=499 => { stats.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
                                     500..=599 => { stats.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
                                     _ => { stats.err_other.fetch_add(1, Ordering::Relaxed); }
@@ -1061,6 +1108,8 @@ async fn download_strip_raw(
                                 .unwrap_or(0);
                             match code {
                                 429 => { stats.err_http_429.fetch_add(1, Ordering::Relaxed); }
+                                // Same rule as download_strip: 404 = no data.
+                                404 => { stats.err_http_404.fetch_add(1, Ordering::Relaxed); }
                                 400..=499 => { stats.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
                                 500..=599 => { stats.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
                                 _ => { stats.err_other.fetch_add(1, Ordering::Relaxed); }
@@ -1324,6 +1373,9 @@ async fn download_all_tiles_web(
 
                     if reason.contains("429") {
                         stats.err_http_429.fetch_add(1, Ordering::Relaxed);
+                    } else if reason.contains("404") {
+                        // Same rule as the native paths: 404 = no data there.
+                        stats.err_http_404.fetch_add(1, Ordering::Relaxed);
                     } else if reason.contains("HTTP 5") {
                         stats.err_http_5xx.fetch_add(1, Ordering::Relaxed);
                     } else if reason.contains("HTTP 4") {
@@ -1377,19 +1429,28 @@ pub fn run_download(job_file: &Path) -> Result<()> {
     rt.block_on(run_download_async(job))
 }
 
-/// Whether losing *failed* of *attempted* XYZ tiles must fail the whole run.
+/// Whether *failed* genuinely-failed fetches of *attempted* XYZ tiles must
+/// fail the whole run.
 ///
-/// A tile that never arrived is written as the `-9999` void sentinel, so the
-/// hole is at least visible now — but a download that 404s everything (the
-/// classic cause: a max zoom the tile source does not serve) still produces a
-/// full set of well-formed, entirely empty `.abt` files, and `run_download`
-/// used to return `Ok(())` for it. (Before the void sentinel it produced a full
-/// set of *plausible-looking flat* ones, which was worse.)
+/// *failed* is [`DownloadStats::fatal_errors`] — timeouts, refused
+/// connections, 403/429/5xx, decode errors — and deliberately NOT the 404s.
+/// An HTTP 404 is the service answering "no tile here": a bounded source (a
+/// regional DEM service, a local fixture) 404s the entire world outside its
+/// coverage, and a run over its edge is a legitimate run whose off-coverage
+/// pixels are written as the `-9999` void sentinel — which a consumer that
+/// fills voids (Waveshed Site Analysis, `void_fill_m: 0.0`) reads as 0 m sea
+/// level, by contract. Any number of 404s therefore stays non-fatal; they are
+/// reported on their own `[Stats] NO-DATA` line instead, so the caller can
+/// tell the user which part of the result is sea, loudly, without killing the
+/// part that is terrain.
 ///
-/// Sparse 404s at the edge of a provider's coverage are normal and must stay
-/// non-fatal, so the line is drawn at a **majority** of the requested tiles:
-/// below that the output is still mostly real terrain and the `[Stats] ERRORS`
-/// summary is the right response; above it there is nothing worth keeping.
+/// The failures that CAN be fatal mean "the data is there and I could not get
+/// it": there the line is drawn at a **majority** of the requested tiles.
+/// Below it the output is still mostly real terrain and the `[Stats] ERRORS`
+/// summary is the right response; above it (the network died, the key
+/// expired, the source serves WebP to a PNG decoder) there is nothing worth
+/// keeping — a mostly-void output that LOOKS like a bounded source is exactly
+/// the silent flat-sea failure this guard exists for.
 #[cfg(feature = "native")]
 fn fetch_failure_is_fatal(failed: usize, attempted: usize) -> bool {
     attempted > 0 && failed * 2 > attempted
@@ -1855,26 +1916,39 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         }
     }
 
-    // A run that fetched almost nothing is not a successful run. A tile that
-    // never arrived is never copied into the mini-grid, so it is written out as
-    // the `-9999` void sentinel — a visible hole, but still nothing a consumer
-    // can build terrain from. Report it as the failure it is instead of exiting
-    // 0 with an empty .abt, and name the error class: "could not be fetched"
-    // alone reads as a network fault even when the real cause is a source
-    // serving WebP to a PNG decoder. `cleanup` takes the files with it.
-    let failed = stats.total_errors();
+    // A run that genuinely FAILED to fetch a majority of its tiles is not a
+    // successful run — the network died, the key expired, or the source serves
+    // bytes the decoder cannot read, and a mostly-void output would cache as
+    // plausible flat sea. Name the error class: "could not be fetched" alone
+    // reads as a network fault even when the real cause is a source serving
+    // WebP to a PNG decoder. `cleanup` takes the files with it.
+    //
+    // 404s are deliberately NOT in `failed`: the service answering "no tile
+    // here" is data, not failure. A run over the edge of a bounded source (or
+    // entirely outside it) keeps its output — void where the service has
+    // nothing, which consumers that fill voids read as 0 m sea level — and
+    // the `[Stats] NO-DATA` line in the summary above is the loud version of
+    // that story. See `fetch_failure_is_fatal`.
+    let failed = stats.fatal_errors();
     let attempted = stats.total_tiles();
     if fetch_failure_is_fatal(failed, attempted) {
         stats.log_summary(start.elapsed().as_secs_f64());
+        let no_data = stats.no_data_count();
         anyhow::bail!(
             "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
-             the output would be mostly void, not terrain. Errors: {}. Check that \
+             the output would be mostly void, not terrain. Errors: {}.{} Check that \
              the tile source serves zoom {} over this area and that the network is \
              reachable.",
             failed,
             attempted,
             failed * 100 / attempted.max(1),
             stats.error_breakdown(),
+            if no_data > 0 {
+                format!(" (A further {} tile(s) answered HTTP 404 — no data there — \
+                         which alone would not fail the run.)", no_data)
+            } else {
+                String::new()
+            },
             job.zoom
         );
     }
@@ -2712,11 +2786,54 @@ mod tests {
 
     #[test]
     fn a_near_total_fetch_failure_fails_the_run() {
-        // The case this exists for: a max zoom the source does not serve, so
-        // every tile 404s and every .abt is written as nothing but void.
+        // The case this exists for: the network died, the key expired, or the
+        // source serves bytes the decoder cannot read — the counts here are
+        // fatal_errors(), which 404s never enter.
         assert!(fetch_failure_is_fatal(1369, 1369));
         assert!(fetch_failure_is_fatal(1000, 1369));
-        assert!(fetch_failure_is_fatal(1, 1), "a one-tile job that fetched nothing");
+        assert!(fetch_failure_is_fatal(1, 1),
+                "a one-tile job whose one fetch genuinely failed");
+    }
+
+    #[test]
+    fn no_data_404s_are_counted_apart_and_never_make_a_run_fatal() {
+        // A 30 m run over the local Terrain-RGB fixture's edge: ~90% of the
+        // requested tiles are outside the Bern box and answer 404. That is
+        // the service saying "no data here", the pixels are written as void
+        // (0 m sea level once the consumer fills voids) — and the run must
+        // SUCCEED, however large the 404 share is.
+        let s = DownloadStats::new();
+        s.ok_count.fetch_add(6, Ordering::Relaxed);
+        s.err_http_404.fetch_add(43, Ordering::Relaxed);
+        assert_eq!(s.no_data_count(), 43);
+        assert_eq!(s.fatal_errors(), 0);
+        assert_eq!(s.total_tiles(), 49, "404s still count as attempted tiles");
+        assert!(!fetch_failure_is_fatal(s.fatal_errors(), s.total_tiles()));
+
+        // Even 100% 404 — a run entirely outside a bounded source — succeeds:
+        // the output is all void, the summary says so loudly, and the caller
+        // turns it into flat sea plus a warning, not into a network diagnosis.
+        let s = DownloadStats::new();
+        s.err_http_404.fetch_add(49, Ordering::Relaxed);
+        assert_eq!(s.fatal_errors(), 0);
+        assert!(!fetch_failure_is_fatal(s.fatal_errors(), s.total_tiles()));
+
+        // But real failures alongside the 404s keep their own majority rule:
+        // 43 no-data + 5 timeouts in 54 attempts is fine (5*2 <= 54) …
+        let s = DownloadStats::new();
+        s.ok_count.fetch_add(6, Ordering::Relaxed);
+        s.err_http_404.fetch_add(43, Ordering::Relaxed);
+        s.err_timeout.fetch_add(5, Ordering::Relaxed);
+        assert_eq!(s.fatal_errors(), 5);
+        assert!(!fetch_failure_is_fatal(s.fatal_errors(), s.total_tiles()));
+
+        // … while a majority of 403s (an expired key) stays fatal: that data
+        // exists and could not be fetched, and flat sea must not paper it over.
+        let s = DownloadStats::new();
+        s.ok_count.fetch_add(1, Ordering::Relaxed);
+        s.err_http_4xx.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(s.fatal_errors(), 3);
+        assert!(fetch_failure_is_fatal(s.fatal_errors(), s.total_tiles()));
     }
 
     #[test]
@@ -2732,6 +2849,13 @@ mod tests {
         s.err_connect.fetch_add(1, Ordering::Relaxed);
         s.err_http_4xx.fetch_add(2, Ordering::Relaxed);
         assert_eq!(s.error_breakdown(), "connect=1, HTTP_4xx=2, decode=3");
+
+        // 404s appear under their own label — they are no-data, not failure,
+        // and folding them into HTTP_4xx would make an off-coverage run read
+        // like a broken service.
+        s.err_http_404.fetch_add(7, Ordering::Relaxed);
+        assert_eq!(s.error_breakdown(),
+                   "connect=1, HTTP_404_no_data=7, HTTP_4xx=2, decode=3");
     }
 
     // ── Failed-run cleanup ─────────────────────────────────────────────────
@@ -2765,8 +2889,9 @@ mod tests {
     }
 
     #[test]
-    fn sparse_edge_failures_do_not_fail_the_run() {
-        // 404s at the edge of a provider's coverage are normal.
+    fn sparse_transport_failures_do_not_fail_the_run() {
+        // A few dropped connections under load are normal; the majority rule
+        // only condemns a run that mostly failed to fetch data that exists.
         assert!(!fetch_failure_is_fatal(0, 1369));
         assert!(!fetch_failure_is_fatal(1, 1369));
         assert!(!fetch_failure_is_fatal(137, 1369), "10% lost is still terrain");

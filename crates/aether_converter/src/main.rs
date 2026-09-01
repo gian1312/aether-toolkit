@@ -252,10 +252,20 @@ fn main() -> anyhow::Result<()> {
                     anyhow::bail!("{} of {} tiles failed to convert", n_failed, total);
                 }
                 if covered.load(Ordering::Relaxed) == 0 {
-                    anyhow::bail!(
-                        "{} tile(s) were written and not one pixel of any of them came \
-                         from a source: the batch holds no terrain. Check that the \
-                         sources overlap the requested area and that their CRS is right.",
+                    // The no-data contract (CONTRACT changelog item 18,
+                    // 2026-08-31): an area the sources do not reach is
+                    // no-data, not an error — the same ruling the download
+                    // path applies to HTTP 404 (item 17). A run over ground
+                    // outside a bounded DEM must degrade to void tiles (or
+                    // the job's void_fill_m, e.g. Waveshed Site Analysis's
+                    // 0 m sea level), loudly — a wrong-CRS mistake produces
+                    // the identical shape and this line is what makes either
+                    // cause visible instead of silent.
+                    eprintln!(
+                        "[Warn] NO-DATA batch: {} tile(s) were written and not one \
+                         pixel of any of them came from a source — the requested \
+                         area is outside every source's coverage (or a source CRS \
+                         is wrong). Voids (or void_fill_m) everywhere.",
                         total
                     );
                 }
