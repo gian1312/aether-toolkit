@@ -5,31 +5,120 @@
   "description": "Job consumed by `aether_converter download --job-file <json>`. Authoritative source: crates/aether_converter/src/download.rs (DownloadJob / SubTileSpec).",
   "type": "object",
   "additionalProperties": true,
-  "required": ["url_template", "encoding", "output_dir", "zoom", "tiles"],
+  "required": [
+    "url_template",
+    "encoding",
+    "output_dir",
+    "zoom",
+    "tiles"
+  ],
   "properties": {
-    "url_template": { "type": "string", "description": "XYZ URL template containing {z}, {x}, {y} placeholders." },
-    "encoding": { "type": "string", "enum": ["terrarium", "mapbox"], "description": "Elevation PNG encoding (case-insensitive). Any other value fails at runtime." },
-    "output_dir": { "type": "string", "description": "Directory for produced .abt tiles." },
-    "zoom": { "type": "integer", "minimum": 0, "description": "XYZ zoom level (u32)." },
-    "max_connections": { "type": ["integer", "null"], "minimum": 1, "description": "Concurrent HTTP connections. Defaults to 256 when absent." },
-    "buildings_pbf_dir": { "type": ["string", "null"], "description": "Directory of {z}_{x}_{y}.pbf vector tiles fused onto the finished .abt tiles as a post-pass. All tiles must share one zoom level. Absent means terrain only." },
+    "url_template": {
+      "type": "string",
+      "description": "XYZ URL template containing {z}, {x}, {y} placeholders."
+    },
+    "encoding": {
+      "type": "string",
+      "enum": [
+        "terrarium",
+        "mapbox"
+      ],
+      "description": "Elevation PNG encoding (case-insensitive). Any other value fails at runtime."
+    },
+    "output_dir": {
+      "type": "string",
+      "description": "Directory for produced .abt tiles."
+    },
+    "zoom": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "XYZ zoom level (u32)."
+    },
+    "max_connections": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "description": "Concurrent HTTP connections. Defaults to 256 when absent."
+    },
+    "buildings_pbf_dir": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Directory of {z}_{x}_{y}.pbf vector tiles fused onto the finished .abt tiles as a post-pass. All tiles must share one zoom level. Absent means terrain only."
+    },
     "tiles": {
       "type": "array",
       "minItems": 1,
-      "items": { "$ref": "#/$defs/subTileSpec" }
+      "items": {
+        "$ref": "#/$defs/subTileSpec"
+      }
+    },
+    "fetch_bounds": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Optional fetch region of interest in degrees. Only source tiles intersecting it are downloaded/decoded; pixels outside keep the -9999 void sentinel. Output grid and .abt layout unchanged. Supported by the in-memory downloader only; the file-based `download` CLI rejects jobs carrying it (its sparse writer would read skipped rows as 0 m).",
+      "required": [
+        "south",
+        "north",
+        "west",
+        "east"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "south": {
+          "type": "number"
+        },
+        "north": {
+          "type": "number"
+        },
+        "west": {
+          "type": "number"
+        },
+        "east": {
+          "type": "number"
+        }
+      }
     }
   },
   "$defs": {
     "subTileSpec": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["filename", "ul_lat", "ul_lon", "size_px", "resolution_m"],
+      "required": [
+        "filename",
+        "ul_lat",
+        "ul_lon",
+        "size_px",
+        "resolution_m"
+      ],
       "properties": {
-        "filename": { "type": "string", "description": "Output .abt filename within output_dir." },
-        "ul_lat": { "type": "number", "description": "Upper-left latitude." },
-        "ul_lon": { "type": "number", "description": "Upper-left longitude (east-positive)." },
-        "size_px": { "type": "integer", "minimum": 1, "description": "Tile side in pixels (u32)." },
-        "resolution_m": { "type": "number", "exclusiveMinimum": 0, "description": "Metres per pixel; writer sets scale = resolution_m / 111111. XYZ samples are area-averaged over each output pixel's footprint (voids excluded from the mean); where a pixel is finer than the source zoom it takes the sample it sits in. See CONTRACT.md section 6." }
+        "filename": {
+          "type": "string",
+          "description": "Output .abt filename within output_dir."
+        },
+        "ul_lat": {
+          "type": "number",
+          "description": "Upper-left latitude."
+        },
+        "ul_lon": {
+          "type": "number",
+          "description": "Upper-left longitude (east-positive)."
+        },
+        "size_px": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Tile side in pixels (u32)."
+        },
+        "resolution_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Metres per pixel; writer sets scale = resolution_m / 111111. XYZ samples are area-averaged over each output pixel's footprint (voids excluded from the mean); where a pixel is finer than the source zoom it takes the sample it sits in. See CONTRACT.md section 6."
+        }
       }
     }
   }

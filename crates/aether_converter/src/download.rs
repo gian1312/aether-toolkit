@@ -56,6 +56,34 @@ pub struct DownloadJob {
     /// one to two orders of magnitude slower.
     #[serde(default)]
     pub buildings_pbf_dir: Option<PathBuf>,
+    /// Optional fetch region of interest (degrees). When present, only the
+    /// source tiles intersecting this box are downloaded and decoded; every
+    /// pixel outside keeps the pre-filled `VOID_ELEV` sentinel. The output
+    /// tile grid, geometry and `.abt` layout are unchanged — this trims the
+    /// fetch set, nothing else. Callers pass the area they actually need
+    /// (the web passes its simulation bbox inflated by 2 %, covering the
+    /// engine's own 1 % bounds margin), because the grid-derived rectangle
+    /// can span far more ground than the request (a 2048 px output tile at
+    /// 90 m covers 184 km).
+    ///
+    /// Additive and absent from older jobs (CONTRACT §9b). Supported by the
+    /// in-memory downloader only; the file-based `run_download` rejects it,
+    /// because its writer produces sparse files whose unwritten rows would
+    /// read as 0 m sea level instead of void.
+    #[serde(default)]
+    pub fetch_bounds: Option<FetchBounds>,
+}
+
+/// Region of interest for [`DownloadJob::fetch_bounds`], in degrees.
+// dead_code: the CLI binary never reaches the in-memory path, so its
+// reachability pass flags these pub fields; the lib (WASM) reads them all.
+#[allow(dead_code)]
+#[derive(Deserialize, Debug, Clone, Copy)]
+pub struct FetchBounds {
+    pub south: f64,
+    pub north: f64,
+    pub west: f64,
+    pub east: f64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1194,7 +1222,6 @@ async fn download_strip_raw(
 /// Given an S3 path-style or virtual-hosted URL template, return multiple
 /// equivalent URL templates using different S3 hostnames for domain sharding.
 /// Falls back to a single template if the URL isn't recognised as S3.
-#[cfg(target_arch = "wasm32")]
 fn shard_s3_templates(url_template: &str) -> Vec<String> {
     // Try path-style: https://s3.amazonaws.com/BUCKET/path...
     if let Some(rest) = url_template.strip_prefix("https://s3.amazonaws.com/") {
@@ -1213,7 +1240,6 @@ fn shard_s3_templates(url_template: &str) -> Vec<String> {
     vec![url_template.to_string()]
 }
 
-#[cfg(target_arch = "wasm32")]
 fn make_s3_shards(bucket: &str, path: &str) -> Vec<String> {
     vec![
         format!("https://s3.amazonaws.com/{bucket}/{path}"),
@@ -1223,6 +1249,78 @@ fn make_s3_shards(bucket: &str, path: &str) -> Vec<String> {
         format!("https://s3.dualstack.us-east-1.amazonaws.com/{bucket}/{path}"),
         format!("https://{bucket}.s3.dualstack.us-east-1.amazonaws.com/{path}"),
     ]
+}
+
+/// The exact `(tx, ty, URL)` list the web downloader fetches for a source-tile
+/// rectangle, shard assignment included. Every consumer of tile URLs (the
+/// downloader itself and the `tile_urls_for_job` prefetch export) goes through
+/// this one function so the fetch set and the warmed set can never drift.
+///
+/// The shard is chosen from the tile *coordinates* — `(tx + ty) % n` — not
+/// from the enumeration index, so a given tile has the same URL in every run
+/// and in the prefetcher. Stable URLs are what let the browser HTTP cache
+/// work across runs; `(x + y) % n` also balances contiguous rectangles as
+/// tightly as round-robin, which a scrambling hash does not (measured
+/// worst-case 2–3× per-host load on small rectangles).
+pub fn plan_tile_urls(
+    url_template: &str,
+    zoom: u32,
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+) -> Vec<(u32, u32, String)> {
+    let templates = shard_s3_templates(url_template);
+    let shard_count = templates.len();
+    (y0..=y1)
+        .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
+        .map(|(tx, ty)| {
+            let url = templates[((tx as u64 + ty as u64) % shard_count as u64) as usize]
+                .replace("{z}", &zoom.to_string())
+                .replace("{x}", &tx.to_string())
+                .replace("{y}", &ty.to_string());
+            (tx, ty, url)
+        })
+        .collect()
+}
+
+/// Full source-tile rectangle of a job (derived from its output-tile grid),
+/// intersected with `fetch_bounds` when present. `None` means the ROI misses
+/// the grid entirely — nothing to fetch, all-void terrain.
+pub fn job_fetch_rect(job: &DownloadJob) -> Option<(u32, u32, u32, u32)> {
+    let (mut bb_s, mut bb_n, mut bb_w, mut bb_e) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+    for t in &job.tiles {
+        let pd = t.resolution_m / 111_111.0;
+        let sp = t.size_px as f64 * pd;
+        bb_s = bb_s.min(t.ul_lat - sp);
+        bb_n = bb_n.max(t.ul_lat);
+        bb_w = bb_w.min(t.ul_lon);
+        bb_e = bb_e.max(t.ul_lon + sp);
+    }
+    let (x0, x1) = (lon2tx(bb_w, job.zoom), lon2tx(bb_e, job.zoom));
+    let (y0, y1) = (lat2ty(bb_n, job.zoom), lat2ty(bb_s, job.zoom));
+    intersect_fetch_rect(x0, x1, y0, y1, job.fetch_bounds.as_ref(), job.zoom)
+}
+
+/// Intersect a source-tile rectangle with an optional [`FetchBounds`].
+fn intersect_fetch_rect(
+    x0: u32,
+    x1: u32,
+    y0: u32,
+    y1: u32,
+    fb: Option<&FetchBounds>,
+    zoom: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    match fb {
+        None => Some((x0, x1, y0, y1)),
+        Some(fb) => {
+            let ix0 = x0.max(lon2tx(fb.west, zoom));
+            let ix1 = x1.min(lon2tx(fb.east, zoom));
+            let iy0 = y0.max(lat2ty(fb.north, zoom));
+            let iy1 = y1.min(lat2ty(fb.south, zoom));
+            if ix0 > ix1 || iy0 > iy1 { None } else { Some((ix0, ix1, iy0, iy1)) }
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1246,25 +1344,14 @@ async fn download_all_tiles_web(
 
     // Domain sharding: expand single S3 URL into multiple hostnames.
     // Browser allows 6 HTTP/1.1 connections per hostname.
-    let templates = shard_s3_templates(url_template);
-    let shard_count = templates.len();
+    let shard_count = shard_s3_templates(url_template).len();
     if shard_count > 1 {
         eprintln!("[DownloadWeb] Domain sharding: {} hostnames × 6 conn = {} concurrent",
             shard_count, shard_count * 6);
     }
 
-    // Build all tile URLs, round-robin across shards.
-    let tile_info: Vec<(u32, u32, String)> = (y0..=y1)
-        .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
-        .enumerate()
-        .map(|(i, (tx, ty))| {
-            let url = templates[i % shard_count]
-                .replace("{z}", &zoom.to_string())
-                .replace("{x}", &tx.to_string())
-                .replace("{y}", &ty.to_string());
-            (tx, ty, url)
-        })
-        .collect();
+    // One planner builds every tile URL (shared with `tile_urls_for_job`).
+    let tile_info = plan_tile_urls(url_template, zoom, x0, x1, y0, y1);
 
     // ── Concurrency: saturate the browser's HTTP/2 stream budget ──
     // HTTP/2 multiplexes ~100 streams per connection.  Domain sharding
@@ -1421,6 +1508,19 @@ async fn download_all_tiles_web(
 pub fn run_download(job_file: &Path) -> Result<()> {
     let content = fs::read_to_string(job_file)?;
     let job: DownloadJob = serde_json::from_str(&content)?;
+
+    // The file-based path seek-writes sparse .abt files ("file grows as
+    // strips write data"), so rows a fetch ROI skipped would read back as
+    // 0 m sea level instead of the void sentinel — a no-data contract
+    // violation. Reject loudly rather than mis-support it; the in-memory
+    // path (`run_download_mem`) pre-fills void and supports `fetch_bounds`.
+    if job.fetch_bounds.is_some() {
+        anyhow::bail!(
+            "fetch_bounds is not supported by the file-based download path \
+             (sparse output files would read skipped rows as 0 m sea level); \
+             omit it, or use the in-memory downloader"
+        );
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -2079,8 +2179,18 @@ pub async fn run_download_mem(
     let gul_lon = tx2lon(x0, job.zoom);
     let glr_lon = tx2lon(x1 + 1, job.zoom);
 
+    // Optional fetch ROI (additive `fetch_bounds`): only source tiles inside
+    // it are fetched and decoded; everything else keeps the void pre-fill.
+    // Grid geometry, strip layout and the output tiles are unchanged.
+    let fetch_rect = intersect_fetch_rect(x0, x1, y0, y1, job.fetch_bounds.as_ref(), job.zoom);
+    let (fx0, fx1, fy0, fy1) = fetch_rect.unwrap_or((1, 0, 1, 0)); // empty inclusive ranges
+    let ftotal = fetch_rect.map_or(0usize, |(a, b, c, d)| ((b - a + 1) * (d - c + 1)) as usize);
+
     eprintln!("[DownloadMem] z={} tiles={}x{}={} connections={}",
         job.zoom, nx, ny, total, conns);
+    if job.fetch_bounds.is_some() {
+        eprintln!("[DownloadMem] fetch_bounds: fetching {ftotal} of {total} source tiles");
+    }
 
     // 3. Prepare in-memory .abt buffers (header + a body of void).
     //    The body is pre-filled with the `-9999` sentinel so a pixel no tile
@@ -2163,16 +2273,21 @@ pub async fn run_download_mem(
     let stats = Arc::new(DownloadStats::new());
 
     // Report 0% immediately
-    if let Some(cb) = &on_progress { cb(0, total); }
+    if let Some(cb) = &on_progress { cb(0, ftotal); }
 
-    // ── WASM: batch-download ALL tiles via browser fetch ────────
+    // ── WASM: batch-download the fetch rect via browser fetch ───
     // Bypasses reqwest; hands every URL to the browser in one JS call.
+    // An empty fetch rect skips the network entirely (all tiles stay void).
     #[cfg(target_arch = "wasm32")]
-    let mut tile_cache = download_all_tiles_web(
-        &job.url_template, zoom, x0, x1, y0, y1,
-        conns.min(200),
-        &stats, start, js_progress,
-    ).await;
+    let mut tile_cache = if ftotal == 0 {
+        std::collections::HashMap::new()
+    } else {
+        download_all_tiles_web(
+            &job.url_template, zoom, fx0, fx1, fy0, fy1,
+            conns.min(200),
+            &stats, start, js_progress,
+        ).await
+    };
     #[cfg(target_arch = "wasm32")]
     let _ = client; // browser fetch bypasses reqwest
 
@@ -2195,22 +2310,33 @@ pub async fn run_download_mem(
     for (strip_idx, &(sy0, sy1)) in strips.iter().enumerate() {
         let sny = (sy1 - sy0 + 1) as usize;
 
-        // ── Get raw tile data ───────────────────────────────────
+        // ── Get raw tile data (fetch rect only; the rest stays void) ──
+        let fsy0 = sy0.max(fy0);
+        let fsy1 = sy1.min(fy1);
+
         #[cfg(target_arch = "wasm32")]
-        let raw_results: Vec<(u32, u32, Result<Vec<u8>>)> = (sy0..=sy1)
-            .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
-            .map(|(tx, ty)| match tile_cache.remove(&(tx, ty)) {
-                Some(bytes) => (tx, ty, Ok(bytes)),
-                None => (tx, ty, Err(anyhow::anyhow!("download failed"))),
-            })
-            .collect();
+        let raw_results: Vec<(u32, u32, Result<Vec<u8>>)> = if fsy0 > fsy1 {
+            Vec::new()
+        } else {
+            (fsy0..=fsy1)
+                .flat_map(|ty| (fx0..=fx1).map(move |tx| (tx, ty)))
+                .map(|(tx, ty)| match tile_cache.remove(&(tx, ty)) {
+                    Some(bytes) => (tx, ty, Ok(bytes)),
+                    None => (tx, ty, Err(anyhow::anyhow!("download failed"))),
+                })
+                .collect()
+        };
 
         #[cfg(not(target_arch = "wasm32"))]
-        let raw_results = download_strip_raw(
-            client, &job.url_template, zoom, x0, x1, sy0, sy1,
-            conns, &progress, total, &stats, start, &semaphore,
-            on_progress,
-        ).await;
+        let raw_results = if fsy0 > fsy1 {
+            Vec::new()
+        } else {
+            download_strip_raw(
+                client, &job.url_template, zoom, fx0, fx1, fsy0, fsy1,
+                conns, &progress, ftotal, &stats, start, &semaphore,
+                on_progress,
+            ).await
+        };
 
         // Phase 2: Decode PNGs sequentially, then classify decode errors.
 
@@ -2228,14 +2354,14 @@ pub async fn run_download_mem(
                             {
                                 decoded_count += 1;
                                 if let Some(f) = js_progress {
-                                    let pct5 = if total > 0 { decoded_count * 20 / total } else { 0 };
-                                    if pct5 > last_decode_pct5 || decoded_count == total || decoded_count == 1 {
+                                    let pct5 = if ftotal > 0 { decoded_count * 20 / ftotal } else { 0 };
+                                    if pct5 > last_decode_pct5 || decoded_count == ftotal || decoded_count == 1 {
                                         last_decode_pct5 = pct5;
                                         let _ = f.call3(
                                             &wasm_bindgen::JsValue::NULL,
                                             &wasm_bindgen::JsValue::from(1u32),
                                             &wasm_bindgen::JsValue::from(decoded_count as u32),
-                                            &wasm_bindgen::JsValue::from(total as u32),
+                                            &wasm_bindgen::JsValue::from(ftotal as u32),
                                         );
                                     }
                                 }
@@ -2382,6 +2508,108 @@ pub async fn run_download_mem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fetch_bounds / URL planning ────────────────────────────────────────
+
+    fn job_json(fetch_bounds: Option<&str>) -> String {
+        let fb = fetch_bounds.map_or(String::new(), |f| format!(r#""fetch_bounds": {f},"#));
+        format!(
+            r#"{{
+                "url_template": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{{z}}/{{x}}/{{y}}.png",
+                "encoding": "terrarium",
+                "output_dir": "/mem",
+                {fb}
+                "tiles": [{{
+                    "filename": "tile_0_0.abt",
+                    "ul_lat": 47.04, "ul_lon": 8.42,
+                    "size_px": 2048, "resolution_m": 30.0
+                }}],
+                "zoom": 12
+            }}"#
+        )
+    }
+
+    #[test]
+    fn fetch_bounds_is_optional_and_parses() {
+        let plain: DownloadJob = serde_json::from_str(&job_json(None)).unwrap();
+        assert!(plain.fetch_bounds.is_none());
+
+        let with: DownloadJob = serde_json::from_str(&job_json(Some(
+            r#"{"south": 46.86, "north": 47.04, "west": 8.42, "east": 8.68}"#,
+        )))
+        .unwrap();
+        let fb = with.fetch_bounds.unwrap();
+        assert_eq!(fb.north, 47.04);
+        assert_eq!(fb.east, 8.68);
+    }
+
+    #[test]
+    fn fetch_rect_without_bounds_is_the_full_grid_rect() {
+        let job: DownloadJob = serde_json::from_str(&job_json(None)).unwrap();
+        // Mirror run_download_mem's own bbox derivation for the single tile.
+        let pd = 30.0 / 111_111.0;
+        let sp = 2048.0 * pd;
+        let (x0, x1) = (lon2tx(8.42, 12), lon2tx(8.42 + sp, 12));
+        let (y0, y1) = (lat2ty(47.04, 12), lat2ty(47.04 - sp, 12));
+        assert_eq!(job_fetch_rect(&job), Some((x0, x1, y0, y1)));
+    }
+
+    #[test]
+    fn fetch_bounds_clamps_the_rect_and_disjoint_bounds_empty_it() {
+        let job: DownloadJob = serde_json::from_str(&job_json(Some(
+            r#"{"south": 46.86, "north": 47.04, "west": 8.42, "east": 8.68}"#,
+        )))
+        .unwrap();
+        let (fx0, fx1, fy0, fy1) = job_fetch_rect(&job).unwrap();
+        let clamped = ((fx1 - fx0 + 1) * (fy1 - fy0 + 1)) as usize;
+        // The bbox needs a handful of z12 tiles; the 2048 px grid tile spans
+        // 0.553 deg and would cover 70-80. The clamp must cut most of that.
+        assert!(clamped >= 9 && clamped <= 25, "clamped = {clamped}");
+        assert!(fx0 >= lon2tx(8.42, 12) && fy0 >= lat2ty(47.04, 12));
+
+        let disjoint: DownloadJob = serde_json::from_str(&job_json(Some(
+            r#"{"south": -10.0, "north": -9.0, "west": 100.0, "east": 101.0}"#,
+        )))
+        .unwrap();
+        assert_eq!(job_fetch_rect(&disjoint), None);
+    }
+
+    #[test]
+    fn planned_urls_are_stable_across_different_rectangles() {
+        let tmpl = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+        // The same tile must get the same URL regardless of which rectangle
+        // (i.e. which run) it appears in — this is what lets the HTTP cache
+        // and the prefetcher work across runs.
+        let a = plan_tile_urls(tmpl, 12, 2143, 2150, 1440, 1449);
+        let b = plan_tile_urls(tmpl, 12, 2145, 2146, 1442, 1443);
+        for (tx, ty, url_b) in &b {
+            let url_a = &a.iter().find(|(ax, ay, _)| ax == tx && ay == ty).unwrap().2;
+            assert_eq!(url_a, url_b, "tile {tx}/{ty} changed hosts between runs");
+        }
+    }
+
+    #[test]
+    fn planned_urls_balance_hosts_like_round_robin() {
+        let tmpl = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+        let urls = plan_tile_urls(tmpl, 12, 2143, 2150, 1440, 1449); // 8 x 10 = 80
+        assert_eq!(urls.len(), 80);
+        let mut per_host = std::collections::HashMap::new();
+        for (_, _, u) in &urls {
+            let host = u.split('/').nth(2).unwrap().to_string();
+            *per_host.entry(host).or_insert(0usize) += 1;
+        }
+        assert_eq!(per_host.len(), 6, "expected 6 shard hosts");
+        // Round-robin ideal is 80/6 = 13.3; (x+y) % 6 stays within one row of it.
+        assert!(per_host.values().all(|&n| n <= 22), "per-host: {per_host:?}");
+        // Substitution sanity.
+        assert!(urls[0].2.contains("/12/") && urls[0].2.ends_with(".png"));
+    }
+
+    #[test]
+    fn non_s3_templates_stay_single_host() {
+        let urls = plan_tile_urls("https://dem.example.org/t/{z}/{x}/{y}.png", 11, 5, 6, 7, 8);
+        assert!(urls.iter().all(|(_, _, u)| u.starts_with("https://dem.example.org/")));
+    }
 
     // ── Tile math ──────────────────────────────────────────────────────────
 

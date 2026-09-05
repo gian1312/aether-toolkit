@@ -156,6 +156,23 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    keeps it visible. Consumers that relied on the bail must match the
 >    `[Warn] NO-DATA batch:` prefix. Per-tile partial coverage was always
 >    exit 0 and is unchanged.
+> 19. **P2P honors `compute_backend: "CPU"`, and a failed link is 9999, not 0
+>    (§3.3/§7; 2026-09-01).** P2P/BATCH_P2P previously ignored
+>    `compute_backend` and always ran the GPU; `"CPU"` now selects a reference
+>    CPU implementation (same links, same frozen CSV columns, same single-link
+>    artifacts). Independently, a link whose loss cannot be computed (non-finite
+>    ITM result, pattern-blocked bearing) reports `Path_Loss_dB` = `9999.00` —
+>    both backends — where some failure paths previously wrote `0.00`, which
+>    reads as a perfect link. LOS-mode `-1`/`0` visibility is unchanged.
+> 20. **`download` job `fetch_bounds` (§9b, additive; 2026-09-05).** Optional
+>    region of interest: only source tiles intersecting it are fetched and
+>    decoded, everything else keeps the `-9999` void pre-fill; output grid,
+>    geometry and `.abt` layout unchanged. In-memory downloader only — the
+>    file-based `download` CLI rejects jobs carrying it (its sparse writer
+>    would read skipped rows as 0 m sea level). Same change: web tile URLs
+>    are sharded by tile coordinate (`(x+y) % hosts`) instead of fetch order,
+>    so a tile's URL is stable across runs (browser-cache reuse); URL choice
+>    is not a contract surface, noted for completeness.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -310,20 +327,26 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   be loaded fails the tile (and thus the run) instead of warning and writing a
   terrain-less tile. CRS/georeferencing problems are hard errors naming the
   file and the fix (§9a).
-* **An ingest that covered nothing exits non-zero.** A run in which **no
-  source supplied a sample for a single pixel of a single tile** fails
-  (`no source covered any pixel of …` for one job, `… came from a source` for
-  a batch) instead of exiting 0 with a tile that is nothing but void. Coverage
-  is counted **before** `void_fill_m` is applied, so filling the holes with
-  0 m does not disguise it, and it is judged **over the whole run**, never per
-  tile: the edge tiles of any area legitimately fall outside the sources, and
-  those are still written. The usual cause is a source that does not overlap
-  the requested area at all, or the wrong CRS on one.
+* **An ingest that covered nothing: batch warns and exits 0; a single job
+  still exits non-zero (changelog item 18, 2026-08-31).** A **batch** whose
+  tiles took not one pixel from any source keeps its tiles — void, or
+  `void_fill_m` where the job sets it — prints the frozen
+  `[Warn] NO-DATA batch:` line and exits 0: ground outside a bounded source
+  degrades to sea, loudly, never an error. A **single job** (a JSON object,
+  not an array) that covers nothing still fails with
+  `no source covered any pixel of …` — one tile with one source set is a
+  deliberate request for exactly that ground, so covering none of it is
+  treated as caller error (usually no overlap, or the wrong CRS). Coverage is
+  counted **before** `void_fill_m` is applied, so filling the holes with 0 m
+  does not disguise it, and for a batch it is judged **over the whole run**,
+  never per tile: the edge tiles of any area legitimately fall outside the
+  sources, and those are still written.
 
-  > **Consumer note.** A caller that today treats exit 0 as "terrain exists"
-  > keeps working. A caller that deliberately converts an area with no data —
-  > to pre-create empty tiles — must now pass `void_fill_m` **and** at least
-  > one overlapping source, or handle the non-zero exit.
+  > **Consumer note.** A caller that treats exit 0 as "terrain exists" must,
+  > for batches, also match the `[Warn] NO-DATA batch:` prefix (item 18) —
+  > exit 0 now includes the all-void case. Single-job callers keep the old
+  > behavior: pre-creating empty tiles deliberately needs `void_fill_m`
+  > **and** at least one overlapping source, or handling the non-zero exit.
 * **`plan` (new in v2.0, additive).** Enumerates, without downloading or
   converting anything, exactly the `.abt` tiles an area/resolution request
   produces: one JSON document on stdout with `schema: "aether-plan/1"`,
@@ -721,6 +744,12 @@ rejects other values.
 | `"CPU"` | Force CPU. | Skip GPU; run the in-process CPU engine. |
 | `"GPU_ONLY"` | (treated as AUTO) | **WASM-only:** try GPU; on failure **return an error** (`AETHER_GPU_UNAVAILABLE: …`) instead of the slow single-threaded CPU path, so the JS caller can orchestrate a multi-Worker CPU fallback. Matching is case-insensitive. |
 
+> **P2P/BATCH_P2P (2026-09-01):** `"CPU"` now selects a CPU implementation for
+> P2P tasks too (reference `cpu_itm`, same links, same frozen CSV, same
+> single-link artifacts). Before this, P2P ignored `compute_backend` and always
+> ran the GPU — a `"CPU"` job on a GPU-less machine simply failed. `"AUTO"` and
+> `"GPU"` keep the GPU path.
+
 ### 3.4 `output` (`OutputConfig`)
 
 | Field | Type | Required? | Notes |
@@ -894,6 +923,11 @@ writeln!(out_file, "{},{},{:.2},{:.2}", src_id, tgt_id, r.signal, r.loss)?; // r
   `Source_ID, Target_ID, Signal_dBm, Path_Loss_dB`. **Both the order (for
   MPT_SIGMA) and the names (for QGIS) are therefore load-bearing.** Do not
   reorder, rename, or insert columns.
+* **No-signal sentinel (2026-09-01).** A link whose loss cannot be computed —
+  the ITM math returned a non-finite value, or the TX antenna pattern blocks
+  the bearing — reports `Path_Loss_dB` = `9999.00` (and the correspondingly
+  impossible `Signal_dBm`), never `0.00`: a zero here reads as a perfect link.
+  LOS-mode links keep their `-1`/`0` visibility convention.
 
 **Single-link extras.** When the job resolves to **exactly one** source×target
 link, `aether_core` also writes SPLAT-compatible profile files into
@@ -1354,6 +1388,7 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `zoom` | u32 | **required** | XYZ zoom level. |
 | `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
+| `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 
 `SubTileSpec`:

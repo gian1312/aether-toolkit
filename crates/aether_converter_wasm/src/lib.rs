@@ -4,7 +4,8 @@
 
 use wasm_bindgen::prelude::*;
 use aether_converter::download::{
-    DownloadJob, run_download_mem, lon2tx, lat2ty, ty2lat, tx2lon,
+    DownloadJob, run_download_mem, job_fetch_rect, plan_tile_urls,
+    lon2tx, lat2ty, ty2lat, tx2lon,
 };
 use aether_converter::canopy::{apply_surface_to_abt_tiles, SurfaceOpts};
 use aether_converter::mvt;
@@ -35,6 +36,23 @@ pub async fn download_terrain(
             .map_err(|e| JsValue::from_str(&format!("JS error: {e:?}")))?;
     }
     Ok(obj.into())
+}
+
+/// The exact source-tile URLs `download_terrain` would fetch for this job —
+/// same rectangle, same `fetch_bounds` clamp, same shard assignment, same
+/// order. The page's pan-time prefetcher warms precisely these, so the
+/// prefetched set and the fetched set cannot drift.
+#[wasm_bindgen]
+pub fn tile_urls_for_job(job_json: &str) -> Result<js_sys::Array, JsValue> {
+    let job: DownloadJob = serde_json::from_str(job_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid job JSON: {e}")))?;
+    let arr = js_sys::Array::new();
+    if let Some((x0, x1, y0, y1)) = job_fetch_rect(&job) {
+        for (_, _, url) in plan_tile_urls(&job.url_template, job.zoom, x0, x1, y0, y1) {
+            arr.push(&JsValue::from_str(&url));
+        }
+    }
+    Ok(arr)
 }
 
 // ── Assemble pre-decoded tiles into .abt buffers ─────────────
