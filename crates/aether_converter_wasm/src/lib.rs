@@ -13,10 +13,17 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{Cursor, Write};
 
 /// Download terrain tiles and convert to .abt format in memory.
+///
+/// `fetch_fn` is optional and additive: a JS
+/// `(url: string) => Promise<{ok, status, arrayBuffer()}>` used for **every**
+/// source-tile request instead of the global `fetch`, so the page can serve
+/// tiles from its own cache. Omit it (or pass `undefined`) and behaviour is
+/// exactly as before. The job JSON is unchanged either way.
 #[wasm_bindgen]
 pub async fn download_terrain(
     job_json: &str,
     on_progress: Option<js_sys::Function>,
+    fetch_fn: Option<js_sys::Function>,
 ) -> Result<JsValue, JsValue> {
     let job: DownloadJob = serde_json::from_str(job_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid job JSON: {e}")))?;
@@ -25,7 +32,7 @@ pub async fn download_terrain(
         .build()
         .map_err(|e| JsValue::from_str(&format!("HTTP client error: {e}")))?;
 
-    let result = run_download_mem(&job, &client, None, on_progress.as_ref())
+    let result = run_download_mem(&job, &client, None, on_progress.as_ref(), fetch_fn.as_ref())
         .await
         .map_err(|e| JsValue::from_str(&format!("Download failed: {e}")))?;
 

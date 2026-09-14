@@ -1333,6 +1333,9 @@ async fn download_all_tiles_web(
     stats: &DownloadStats,
     start_time: Instant,
     js_progress: Option<&js_sys::Function>,
+    // Optional JS fetch replacement: `(url) => Promise<{ok, status, arrayBuffer()}>`.
+    // When absent the snippet uses the global `fetch`, byte-identical to before.
+    js_fetch: Option<&js_sys::Function>,
 ) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
@@ -1364,11 +1367,11 @@ async fn download_all_tiles_web(
     // (500 ms, 1 s, 1.5 s).  `prog(phase, done, total)` is called
     // every 5 % of tiles (plus first and last) so the UI stays live.
     let fetch_pool = js_sys::Function::new_with_args(
-        "urls,conc,prog",
+        "urls,conc,prog,f",
         "return new Promise(function(resolve){\
             var r=new Array(urls.length),n=0,d=0,t=urls.length,lp=-1;\
             function doFetch(i,retries){\
-                fetch(urls[i]).then(function(resp){\
+                (f||fetch)(urls[i]).then(function(resp){\
                     if(!resp.ok)throw new Error('HTTP '+resp.status);\
                     return resp.arrayBuffer();\
                 }).then(function(buf){\
@@ -1418,12 +1421,17 @@ async fn download_all_tiles_web(
         Some(f) => f.clone().into(),
         None => wasm_bindgen::JsValue::NULL,
     };
-    let promise = match fetch_pool.call3(
-        &wasm_bindgen::JsValue::NULL,
+    let fetch_val: wasm_bindgen::JsValue = match js_fetch {
+        Some(f) => f.clone().into(),
+        None => wasm_bindgen::JsValue::NULL,
+    };
+    let pool_args = js_sys::Array::of4(
         &js_urls,
         &wasm_bindgen::JsValue::from(concurrency as u32),
         &prog_val,
-    ) {
+        &fetch_val,
+    );
+    let promise = match fetch_pool.apply(&wasm_bindgen::JsValue::NULL, &pool_args) {
         Ok(p) => js_sys::Promise::from(p),
         Err(e) => {
             eprintln!("[DownloadWeb] Failed to start pool: {:?}", e);
@@ -2149,6 +2157,10 @@ pub async fn run_download_mem(
     // Phase 0 = download, 1 = decode.
     #[cfg(target_arch = "wasm32")]
     js_progress: Option<&js_sys::Function>,
+    // Optional JS fetch replacement for every source-tile request:
+    // `(url) => Promise<{ok, status, arrayBuffer()}>`. `None` = global `fetch`.
+    #[cfg(target_arch = "wasm32")]
+    js_fetch: Option<&js_sys::Function>,
 ) -> Result<std::collections::HashMap<String, Vec<u8>>> {
     let start = Instant::now();
     let conns = job.max_connections.unwrap_or(256);
@@ -2285,7 +2297,7 @@ pub async fn run_download_mem(
         download_all_tiles_web(
             &job.url_template, zoom, fx0, fx1, fy0, fy1,
             conns.min(200),
-            &stats, start, js_progress,
+            &stats, start, js_progress, js_fetch,
         ).await
     };
     #[cfg(target_arch = "wasm32")]

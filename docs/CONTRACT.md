@@ -173,6 +173,15 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    are sharded by tile coordinate (`(x+y) % hosts`) instead of fetch order,
 >    so a tile's URL is stable across runs (browser-cache reuse); URL choice
 >    is not a contract surface, noted for completeness.
+> 21. **`download_terrain` optional `fetch_fn` (WASM surface only, additive;
+>    2026-09-14).** The `aether_converter_wasm` export takes an optional third
+>    argument: a JS `(url) => Promise<{ok, status, arrayBuffer()}>` used for
+>    every source-tile request in place of the global `fetch`. Omitted or
+>    `undefined`, behaviour is exactly as before. Nothing else moves — the
+>    `download` job JSON (§9b), the planned tile URLs, the retry/backoff and
+>    progress callbacks, and the `.abt` bytes are all unchanged, and no native
+>    or CLI surface is touched. Consumer: the waveshed.io web pipeline, which
+>    serves source tiles from its own browser cache.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
