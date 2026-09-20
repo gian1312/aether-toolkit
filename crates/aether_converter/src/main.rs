@@ -95,7 +95,8 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         },
         Commands::Ingest { job_file } => {
-            let content = fs::read_to_string(&job_file)?;
+            let content = fs::read_to_string(&job_file)
+                .map_err(|e| anyhow::anyhow!("reading job file {:?}: {e}", job_file))?;
 
             // Wrap cache in Arc<Mutex> for safe multi-threading
             let texture_cache: ingest::ImageCache = Arc::new(Mutex::new(HashMap::new()));

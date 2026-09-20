@@ -936,6 +936,9 @@ writeln!(out_file, "{},{},{:.2},{:.2}", src_id, tgt_id, r.signal, r.loss)?; // r
   the ITM math returned a non-finite value, or the TX antenna pattern blocks
   the bearing — reports `Path_Loss_dB` = `9999.00` (and the correspondingly
   impossible `Signal_dBm`), never `0.00`: a zero here reads as a perfect link.
+  A link longer than `max_range_km` reports the same `9999.00` on the **CPU**
+  backend, with one `[P2P] WARNING: link … exceeds max_range_km` line on stderr
+  (the GPU shader still writes `0.00` for that case).
   LOS-mode links keep their `-1`/`0` visibility convention.
 
 **Single-link extras.** When the job resolves to **exactly one** source×target
@@ -1210,7 +1213,7 @@ a **single object** or a **JSON array** of such objects (batch).
 
 | Field | Type | Required? | Notes |
 |-------|------|-----------|-------|
-| `output_path` | string (path) | **required** | Destination `.abt` file. |
+| `output_path` | string (path) | **required** | Destination `.abt` file; its parent directory is created if missing, so the caller need not pre-create it. |
 | `format` | string? | optional | `"r16sint"` (default behavior) or `"bc6h"`. |
 | `ul_lat` | f64 | **required** | Upper-left latitude. |
 | `ul_lon` | f64 | **required** | Upper-left longitude (east-positive). |

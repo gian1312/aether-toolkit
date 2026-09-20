@@ -1329,7 +1329,12 @@ pub fn process_tile(
         base_elev = min_elev;
     }
 
-    let f = File::create(&job.output_path)?;
+    if let Some(dir) = job.output_path.parent() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("creating output directory {:?}", dir))?;
+    }
+    let f = File::create(&job.output_path)
+        .with_context(|| format!("creating output tile {:?}", job.output_path))?;
     let mut w = BufWriter::with_capacity(1024 * 1024, f);
 
     w.write_all(b"AETH")?;
