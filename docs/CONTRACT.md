@@ -608,20 +608,22 @@ empirically:
 
 | Binary | `clap` `version` attribute? | `--version` behavior |
 |--------|-----------------------------|----------------------|
-| `aether_core` | **yes** — `#[command(author, version, about)]` | Prints `aether_core <CARGO_PKG_VERSION>` (currently `0.1.0`) and exits `0`. `-V` also works. |
-| `aether_converter` | no | `--version` is an *unknown argument* → clap error, exit `2`. |
-| `aether_export` | no | `--version`/`-V` → `error: unexpected argument '--version' found`, exit `2` (verified). |
-| `aether_aggregate` | no | same as above, exit `2` (verified). |
+| `aether_core` | **yes** — `#[command(author, version, about)]` | Prints `aether_core <CARGO_PKG_VERSION>` and exits `0`. `-V` also works. |
+| `aether_converter` | **yes** (since 0.2.5) | Prints `aether_converter <CARGO_PKG_VERSION>`, exit `0`. Older builds: unknown argument, exit `2`. |
+| `aether_export` | **yes** (since 1.0.1) | Prints `aether_export <CARGO_PKG_VERSION>`, exit `0`. Older builds: unknown argument, exit `2`. |
+| `aether_aggregate` | **yes** (since 1.0.1) | Prints `aether_aggregate <CARGO_PKG_VERSION>`, exit `0`. Older builds: unknown argument, exit `2`. |
 
-Current versions: `aether_converter 0.2.4`, `aether_export 1.0.0`,
-`aether_aggregate 1.0.0` (from each crate's `Cargo.toml`; the toolkit binaries
-do **not** expose these on the CLI).
+Every binary therefore answers `--version` with `<name> <semver>` on stdout
+and exit `0` (pinned by each crate's `tests/test_version.rs`). A consumer
+that sees exit `2` / "unexpected argument" is talking to a build older than
+the versions above and must treat its capabilities as the oldest known set.
 
-> **RECOMMENDED future behavior:** every binary should accept `--version` and
-> print a real semantic version (`<name> <semver>`) to stdout with exit `0`.
-> This lets consumers gate on engine capability without parsing help text.
-> Adding `#[command(version)]` to the three toolkit CLIs is a safe additive
-> change; do it before consumers begin depending on version output.
+Known capability gates consumers rely on:
+
+| Capability | Minimum version |
+|------------|-----------------|
+| `aether_core` coverage at resolutions outside `{2, 5, 10, 30}` m on the GPU backend (the hardcoded list was removed; the CPU/WASM paths never had it) | `aether_core 0.4.3` |
+| `aether_core --fingerprint` | `aether_core 0.4.2` |
 
 ---
 

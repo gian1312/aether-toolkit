@@ -47,7 +47,7 @@ use std::collections::HashMap;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Parser, Debug)]
-#[command(name = "aether_export")]
+#[command(name = "aether_export", version)]
 #[command(about = "Convert AETHER .bit/.tiles → Cloud-Optimized GeoTIFF (pure Rust, no GDAL)")]
 struct Args {
     /// Path to the input file (.bit for flat, .tiles for tiled)

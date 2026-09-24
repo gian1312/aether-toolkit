@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use sysinfo::System;
 
 #[derive(Parser)]
-#[command(name = "aether_converter")]
+#[command(name = "aether_converter", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -12,3 +12,4 @@ target/
 # OS cruft
 .DS_Store
 Thumbs.db
+/target-linux/

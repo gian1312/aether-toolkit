@@ -12,7 +12,7 @@ mod writer;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Parser, Debug)]
-#[command(name = "aether_aggregate")]
+#[command(name = "aether_aggregate", version)]
 #[command(about = "Aggregate raster files into max/count COG outputs (pure Rust, no GDAL)")]
 struct Args {
     /// Text file with one input path per line (.bit or .tif)
