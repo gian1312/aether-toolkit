@@ -1567,58 +1567,91 @@ unaffected — **MPT_SIGMA** passes `AETHER_LICENSE` through verbatim
 
 ## 11. Release / distribution manifest (`latest.json`)
 
-Consumed by the **Waveshed QGIS plugin** to discover, verify, and install engine
-binary updates. It is served from waveshed.io.
+Consumed by the **Waveshed QGIS plugin** (`waveshed/core/binary_manager.py`) to
+discover, verify and install engine binary updates, and by the waveshed.io
+downloads page.
 
-> **Verification caveat:** unlike every other section, this schema could **not**
-> be verified against readable source — the sole consumer is the QGIS plugin,
-> which is out of scope for this repository, and no `latest.json`,
-> `min_plugin_version`, `schema_version`, or `sha256`-manifest producer exists
-> anywhere in the readable repos (`AETHER`, `MPT_SIGMA`, this workspace). The
-> schema below is the agreed interface; when the QGIS plugin or the web release
-> tooling becomes inspectable, re-verify and update `schemas/release_manifest.schema.json`.
+* **Producer:** the AETHER release workflow (`.github/workflows/release.yml`)
+  via `python/release/` (`package_release.py` per platform → `make_manifest.py`,
+  validated by `release_common.py`). It uploads the zips to the R2 bucket
+  `waveshed-releases` (public at `https://releases.waveshed.io/`) as
+  `vX.Y.Z/<filename>`, and the manifest as both `manifests/vX.Y.Z/latest.json`
+  and `manifests/latest.json`.
+* **Served at** `https://waveshed.io/releases/latest.json`, a relay of
+  `manifests/latest.json` (AETHER_Web `routes/releases/latest.json/+server.ts`).
+  The relay validates a parsed copy but **returns the upstream bytes verbatim**:
+  the detached signature below covers the exact bytes, so any re-serialisation
+  (key order, whitespace, escapes) would invalidate it. A relay that cannot
+  validate answers 503 `{schema_version: 1, version: null, assets: []}`.
 
 ```jsonc
 {
   "schema_version": 1,
-  "version": "1.4.2",                       // engine/bundle semver
-  "released_at": "2026-07-01T12:00:00Z",    // ISO-8601 UTC
-  "changelog_url": "https://waveshed.io/…", // optional
-  "eula_url": "https://waveshed.io/eula",   // optional
-  "min_plugin_version": "2.7.0",            // reject if plugin older
+  "version": "0.4.7",                       // engine semver (== aether_core Cargo version)
+  "released_at": "2026-10-01",              // release DATE, YYYY-MM-DD (UTC)
+  "changelog_url": "https://waveshed.io/downloads#changelog", // optional
+  "eula_url": "https://waveshed.io/legal/aether-engine-eula.md", // optional
+  "min_plugin_version": "0.1.0",            // optional; plugin warns if older
   "assets": [
     {
       "platform": "windows",                // windows | linux | macos
       "arch": "x64",                        // x64 | arm64
-      "filename": "aether-1.4.2-win-x64.zip",
-      "url": "https://waveshed.io/dl/…",
-      "size_bytes": 123456789,
-      "sha256": "<64 hex chars>"
+      "filename": "aether-0.4.7-windows-x64.zip",
+      "url": "https://releases.waveshed.io/v0.4.7/aether-0.4.7-windows-x64.zip",
+      "size_bytes": 22035144,
+      "sha256": "<64 lowercase hex chars>"
     }
-  ]
+  ],
+  "revocation": {                           // optional, see §10 / License-v3.md
+    "key_id": 0,
+    "seq": 1,
+    "blob": "<base64 revocation.bin>"
+  }
 }
 ```
 
 | Field | Type | Required | Notes |
 |-------|------|----------|-------|
 | `schema_version` | int | yes | `1`. Bump on breaking manifest changes. |
-| `version` | string | yes | Semver of the release. |
-| `released_at` | string | yes | ISO-8601 UTC timestamp. |
+| `version` | string | yes | Semver `X.Y.Z` of the release. |
+| `released_at` | string | yes | Release **date** `YYYY-MM-DD` (not a timestamp). The licence Worker derives a free key's `epoch_from` from it. |
 | `changelog_url` | string | no | |
-| `eula_url` | string | no | |
-| `min_plugin_version` | string | no | Plugin refuses assets requiring a newer plugin. |
-| `assets` | array | yes | ≥ 1 asset. |
+| `eula_url` | string | no | Overrides the plugin's default EULA URL. |
+| `min_plugin_version` | string | no | Plugin warns when it is older (advisory). |
+| `assets` | array | yes | Exactly windows/x64, linux/x64, macos/arm64 in that order (producer rule). |
 | `assets[].platform` | enum | yes | `windows`\|`linux`\|`macos`. |
 | `assets[].arch` | enum | yes | `x64`\|`arm64`. |
-| `assets[].filename` | string | yes | |
-| `assets[].url` | string | yes | Download URL. |
-| `assets[].size_bytes` | int | yes | |
+| `assets[].filename` | string | yes | `aether-X.Y.Z-<platform>-<arch>.zip`. |
+| `assets[].url` | string | yes | `https://releases.waveshed.io/vX.Y.Z/<filename>`; relay and plugin refuse other hosts. |
+| `assets[].size_bytes` | int | yes | > 0. |
 | `assets[].sha256` | string | yes | Lowercase 64-hex digest. |
+| `revocation` | object | no | `{key_id, seq, blob}`: signed cumulative revocation list; the plugin writes `blob` (base64) as `revocation.bin` next to the engine. |
 
 * **`sha256` is fail-closed.** The plugin must compute the SHA-256 of the
   downloaded asset and **refuse to install** on any mismatch, missing digest, or
   absent asset for the running platform/arch. A download that cannot be verified
   is treated as a failure, never as "install anyway".
+
+### 11.1 Detached signature (`latest.json.sig`)
+
+Every release from the first signed engine release on also publishes
+`manifests/vX.Y.Z/latest.json.sig` and `manifests/latest.json.sig`:
+
+```json
+{"alg": "ed25519", "context": "waveshed-manifest-v1", "public_key": "<64 hex>", "signature": "<base64, 64 bytes>"}
+```
+
+* Signed message = `b"waveshed-manifest-v1\0"` ‖ **the exact bytes of
+  `latest.json`** as uploaded (and as relayed, see above).
+* The key is the dedicated **manifest signing key** — not a licence key; the
+  engine never trusts it. Consumers embed its public half and refuse a
+  signature whose `public_key` they do not trust.
+* Consumers fetch the **versioned** sig (`manifests/v{version}/latest.json.sig`,
+  `version` taken from the manifest and checked to be `X.Y.Z` before it goes
+  into a URL), so a manifest/sig pair cannot straddle a release upload.
+* A bad signature is always fatal. A *missing* signature is tolerated only for
+  manifests whose `version` is at or below the last unsigned release (0.4.7);
+  anything newer without a valid signature is refused.
 
 ---
 
