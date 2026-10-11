@@ -5,7 +5,7 @@
 // tokio for maximum download throughput.
 // Processes tiles in strips to bound memory.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use byteorder::{LittleEndian, WriteBytesExt};
 use futures::stream::{self, StreamExt};
 use serde::Deserialize;
@@ -705,6 +705,23 @@ fn estimate_abt_bytes(tiles: &[SubTileSpec]) -> u64 {
 }
 
 // -- .abt writer --------------------------------------------------------------
+
+/// Open `path`, write consecutive rows (first row's `y` gives the offset), close.
+#[cfg(feature = "native")]
+fn write_rows_at(path: &Path, size_px: usize, stride: usize, rows: &[(u32, Vec<i16>)]) -> Result<()> {
+    const PAD: [u8; 256] = [0u8; 256];
+    let f = fs::OpenOptions::new().write(true).open(path)
+        .with_context(|| format!("open {} for strip rows", path.display()))?;
+    let mut w = BufWriter::with_capacity(1 << 20, f);
+    w.seek(SeekFrom::Start(44 + rows[0].0 as u64 * stride as u64))?;
+    let pad = stride - size_px * 2;
+    for (_, row_data) in rows {
+        w.write_all(bytemuck::cast_slice(row_data))?;
+        if pad > 0 { w.write_all(&PAD[..pad])?; }
+    }
+    w.flush()?;
+    Ok(())
+}
 
 #[cfg(feature = "native")]
 struct AbtWriter {
@@ -1874,12 +1891,6 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                         let bpr = spec.size_px as usize * 2;
                         (bpr + 255) & !255
                     }).collect();
-                    let mut writers: Vec<Option<BufWriter<File>>> = specs.iter()
-                        .map(|(_, path)| {
-                            fs::OpenOptions::new().write(true).open(path)
-                                .ok().map(|f| BufWriter::with_capacity(1 << 20, f))
-                        }).collect();
-                    let mut sought = vec![false; specs.len()];
                     let setup_ms = t_setup.elapsed().as_millis();
 
                     // Process one tile-row at a time. Grid = gw×ts ≈ 36 MB (fits in L3).
@@ -1887,7 +1898,6 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                     let mut mini_grid = vec![NO_TILE_M; gw * ts];
                     let mut total_rows = 0usize;
                     let mut total_px = 0usize;
-                    const PAD: [u8; 256] = [0u8; 256];
 
                     for tr in 0..sny {
                         let ty = sy0 + tr as u32;
@@ -1953,25 +1963,16 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                             if rows.is_empty() { continue; }
                             total_rows += rows.len();
                             total_px += rows.len() * specs[sti].0.size_px as usize;
-                            if let Some(ref mut w) = writers[sti] {
-                                if !sought[sti] {
-                                    let first_y = rows[0].0;
-                                    w.seek(SeekFrom::Start(
-                                        44 + first_y as u64 * strides[sti] as u64,
-                                    ))?;
-                                    sought[sti] = true;
-                                }
-                                let p = strides[sti] - specs[sti].0.size_px as usize * 2;
-                                for (_, row_data) in rows {
-                                    w.write_all(bytemuck::cast_slice(row_data))?;
-                                    if p > 0 { w.write_all(&PAD[..p])?; }
-                                }
-                            }
+                            // Open, write, close per tile-row: never more than one
+                            // output file open, so no fd limit can be hit. A failure
+                            // aborts the run — a skipped row would read back as 0 m.
+                            write_rows_at(
+                                &specs[sti].1, specs[sti].0.size_px as usize,
+                                strides[sti], rows,
+                            )?;
                         }
                     }
 
-                    // Flush.
-                    for w in writers.iter_mut().flatten() { w.flush()?; }
                     drop(tiles_by_row);
                     drop(results);
                     let work_ms = t_work.elapsed().as_millis();
@@ -2000,8 +2001,10 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         let sz = spec.size_px as usize;
         let stride = ((sz * 2) + 255) & !255;
         let expected = 44 + stride as u64 * sz as u64;
-        if let Ok(mut f) = fs::OpenOptions::new().write(true).open(path) {
-            let actual = f.metadata().map(|m| m.len()).unwrap_or(0);
+        {
+            let mut f = fs::OpenOptions::new().write(true).open(path)
+                .with_context(|| format!("open {} for tail fill", path.display()))?;
+            let actual = f.metadata()?.len();
             if actual >= expected {
                 continue;
             }
@@ -2009,18 +2012,12 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
             // a partial one (an interrupted flush) is rewritten from its start.
             let written = actual.saturating_sub(44) / stride as u64;
             let row = void_row_bytes(sz, stride);
-            let wrote = (|| -> Result<()> {
-                f.seek(SeekFrom::Start(44 + written * stride as u64))?;
-                let mut w = BufWriter::with_capacity(1 << 20, &mut f);
-                for _ in written..sz as u64 {
-                    w.write_all(&row)?;
-                }
-                w.flush()?;
-                Ok(())
-            })();
-            if wrote.is_err() {
-                let _ = f.set_len(expected);
+            f.seek(SeekFrom::Start(44 + written * stride as u64))?;
+            let mut w = BufWriter::with_capacity(1 << 20, &mut f);
+            for _ in written..sz as u64 {
+                w.write_all(&row)?;
             }
+            w.flush()?;
         }
     }
 
@@ -2520,6 +2517,24 @@ pub async fn run_download_mem(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_rows_at_missing_file_is_an_error() {
+        let missing = std::env::temp_dir().join("aether_no_such_dir_xyz/a.abt");
+        let rows = vec![(0u32, vec![1i16; 4])];
+        assert!(write_rows_at(&missing, 4, 256, &rows).is_err());
+    }
+
+    #[test]
+    fn write_rows_at_writes_at_row_offset() {
+        let p = std::env::temp_dir().join(format!("aether_wr_{}.abt", std::process::id()));
+        fs::write(&p, []).unwrap();
+        write_rows_at(&p, 4, 256, &[(2u32, vec![7i16; 4])]).unwrap();
+        let b = fs::read(&p).unwrap();
+        let _ = fs::remove_file(&p);
+        assert_eq!(b.len(), 44 + 3 * 256);
+        assert_eq!(&b[44 + 512..44 + 512 + 2], &7i16.to_ne_bytes());
+    }
 
     // ── fetch_bounds / URL planning ────────────────────────────────────────
 
