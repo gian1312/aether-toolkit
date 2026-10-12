@@ -78,6 +78,19 @@
           "default": "AUTO",
           "description": "AUTO/GPU/CPU are recognized by the native engine; GPU_ONLY is WASM-only.",
           "enum": ["AUTO", "GPU", "CPU", "GPU_ONLY"]
+        },
+        "range_profile": {
+          "type": ["array", "null"],
+          "maxItems": 8,
+          "description": "Optional variable radial step (CONTRACT.md 3.3). Absent = uniform step of resolution_m, byte-identical to older engines.",
+          "items": {
+            "type": "object",
+            "required": ["until_m", "step_m"],
+            "properties": {
+              "until_m": { "type": "number", "exclusiveMinimum": 0 },
+              "step_m": { "type": "number", "minimum": 0.1 }
+            }
+          }
         }
       }
     },

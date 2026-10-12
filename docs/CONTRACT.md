@@ -721,6 +721,7 @@ Top-level object:
 | `batch_file` | string? | `null` | **Required when `task_type == "BATCH_P2P"`/`"P2P"`.** Points at a `batch_links.csv` (§4). |
 | `min_db` | f32 | `-140.0` | Signal floor; pixels weaker than this are treated as no-coverage. |
 | `compute_backend` | string | `"AUTO"` | Backend selection (see below). |
+| `range_profile` | array? | `null` | Variable radial step for coverage (`SINGLE`) jobs — see below. Added engine 0.4.9 (additive). |
 
 **`task_type`** routing (`main.rs`):
 
@@ -745,6 +746,29 @@ enum validation**. Consumers conventionally use one of **`{2, 5, 10, 30}`**
 metres (the resolutions at which terrain `.abt` tiles are produced). This set is
 a *consumer/data convention, not an engine constraint*; do not assume the engine
 rejects other values.
+
+**`range_profile`** (`range_grid.rs`) — optional list of up to 8 bands
+`{"until_m": <metres>, "step_m": <metres>}` in ascending `until_m`. Without it the
+radial step is uniform (`resolution_m`) and the output is byte-identical to engines
+that predate the field. With it each radial stays one continuous ray from the
+transmitter (far bands keep the horizon the fine near field produced) but is sampled
+at each band's own step; `resolution_m` keeps meaning the **output pixel size**.
+Normalisation: the last band is clipped/extended to `max_range_km`; each band holds a
+whole number of steps (`n = ceil(len/step)`, actual step `len/n` ≤ requested), the
+GPU's 64-step padding goes into the last band; the radial count is
+`ceil(2π·max_k(end_k/step_k))` (arc spacing ≤ each band's requested step at its outer
+edge). Output pixels read the **nearest** range sample (the uniform engine floors).
+Native GPU and CPU engines honour it, PATH too (per waypoint, the last band follows
+the waypoint's range); P2P/BATCH_P2P and the WASM build ignore it. A malformed profile (empty, > 8 bands, non-ascending `until_m`,
+`step_m` < 0.1) fails the job with an error.
+
+**Mixed-resolution terrain** (what profile jobs rely on): `aether_core` keeps **every**
+`.abt` tile group in `terrain_dir` with a distinct (UL corner, extent) and lets finer
+tiles overwrite coarser ones where they overlap; within one group (same corner and
+extent) it picks the tile closest to `resolution_m`. Tile extents must nest (each
+extent an integer multiple of the smallest). The CPU engine, which otherwise skips
+tiles more than 50 % off `resolution_m`, accepts tiles near any band's step when a
+profile is set and samples the finest first.
 
 **`compute_backend`** (`main.rs` for native; `aether_core_wasm` for the web build):
 
