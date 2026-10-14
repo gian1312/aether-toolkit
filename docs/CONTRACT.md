@@ -120,7 +120,8 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    repaired from the first ancestor that decodes (down to the same minimum
 >    zoom the in-tile repair uses); a tile with no usable ancestor at any
 >    zoom stays fully void. A **repaired tile counts as OK**, not as an
->    error: `[Stats] Tiles: N/M OK` and the >50%-loss fatal guard both see
+>    error (narrowed by item 24: only a repaired **404** does; any other
+>    repaired failure is "degraded"): `[Stats] Tiles: N/M OK` and the >50%-loss fatal guard both see
 >    it as fetched (the request failure still appears in the error-class
 >    log lines), and a new line — `[Stats] Repaired from coarser parent
 >    tiles: N` — reports the repairs. **Bytes change for any run that lost
@@ -182,6 +183,113 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    progress callbacks, and the `.abt` bytes are all unchanged, and no native
 >    or CLI surface is touched. Consumer: the waveshed.io web pipeline, which
 >    serves source tiles from its own browser cache.
+> 22. **`ingest` honours non-square source pixels (§9a; changes `.abt`
+>    bytes; 2026-10-13).** A GeoTIFF source's X and Y pixel steps are read
+>    separately (`ModelPixelScale[0]` / `[1]`, or `ModelTransformation[0]` /
+>    `[5]`). The reader used the X step for both axes, so a file whose pixels
+>    are not square — Copernicus GLO-30 north of 50°N (0.000417° × 0.000278°),
+>    any geographic grid with equal metres per pixel — was stretched
+>    north–south by the step ratio and "covered" ground beyond its real edge.
+>    Measured on `Copernicus_DSM_COG_10_N50_00_E014_00_DEM.tif` against GDAL:
+>    90 m median / 432 m max error before, ≤ 0.5 m (the storage step) after.
+>    Square-pixel sources are byte-identical. This regressed when contract
+>    v2.0 moved reprojection from the consumer's GDAL warp (which handles any
+>    pixel shape) into `ingest`; consumers that cache file-built tiles must
+>    invalidate them (the Waveshed plugin's `_FILE_SOURCE_SCHEMA = "g2"`).
+> 23. **`ingest` streams its sources; GDAL scale/offset, rotated-grid and
+>    codec refusals, full error causes (§1.2, §9a; changes `.abt` bytes
+>    **only** for sources carrying a GDAL scale/offset; 2026-10-13).**
+>    (a) *Memory and speed, bytes unchanged.* A tile used to decode every
+>    source it touched WHOLE and hold them all at once (~580 swissALTI3D
+>    0.5 m files under one 10 m tile ≈ 4.6 GB per thread — out of memory),
+>    with a count-based cache and `total RAM / 1.5 GB` threads. It now
+>    streams the output in row bands and decodes, per band, only the part
+>    of each source the band's cell footprints reach (the band's own
+>    transformed row geometry + 2 source px, clamped to the file), through
+>    the TIFF's own strips/tiles and one byte-budgeted LRU chunk cache
+>    shared by the batch. Per tile ≤ 128 MiB of band windows, per process
+>    ≤ 192 MiB of cached chunks (a chunk over half the cache is held by its
+>    tile only — a huge single-strip file still costs one strip per tile;
+>    re-tile it, `gdal_translate -co TILED=YES`, for the bound). The batch
+>    pool is sized from a per-tile estimate and **available** memory; the
+>    `[Rust] Rayon Pool: <n> threads (System RAM: <t> GB` line gains
+>    `, <a> GB available, ~<m> MB per tile)` (diagnostic, not frozen). The
+>    sampling arithmetic is unchanged: verified byte-identical to the
+>    previous converter on geographic + projected + priority-overlap +
+>    nodata fixtures and on a 1600-file LV95 batch; a read outside a planned
+>    window refuses the tile (`internal error converting …`) rather than
+>    guess. Every listed source's **header** is still read for every tile
+>    that lists it, so a missing, non-georeferenced, CRS-less, rotated or
+>    undecodable-codec source still fails that tile; only damage inside
+>    pixel data the tile never reads no longer does.
+>    (b) *GDAL scale/offset (changes bytes).* The `GDAL_METADATA` tag
+>    (42112) band-1 `SCALE`/`OFFSET` items are applied — metres =
+>    `raw × scale + offset` — before the half-metre conversion; nodata is
+>    matched on the **raw** value, as GDAL does. An Int16 decimetre DEM
+>    (5000, scale 0.1) came out as 5000 m, now 500 m. Identity (1, 0) or
+>    absent: unchanged bytes. An unparseable value is a hard error naming
+>    the file (`GDAL_METADATA SCALE "…" is not a finite number`).
+>    Consumers that cache file-built tiles of scaled sources must
+>    invalidate them.
+>    (c) *Codecs.* ZSTD (50000) now decodes in native builds and WebP
+>    (50001) in all builds; LERC (34887), JPEG-XL (50002), LZMA (34925),
+>    JPEG 2000, old-style JPEG, CCITT RLE/Fax3 — and ZSTD in the WASM build
+>    — are refused **from the header, before any pixel**, naming file and
+>    codec: `source "<path>": unsupported compression <NAME> (<code>) — this
+>    build cannot decode it. …` (previously the decode aborted the tile with
+>    the bare `compression method Unknown(34887) is unsupported`). Match
+>    `unsupported compression` to route that one file through GDAL.
+>    (d) *Rotated / sheared grids refused.* A `ModelTransformation` with
+>    non-zero term [1] or [4] is a hard error naming the file:
+>    `source "<path>": rotated/sheared geotransform is not supported — warp
+>    it to a north-up grid first …` (it was sampled as north-up, silently
+>    misplaced).
+>    (e) *Error causes.* The batch line `[Error] Failed to process tile:
+>    <message>` prints the whole cause chain, `: `-joined (outermost
+>    first), e.g. `loading source "<p>": Opening "<p>": No such file or
+>    directory (os error 2)` — it printed only the outermost context. The
+>    prefix is unchanged.
+> 24. **`download`: a failed tile filled from a coarser zoom is DEGRADED,
+>    not OK (§1.2, §9b; changes the `[Stats] Tiles:` OK count; 2026-10-13).**
+>    Item 16 counted every tile the parent backfill repaired as OK. That
+>    still holds for a tile that answered **HTTP 404** (no tile at this zoom
+>    — the coarser one is the data that exists). A tile whose fetch failed
+>    for **any other reason** (timeout, connect, 429, 5xx, other 4xx,
+>    decode, other) and was then filled from an ancestor is now
+>    **degraded**: it is tallied in its error class (`[Stats] ERRORS`), it
+>    is **not** counted in `<ok>` of `[Stats] Tiles: <ok>/<total> OK`, and
+>    each one is named on stderr (frozen, parsed by the Waveshed plugin):
+>    `[Degraded] z=<z> x=<x> y=<y> reason=<timeout|connect|http_<code>|decode|other> filled_from=z<k>`
+>    (`k` = the coarsest zoom that supplied a pixel), the first 20000 of
+>    them, then one `[Degraded] … <n> more not listed`; and, only when
+>    n > 0, `[Stats] DEGRADED: <n> of <total> source tile(s) filled from
+>    coarser zooms after a failed fetch`. **Consumer-visible:** a run with
+>    degraded tiles no longer reports 100 % success — it used to print
+>    `760/760 OK (100.0% success)` over 2 m near-field terrain that was
+>    partly z14-or-coarser, and the plugin cached it as complete. Degraded
+>    tiles are **excluded from the >50 % fatal guard** (their pixels exist,
+>    coarse; a coarse patch beats a hole for this run), so exit codes and
+>    `.abt` bytes are unchanged; the `Tile download failed:` message gains a
+>    parenthetical naming them when they occurred. `[Stats] Repaired from
+>    coarser parent tiles: N` still counts every repair, degraded included.
+>    Same change: (a) the parent backfill requests all candidate ancestor
+>    zooms **concurrently under one 30 s deadline** (pixels still taken
+>    finest zoom first), so a tile's worst case is its retries plus one
+>    deadline — 233 s, was 443 s at z14 (levels fetched one by one at 30 s
+>    each); an ancestor that decoded but supplied no terrain no longer
+>    counts as a repair (the tile was void either way; bytes unchanged).
+>    (b) `[Stats] Retries:` states each path's real maximum: `(up to 5 per
+>    failed tile)` for the CLI `download` (it printed `3`), `(up to 3 …)` for
+>    the native in-memory downloader; the browser path, which counts
+>    nothing, prints `[Stats] Retries: not counted (the browser retries up
+>    to 3 per failed tile)`. (c) The disk-space guard now works on Windows:
+>    the lookup canonicalized the path, whose `\\?\C:\…` verbatim prefix
+>    never matched the disk's `C:\` mount point, so the guard silently never
+>    fired there. It now matches the absolute path as written (nearest
+>    existing ancestor, longest mount point) and, on Unix, also requires the
+>    same device, else reports "unknown" and skips the check rather than
+>    quoting another volume's free space. The in-memory/WASM downloaders
+>    never repair a failed tile from parents, so they have no degraded tiles.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -335,7 +443,10 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   (it used to exit 0 having done nothing). A listed terrain source that cannot
   be loaded fails the tile (and thus the run) instead of warning and writing a
   terrain-less tile. CRS/georeferencing problems are hard errors naming the
-  file and the fix (§9a).
+  file and the fix (§9a). In a batch each failed tile prints
+  `[Error] Failed to process tile: <message>` on stdout with the **full
+  cause chain**, `: `-joined outermost first (changelog 23), and the run
+  ends with `<n> of <total> tiles failed to convert`.
 * **An ingest that covered nothing: batch warns and exits 0; a single job
   still exits non-zero (changelog item 18, 2026-08-31).** A **batch** whose
   tiles took not one pixel from any source keeps its tiles — void, or
@@ -389,6 +500,34 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   ```
 
   i.e. `[Stats] Tiles: <ok>/<total> OK (<pct>% success)`.
+
+  `<ok>` counts tiles that arrived, plus tiles that answered HTTP 404 and were
+  repaired from a coarser zoom. It does **not** count a **degraded** tile — one
+  whose fetch failed for any other reason and was then filled from a coarser
+  zoom (changelog item 24); those are tallied in `[Stats] ERRORS` by class,
+  named one per line, and summarised (stderr, frozen, parsed by the Waveshed
+  plugin):
+
+  ```
+  [Degraded] z=<z> x=<x> y=<y> reason=<timeout|connect|http_<code>|decode|other> filled_from=z<k>
+  [Degraded] … <n> more not listed
+  [Stats] DEGRADED: <n> of <total> source tile(s) filled from coarser zooms after a failed fetch
+  ```
+
+  One `[Degraded]` line per degraded source tile, printed as it completes
+  (interleaved with `[Download]` progress), at most 20000; beyond that one
+  `… <n> more not listed` line in the summary. `k` is the coarsest zoom that
+  supplied at least one of the tile's pixels. The `[Stats] DEGRADED:` line
+  appears only when `n > 0`, after `[Stats] Repaired from coarser parent
+  tiles:` (which counts every repair, degraded or not). A consumer that caches
+  output as complete must not do so for a run that printed it — or must cache
+  it as degraded. Degraded tiles do not count toward the fatal majority below.
+
+  `[Stats] Retries: <n> (up to <m> per failed tile)` — `m` is 5 for the CLI
+  `download`, 3 for the native in-memory downloader. Each tile's parent
+  backfill is bounded by one 30 s deadline (all ancestor zooms requested
+  concurrently), so a tile's worst case is `6 × 30 s` attempts `+ 23 s`
+  backoff `+ 30 s` = 233 s.
 * **Disk-space failure — `[MPT-critical]` / QGIS-critical.** When the estimated
   `.abt` output exceeds free space, `download` **fails** (`anyhow::bail!`, non-zero
   exit). The exact and only emitted string (`crates/aether_converter/src/download.rs`,
@@ -503,8 +642,10 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   > never sea level.** A tile that never arrives is first offered to the
   > same parent backfill that repairs in-tile voids (changelog item 16): the
   > first coarser ancestor that decodes supplies all of its pixels,
-  > upsampled, and the tile then counts as OK (`[Stats] Repaired from
-  > coarser parent tiles: N`). Only a tile with **no usable ancestor at any
+  > upsampled. A tile that answered 404 then counts as OK; one that failed
+  > for any other reason is **degraded** (changelog item 24 — named on a
+  > `[Degraded]` line, not OK, not fatal); both are counted by `[Stats]
+  > Repaired from coarser parent tiles: N`. Only a tile with **no usable ancestor at any
   > zoom** stays a hole — and a hole is now the **`-9999` void sentinel** of
   > §6, the same value `ingest` writes for a pixel no source covered, never
   > **0 m** as before (a valid sea-level elevation, indistinguishable
@@ -1355,7 +1496,13 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
   (version 2) tile — only R16SINT (version 1) is ingestable.
   A GeoTIFF `path` **must** carry a geotransform (a
   `ModelTransformation` tag, or `ModelTiepoint` + `ModelPixelScale`); a file
-  without one is a **hard error** naming the file. Georeferencing is **never**
+  without one is a **hard error** naming the file. The X and Y pixel steps are
+  taken separately, so non-square pixels are sampled at their true size. A
+  **rotated or sheared** grid (`ModelTransformation` term [1] or [4]
+  non-zero) is a **hard error** naming the file (*"rotated/sheared
+  geotransform is not supported — warp it to a north-up grid first"*,
+  changelog 23); it used to be sampled as north-up and misplaced without an
+  error. Georeferencing is **never**
   derived from file names (the old filename fallback is gone).
   `GTRasterTypeGeoKey` (1025) is honoured: when it is `2`
   (**RasterPixelIsPoint** — how Copernicus GLO and SRTM ship), the origin
@@ -1366,8 +1513,24 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
   sample per pixel, any sample type): an RGB(A)/palette/GrayA file is a
   picture — a rendered basemap, hillshade or photo — and is a **hard error**
   naming the file (*"… not an elevation raster"*), raised before any sample
-  is decoded. A decode that yields anything but exactly `w·h` samples is
-  refused the same way.
+  is decoded. A decode that yields anything but exactly `w·h` samples (per
+  strip/tile: its own data size) is refused the same way.
+  The TIFF **compression** must be one this build decodes — none, LZW,
+  Deflate, PackBits, JPEG, WebP, and ZSTD in native builds; anything else
+  (LERC, JPEG-XL, LZMA, JPEG 2000, … and ZSTD in the WASM build) is a **hard
+  error raised from the header**, naming file and codec (changelog 23):
+
+  ```
+  source "<path>": unsupported compression <NAME> (<code>) — this build cannot decode it. Re-encode the file (e.g. `gdal_translate -co COMPRESS=DEFLATE`) or convert it through GDAL first.
+  ```
+
+  A band-1 **GDAL scale/offset** (`GDAL_METADATA` tag 42112, `<Item
+  name="SCALE"|"OFFSET" sample="0" role="scale"|"offset">`) is applied —
+  metres = `raw × scale + offset` — before the half-metre conversion; an
+  unparseable value is a hard error naming the file.
+  Sources are **streamed**: each output row band decodes only the strips/
+  tiles its footprints reach, so a source's size does not bound the run's
+  memory (changelog 23).
 * `crs` — `"EPSG:nnnn"` or a raw proj string starting with `+`. Optional:
   when absent, the file's GeoKeyDirectory is read — `ProjectedCSTypeGeoKey`
   (3072) first, else `GeographicTypeGeoKey` (2048). An absent key, or the
@@ -1382,14 +1545,16 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
 * `nodata` — no-data value in source units. Optional: when absent, the
   file's `GDAL_NODATA` ascii tag applies if present. Matching samples become
   the `-9999` void sentinel **at load time**; the Float32-NaN and
-  Int32-widening rules of §6 apply unchanged on top.
+  Int32-widening rules of §6 apply unchanged on top. Nodata is compared
+  with the **raw** sample, before any GDAL scale/offset.
 * Supplying `sources` **and** either legacy field in one job is a **hard
   error** (the priority order would be ambiguous). A job with none of the
   three writes an all-void (or all-`void_fill_m`) tile as before at the
   library level, but the CLI refuses a whole run that covered nothing (§1.2,
   "An ingest that covered nothing exits non-zero").
-* A listed source that cannot be opened or decoded **fails the tile** —
-  never a warning.
+* A listed source that cannot be opened, or whose header is unusable,
+  **fails every tile that lists it** — never a warning; a pixel decode
+  error fails the tile that needed those pixels.
 
 > **Mixed zooms are refused on both paths.** `ingest` previously accepted a
 > mixed-zoom `buildings_pbf_dir` and drew every zoom's copy of the same
@@ -1466,6 +1631,24 @@ unusable geometry stops the run. Both remove the `.abt` files the run created.
 
 Anything else a tile source does wrong — a 404, a timeout, a WebP body — stays a
 per-tile failure, tallied in `[Stats] ERRORS` and judged by the majority rule.
+
+What becomes of each source tile, and how the `[Stats]` block counts it
+(§1.2; changelog items 16, 17, 24):
+
+| Fetch outcome (after retries) | Coarser ancestor supplied pixels? | Output pixels | `<ok>` of `[Stats] Tiles:` | Error tally | Fatal majority | Extra line |
+|---|---|---|---|---|---|---|
+| arrived | — (in-tile voids may be filled) | the tile | counted | — | — | — |
+| HTTP 404 | yes | upsampled ancestor | counted | — | — | `[Stats] Repaired …` |
+| HTTP 404 | no | `-9999` void | not counted | `HTTP_404_no_data` | never | `[Stats] NO-DATA (HTTP 404): …` |
+| any other failure | yes | upsampled ancestor | **not counted** | its class | **no** | `[Degraded] …`, `[Stats] DEGRADED: …`, `[Stats] Repaired …` |
+| any other failure | no | `-9999` void | not counted | its class | yes | — |
+
+"Any other failure" is timeout, connect, HTTP 429, other 4xx (403, 410, …),
+5xx, decode, other. The `reason=` token of `[Degraded]` uses the same
+classifier as the tally: `timeout`, `connect`, `http_<code>` (any status),
+`decode`, `other`. This table describes the file-based CLI `download`; the
+in-memory/WASM downloaders never fill a failed tile from parents, so for them
+every failure is the last row.
 
 ---
 

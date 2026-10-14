@@ -17,7 +17,12 @@ byteorder = "1.5"
 # unsupported"), which is how swissALTIRegio and plenty of other Float32
 # DEMs are compressed. 0.11 allows (Horizontal, IEEEFP) and un-differences
 # at any bit depth. Same API surface for everything this crate calls.
-tiff = "0.11"
+# `webp` is pure Rust and builds everywhere. `zstd` (TIFF compression 50000,
+# GDAL's COMPRESS=ZSTD) links the C libzstd through zstd-sys, which needs a C
+# toolchain for the target — so it is enabled for native builds only (below);
+# the wasm build keeps refusing ZSTD with the named "unsupported compression"
+# error. LERC (34887) and JPEG-XL (50002) have no decoder in `tiff` at all.
+tiff = { version = "0.11", features = ["webp"] }
 image_dds = { version = "0.3", optional = true }
 bytemuck = "1.14"
 # Parallel Processing
@@ -45,6 +50,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 proj4rs = "0.1.10"
 crs-definitions = "0.5.0"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tiff = { version = "0.11", features = ["webp", "zstd"] }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
 wasm-bindgen = "0.2"
@@ -52,6 +60,14 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Tests only: zstd writes the ZSTD-compressed fixture the decoder must read
+# (already in the tree through tiff's `zstd` feature); libc reads a child
+# process's peak RSS for the streaming-memory test.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+zstd = "0.13"
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 [features]
 default = ["native"]

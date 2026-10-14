@@ -12,7 +12,7 @@ mod plan;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::fs;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "native")]
@@ -65,12 +65,6 @@ enum Commands {
     },
 }
 
-/// Files at or above this size are pre-loaded sequentially when shared by
-/// more than one job, so a thread-per-tile batch cannot load the same huge
-/// raster many times at once (the classic OOM). Decision: "100 MB" is read as
-/// the decimal 100,000,000 bytes — the threshold is a heuristic, not a format.
-const PRELOAD_MIN_BYTES: u64 = 100_000_000;
-
 fn main() -> anyhow::Result<()> {
     // Force line-buffered stdout so progress reaches the parent process
     // immediately when piped (default is fully-buffered when not a TTY).
@@ -98,7 +92,8 @@ fn main() -> anyhow::Result<()> {
             let content = fs::read_to_string(&job_file)
                 .map_err(|e| anyhow::anyhow!("reading job file {:?}: {e}", job_file))?;
 
-            // Wrap cache in Arc<Mutex> for safe multi-threading
+            // Caller-supplied whole images (none here): every source streams
+            // through the byte-budgeted chunk cache instead.
             let texture_cache: ingest::ImageCache = Arc::new(Mutex::new(HashMap::new()));
 
             if let Ok(job) = serde_json::from_str::<ingest::IngestJob>(&content) {
@@ -121,65 +116,59 @@ fn main() -> anyhow::Result<()> {
                 }
             } else if let Ok(jobs) = serde_json::from_str::<Vec<ingest::IngestJob>>(&content) {
 
-                // --- OOM FIX 1: CALCULATE SAFE THREAD COUNT ---
-                let available_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-                let mut sys = System::new_all();
-                sys.refresh_memory();
-                let total_ram_gb = sys.total_memory() / 1024 / 1024 / 1024;
+                // Validate every job up front, so a bad job (ambiguous
+                // sources, etc.) fails before any tile work starts.
+                for job in &jobs {
+                    job.effective_sources()?;
+                }
 
-                // Budget ~1.5 GB of RAM per thread safely (BC6H RGBA Buffer + Tiff decoding overhead)
-                let safe_threads = ((total_ram_gb as f64 / 1.5).floor() as usize).clamp(1, available_cores);
+                // --- THREAD COUNT FROM A PER-JOB MEMORY ESTIMATE ---
+                // Each tile streams its sources in row bands bounded by the
+                // band budget, and all tiles share ONE byte-budgeted chunk
+                // cache, so a tile's peak no longer grows with the size or
+                // number of its sources. Size the pool from that estimate and
+                // the memory actually AVAILABLE (not installed): the old
+                // `total RAM / 1.5 GB` rule ignored both what else was running
+                // and what a tile really holds (580 whole 0.5 m files per
+                // tile is 4.6 GB, far past 1.5 GB).
+                let opts = ingest::IngestOptions {
+                    band_budget_bytes: ingest::DEFAULT_BAND_BUDGET_BYTES,
+                    chunk_cache: Some(Arc::new(ingest::ChunkCache::new(ingest::DEFAULT_CHUNK_CACHE_BYTES))),
+                };
+                let available_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let mut sys = System::new();
+                sys.refresh_memory();
+                let total_ram = sys.total_memory();
+                // Some platforms report no "available" figure; half the total
+                // is a conservative stand-in.
+                let available_ram = match sys.available_memory() {
+                    0 => total_ram / 2,
+                    a => a,
+                };
+                let per_job = jobs
+                    .iter()
+                    .map(|j| ingest::estimate_job_bytes(j, &opts))
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let usable = (available_ram as f64 * 0.8) as u64;
+                let usable = usable.saturating_sub(ingest::DEFAULT_CHUNK_CACHE_BYTES as u64);
+                let safe_threads = ((usable / per_job) as usize).clamp(1, available_cores);
 
                 println!("[Rust] Batch processing {} tiles...", jobs.len());
-                println!("[Rust] Rayon Pool: {} threads (System RAM: {} GB)", safe_threads, total_ram_gb);
+                println!(
+                    "[Rust] Rayon Pool: {} threads (System RAM: {} GB, {} GB available, ~{} MB per tile)",
+                    safe_threads,
+                    total_ram / 1024 / 1024 / 1024,
+                    available_ram / 1024 / 1024 / 1024,
+                    per_job / 1024 / 1024
+                );
                 {
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }
 
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(safe_threads).build().unwrap();
-
-                // --- OOM FIX 2: PRE-LOAD LARGE SHARED SOURCES SEQUENTIALLY ---
-                // If 16 threads try to load a 600MB source simultaneously, RAM
-                // explodes immediately. Normalizing every job up front also
-                // surfaces bad-job errors (ambiguous sources, etc.) before any
-                // tile work starts. Rule: pre-load every unique source that
-                // appears in MORE THAN ONE job and is larger than
-                // PRELOAD_MIN_BYTES on disk; small per-tile files keep the
-                // lazy per-tile cache loading.
-                let mut jobs_per_source: HashMap<ingest::CacheKey, usize> = HashMap::new();
-                for job in &jobs {
-                    let mut seen_in_job: HashSet<ingest::CacheKey> = HashSet::new();
-                    for spec in job.effective_sources()? {
-                        let key = ingest::cache_key(&spec);
-                        if seen_in_job.insert(key.clone()) {
-                            *jobs_per_source.entry(key).or_default() += 1;
-                        }
-                    }
-                }
-                let preload: HashSet<ingest::CacheKey> = jobs_per_source
-                    .into_iter()
-                    .filter(|(key, n_jobs)| {
-                        *n_jobs > 1
-                            && fs::metadata(&key.0)
-                                .map(|m| m.len() > PRELOAD_MIN_BYTES)
-                                .unwrap_or(false) // missing file: the per-tile load errors loudly
-                    })
-                    .map(|(key, _)| key)
-                    .collect();
-
-                if !preload.is_empty() {
-                    println!("[Rust] Pre-loading {} large shared source(s) to prevent memory races...", preload.len());
-                    let mut cache = texture_cache.lock().unwrap();
-                    for key in &preload {
-                        // load_source_to_ram sniffs the AETH magic itself, so
-                        // large shared .abt sources preload exactly like TIFFs.
-                        let img = ingest::load_source_to_ram(&key.0, key.1.map(f64::from_bits))
-                            .map_err(|e| anyhow::anyhow!("pre-loading shared source {:?}: {e}", key.0))?;
-                        cache.insert(key.clone(), img);
-                    }
-                }
-                let preload = Arc::new(preload);
 
                 // --- PBF DECODE HOIST ---
                 // A `buildings_pbf_dir` decodes to the same building set for
@@ -211,12 +200,16 @@ fn main() -> anyhow::Result<()> {
                             Some(dir) => pbf_sets.get(dir),
                             None => None,
                         };
-                        match ingest::process_tile(job, texture_cache.clone(), pbf) {
+                        match ingest::process_tile_opts(job, texture_cache.clone(), pbf, &opts) {
                             Ok(stats) => {
                                 covered.fetch_add(stats.covered_px, Ordering::Relaxed);
                             }
                             Err(e) => {
-                                println!("[Error] Failed to process tile: {}", e);
+                                // `{:#}` prints the whole cause chain ("loading
+                                // source …: Opening …: No such file …"); `{}`
+                                // printed only the outermost context, which
+                                // named the file but never said what was wrong.
+                                println!("[Error] Failed to process tile: {:#}", e);
                                 failures.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -226,22 +219,6 @@ fn main() -> anyhow::Result<()> {
                             println!("[Rust] Progress: {}/{}", curr, total);
                             use std::io::Write;
                             let _ = std::io::stdout().flush();
-                        }
-
-                        // --- CACHE THRASHING FIX ---
-                        // Periodically let one thread clean the cache if it gets too large
-                        if curr % 5 == 0 {
-                            if let Ok(mut cache) = texture_cache.try_lock() {
-                                if cache.len() > 30 {
-                                    // Retain the pre-loaded shared sources and
-                                    // legacy Chunk_ base DEMs, drop micro tiles
-                                    let keep = preload.clone();
-                                    cache.retain(|k, _| {
-                                        keep.contains(k)
-                                            || k.0.file_name().unwrap_or_default().to_string_lossy().starts_with("Chunk_")
-                                    });
-                                }
-                            }
                         }
                     });
                 });

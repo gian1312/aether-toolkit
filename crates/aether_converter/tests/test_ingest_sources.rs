@@ -36,6 +36,13 @@ struct TiffSpec<'a> {
 }
 
 fn write_geotiff(path: &Path, spec: &TiffSpec) {
+    write_geotiff_xy(path, spec, None);
+}
+
+/// [`write_geotiff`] with a Y pixel step of its own (`ModelPixelScale` =
+/// `[scale, scale_y, 0]`). The plain writer only ever wrote square pixels,
+/// which is how a converter that read one scale for both axes went unnoticed.
+fn write_geotiff_xy(path: &Path, spec: &TiffSpec, scale_y: Option<f64>) {
     const T_SHORT: u16 = 3;
     const T_LONG: u16 = 4;
     const T_ASCII: u16 = 2;
@@ -136,7 +143,7 @@ fn write_geotiff(path: &Path, spec: &TiffSpec) {
     buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD: none
 
     if let Some((origin_e, origin_n, scale)) = spec.geotransform {
-        for v in [scale, scale, 0.0] {
+        for v in [scale, scale_y.unwrap_or(scale), 0.0] {
             buf.extend_from_slice(&v.to_le_bytes());
         }
         for v in [0.0, 0.0, 0.0, origin_e, origin_n, 0.0] {
@@ -340,6 +347,98 @@ fn epsg_2056_sampling_lands_within_one_source_pixel_of_the_old_polynomial() {
             assert!(
                 (got_col - expected_col).abs() <= 1.0,
                 "pixel ({x},{y}): sampled column {got_col:.2}, polynomial column {expected_col:.2}"
+            );
+        }
+    }
+}
+
+// ── Non-square source pixels ──────────────────────────────────────────────
+//
+// One scale for both axes stretched a 0.0004° × 0.0002° file 2× north–south
+// (owner report 2026-10-13; Copernicus GLO-30 north of 50°N is non-square).
+// Each source stores its ROW index ×10, so a sampled value names the source
+// row it came from.
+
+fn row_ramp(w: u32, h: u32) -> Vec<i16> {
+    (0..w * h).map(|i| ((i / w) * 10) as i16).collect()
+}
+
+#[test]
+fn a_non_square_geographic_source_keeps_its_own_row_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("nonsquare.tif");
+    let (sx, sy, w, h) = (0.0004, 0.0002, 100u32, 40u32); // 40 rows = 0.008° tall
+    let (lon0, lat0) = (7.40, 47.00);
+    write_geotiff_xy(
+        &src,
+        &TiffSpec {
+            w, h,
+            geotransform: Some((lon0, lat0, sx)),
+            geokeys: &[(2048, 4326)],
+            nodata: None,
+            samples: Samples::I16(row_ramp(w, h)),
+        },
+        Some(sy),
+    );
+
+    let mut job = tile_json(dir.path(), "tile.abt", 48);
+    job["ul_lat"] = serde_json::json!(lat0);
+    job["sources"] = serde_json::json!([{"path": src, "crs": "EPSG:4326"}]);
+    let px = payload(&run_job(job).unwrap(), 48);
+
+    let pixel_deg = 30.0 / 111111.0;
+    let limit_n = lat0 - h as f64 * sy;
+    for (y, row) in px.iter().enumerate() {
+        let lat_c = lat0 - (y as f64 + 0.5) * pixel_deg;
+        let v = row[10];
+        if lat_c > limit_n + pixel_deg {
+            let expected_row = (lat0 - lat_c) / sy;
+            let got_row = f64::from(v) / 20.0; // stored value = 2 × (row × 10)
+            assert!(
+                (got_row - expected_row).abs() <= 1.0,
+                "output row {y}: sampled source row {got_row:.2}, expected {expected_row:.2}"
+            );
+        } else if lat_c < limit_n - pixel_deg {
+            // The file ends at lat0 - h*sy; with one shared scale it "covered"
+            // twice that far south.
+            assert_eq!(v, VOID_ELEV, "output row {y} lies south of the file but is filled");
+        }
+    }
+}
+
+#[test]
+fn a_non_square_projected_source_keeps_its_own_row_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("nonsquare_lv95.tif");
+    // 10 m east × 20 m north, EPSG:2056, amply covering the test tile.
+    let (e0, n0, sx, sy, w, h) = (2_598_500.0, 1_206_000.0, 10.0, 20.0, 300u32, 150u32);
+    write_geotiff_xy(
+        &src,
+        &TiffSpec {
+            w, h,
+            geotransform: Some((e0, n0, sx)),
+            geokeys: &[(3072, 2056)],
+            nodata: None,
+            samples: Samples::I16(row_ramp(w, h)),
+        },
+        Some(sy),
+    );
+
+    let mut job = tile_json(dir.path(), "tile.abt", 32);
+    job["sources"] = serde_json::json!([{"path": src}]);
+    let px = payload(&run_job(job).unwrap(), 32);
+
+    let pixel_deg = 30.0 / 111111.0;
+    for (y, row) in px.iter().enumerate() {
+        let lat = 46.999 - (y as f64 + 0.5) * pixel_deg;
+        for (x, &v) in row.iter().enumerate() {
+            let lon = 7.425 + (x as f64 + 0.5) * pixel_deg;
+            let (_e, n) = wgs84_to_epsg2056_polynomial(lat, lon);
+            let expected_row = (n0 - n) / sy;
+            let got_row = f64::from(v) / 20.0;
+            assert!(
+                (got_row - expected_row).abs() <= 1.0,
+                "pixel ({x},{y}): sampled source row {got_row:.2}, expected {expected_row:.2}"
             );
         }
     }

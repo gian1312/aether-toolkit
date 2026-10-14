@@ -399,53 +399,171 @@ async fn fetch_decode_raw(
     decode_png(&body, dec).ok()
 }
 
+/// Wall-clock budget for one tile's whole parent backfill (all ancestor levels).
+///
+/// The ancestors are fetched **concurrently** and whatever has arrived when
+/// this expires is used; a level still in flight is dropped. A tile's worst
+/// case is therefore its own retries plus this, once — not, as when the levels
+/// were fetched one after another with the client's 30 s timeout each and no
+/// deadline, retries plus `(zoom - NODATA_FILL_MIN_ZOOM) × 30 s` (8 × 30 s =
+/// 240 s at z14, which is how one stalled tile held a strip for ~5 minutes).
+///
+/// Native `download_strip`, client timeout 30 s, 6 attempts, backoff 1+2+4+8+8 s:
+/// worst case per tile = 6 × 30 + 23 + 30 = **233 s** (was 203 + 240 = 443 s at z14).
+const PARENT_FILL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What [`fill_from_parents`] produced.
+struct ParentFill {
+    grid: Vec<f32>,
+    edge: usize,
+    /// The coarsest zoom that supplied at least one pixel; `None` if no
+    /// ancestor supplied any (only possible when the tile itself arrived).
+    coarsest_zoom: Option<u32>,
+}
+
 /// Fill the NODATA pixels of a zoom-`z` tile from progressively coarser parents.
 ///
 /// `have` is the decoded tile, or `None` when the tile itself never arrived. A
 /// tile that 404'd is a tile that is 100 % void, and the ancestor covering it is
 /// exactly as good a source for all of its pixels as it is for a few of them.
-/// With `None` the first ancestor that decodes fixes the tile edge, so the grid
+/// With `None` the finest ancestor that decodes fixes the tile edge, so the grid
 /// synthesised here has the stride the rest of the run assembles at. `None` comes
-/// back only when nothing was available at any zoom — a genuine hole, which the
-/// caller must keep writing as void rather than as 0 m.
+/// back only when no ancestor at any zoom supplied a single pixel — a genuine
+/// hole, which the caller must keep writing as void rather than as 0 m.
+///
+/// Every candidate level (z-1 down to [`NODATA_FILL_MIN_ZOOM`]) is requested at
+/// once and the whole repair is bounded by `deadline` (normally
+/// [`PARENT_FILL_DEADLINE`]); pixels are still taken finest level first.
 async fn fill_from_parents(
     client: &reqwest::Client, url_template: &str, z: u32, x: u32, y: u32,
     dec: fn(u8, u8, u8) -> f32, have: Option<(Vec<f32>, usize)>,
-) -> Option<(Vec<f32>, usize)> {
+    deadline: std::time::Duration,
+) -> Option<ParentFill> {
+    use futures::stream::FuturesUnordered;
+
     let (mut grid, mut ts) = have.map_or_else(|| (Vec::new(), 0), |(g, t)| (g, t));
     let mut missing: Vec<usize> =
         (0..grid.len()).filter(|&i| grid[i] <= NODATA_M).collect();
-    let mut level = 1u32;
-    while (ts == 0 || !missing.is_empty()) && z >= level + NODATA_FILL_MIN_ZOOM {
-        let (az, ax, ay) = (z - level, x >> level, y >> level);
-        let url = url_template
-            .replace("{z}", &az.to_string())
-            .replace("{x}", &ax.to_string())
-            .replace("{y}", &ay.to_string());
-        if let Some((anc, aedge)) = fetch_decode_raw(client, &url, dec).await {
-            if ts == 0 {
-                ts = aedge;
-                grid = vec![NO_TILE_M; ts * ts];
-                missing = (0..grid.len()).collect();
+    let had_tile = ts != 0;
+    if had_tile && missing.is_empty() {
+        return Some(ParentFill { grid, edge: ts, coarsest_zoom: None });
+    }
+
+    let levels = z.saturating_sub(NODATA_FILL_MIN_ZOOM) as usize;
+    let mut fetched: Vec<Option<(Vec<f32>, usize)>> = vec![None; levels];
+    {
+        let mut pending: FuturesUnordered<_> = (1..=levels as u32)
+            .map(|level| {
+                let url = url_template
+                    .replace("{z}", &(z - level).to_string())
+                    .replace("{x}", &(x >> level).to_string())
+                    .replace("{y}", &(y >> level).to_string());
+                async move { (level, fetch_decode_raw(client, &url, dec).await) }
+            })
+            .collect();
+        let slots = &mut fetched;
+        // Expiry drops the still-pending requests; what arrived is kept.
+        let _ = tokio::time::timeout(deadline, async {
+            while let Some((level, got)) = pending.next().await {
+                slots[level as usize - 1] = got;
             }
-            // The parent has to be the same tile size as the child — one
-            // service, one grid. A parent of a different size is not a parent
-            // this pixel mapping can address, so skip it rather than fold it.
-            if aedge == ts && anc.len() == ts * ts {
-                let t = ts as u64;
-                let (base_x, base_y) = (ax as u64 * t, ay as u64 * t);
-                missing.retain(|&i| {
-                    let (px, py) = ((i % ts) as u64, (i / ts) as u64);
-                    let apx = (((x as u64) * t + px) >> level) - base_x;
-                    let apy = (((y as u64) * t + py) >> level) - base_y;
-                    let v = anc[(apy * t + apx) as usize];
-                    if v > NODATA_M { grid[i] = v; false } else { true }
-                });
+        })
+        .await;
+    }
+
+    let mut coarsest_zoom = None;
+    for (i, anc) in fetched.into_iter().enumerate() {
+        if had_tile && missing.is_empty() { break; }
+        let Some((anc, aedge)) = anc else { continue };
+        let level = i as u32 + 1;
+        if ts == 0 {
+            ts = aedge;
+            grid = vec![NO_TILE_M; ts * ts];
+            missing = (0..grid.len()).collect();
+        }
+        // The parent has to be the same tile size as the child — one
+        // service, one grid. A parent of a different size is not a parent
+        // this pixel mapping can address, so skip it rather than fold it.
+        if aedge == ts && anc.len() == ts * ts {
+            let t = ts as u64;
+            let (ax, ay) = (x >> level, y >> level);
+            let (base_x, base_y) = (ax as u64 * t, ay as u64 * t);
+            let before = missing.len();
+            missing.retain(|&i| {
+                let (px, py) = ((i % ts) as u64, (i / ts) as u64);
+                let apx = (((x as u64) * t + px) >> level) - base_x;
+                let apy = (((y as u64) * t + py) >> level) - base_y;
+                let v = anc[(apy * t + apx) as usize];
+                if v > NODATA_M { grid[i] = v; false } else { true }
+            });
+            if missing.len() < before {
+                coarsest_zoom = Some(z - level);
             }
         }
-        level += 1;
     }
-    if ts == 0 { None } else { Some((grid, ts)) }
+    // Without the tile itself, an ancestor that decoded to all-void supplied
+    // no terrain either: that is a hole, not a repair.
+    (had_tile || coarsest_zoom.is_some())
+        .then_some(ParentFill { grid, edge: ts, coarsest_zoom })
+}
+
+/// Why a source-tile fetch failed, after all its retries.
+///
+/// One classifier feeds both the per-class error tallies and the `reason=`
+/// field of the `[Degraded]` line, so the two can never disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchFailure {
+    Timeout,
+    Connect,
+    /// A non-2xx answer, with its status code.
+    Http(u16),
+    Decode,
+    Other,
+}
+
+impl FetchFailure {
+    fn classify(msg: &str) -> Self {
+        if msg.contains("HTTP ") {
+            let code: u16 = msg.split("HTTP ")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if code == 0 { FetchFailure::Other } else { FetchFailure::Http(code) }
+        } else if msg.contains("timed out") || msg.contains("operation timed out") {
+            FetchFailure::Timeout
+        } else if msg.contains("onnect") || msg.contains("dns") || msg.contains("resolve") {
+            FetchFailure::Connect
+        } else if msg.contains("decode")
+            || msg.contains("png")
+            || msg.contains("PNG")
+            || msg.contains("nvalid")
+            || msg.contains(TILE_GEOMETRY_ERR)
+        {
+            FetchFailure::Decode
+        } else {
+            FetchFailure::Other
+        }
+    }
+
+    /// The `reason=` token of the `[Degraded]` line.
+    fn reason(self) -> String {
+        match self {
+            FetchFailure::Timeout => "timeout".into(),
+            FetchFailure::Connect => "connect".into(),
+            FetchFailure::Http(code) => format!("http_{code}"),
+            FetchFailure::Decode => "decode".into(),
+            FetchFailure::Other => "other".into(),
+        }
+    }
+}
+
+/// How many `[Degraded]` lines a run prints before summarising the rest.
+const DEGRADED_LIST_CAP: usize = 20_000;
+
+/// The per-tile `[Degraded]` line (parsed by the Waveshed plugin; frozen).
+fn degraded_line(z: u32, x: u32, y: u32, why: FetchFailure, filled_from: u32) -> String {
+    format!("[Degraded] z={z} x={x} y={y} reason={} filled_from=z{filled_from}", why.reason())
 }
 
 /// The XYZ tile edge this run assembles for, taken from the tiles themselves.
@@ -525,6 +643,10 @@ struct DownloadStats {
     tile_us_min: AtomicU64,
     slow_logged: AtomicUsize,
     backfilled: AtomicUsize,
+    /// Tiles whose fetch FAILED (anything but 404) and were then filled from a
+    /// coarser zoom. A subset of `backfilled`; tallied in the error classes,
+    /// never in `ok_count`, and excluded from [`Self::fatal_errors`].
+    degraded: AtomicUsize,
 }
 
 impl DownloadStats {
@@ -548,6 +670,7 @@ impl DownloadStats {
             tile_us_min: AtomicU64::new(u64::MAX),
             slow_logged: AtomicUsize::new(0),
             backfilled: AtomicUsize::new(0),
+            degraded: AtomicUsize::new(0),
         }
     }
 
@@ -574,8 +697,68 @@ impl DownloadStats {
     /// "there is no data there". Only the first kind can make a run fatal —
     /// judging fatality on the sum let a bounded source's legitimate
     /// off-coverage 404s abort a run whose in-coverage half was perfect.
+    ///
+    /// Degraded tiles (failed, then filled from a coarser zoom) are failures in
+    /// the tallies but not toward fatality: their pixels exist, coarse, and a
+    /// coarse patch is better for this run than the hole a refusal leaves.
     fn fatal_errors(&self) -> usize {
-        self.total_errors() - self.no_data_count()
+        self.total_errors() - self.no_data_count() - self.degraded_count()
+    }
+
+    fn degraded_count(&self) -> usize {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Tally one tile's final failure in its error class (after all retries).
+    /// Prints the one-per-class "first …" diagnostic line.
+    fn record_failure(&self, why: FetchFailure, z: u32, x: u32, y: u32, msg: &str) {
+        let first = |prev: usize, what: &str| if prev == 0 {
+            eprintln!("[Download] first {what}: z={z}/x={x}/y={y} — {msg}");
+        };
+        match why {
+            FetchFailure::Http(429) => { self.err_http_429.fetch_add(1, Ordering::Relaxed); }
+            // 404 is data ("no tile here"), not failure — never fatal, whatever the count.
+            FetchFailure::Http(404) => { self.err_http_404.fetch_add(1, Ordering::Relaxed); }
+            FetchFailure::Http(400..=499) => { self.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
+            FetchFailure::Http(500..=599) => { self.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
+            FetchFailure::Http(_) => { self.err_other.fetch_add(1, Ordering::Relaxed); }
+            FetchFailure::Timeout => {
+                if self.err_timeout.fetch_add(1, Ordering::Relaxed) == 0 {
+                    eprintln!("[Download] first timeout: z={z}/x={x}/y={y}");
+                }
+            }
+            FetchFailure::Connect => first(self.err_connect.fetch_add(1, Ordering::Relaxed), "connect error"),
+            FetchFailure::Decode => first(self.err_decode.fetch_add(1, Ordering::Relaxed), "decode error"),
+            FetchFailure::Other => first(self.err_other.fetch_add(1, Ordering::Relaxed), "unknown error"),
+        }
+    }
+
+    /// Count one degraded tile; returns its `[Degraded]` line while under
+    /// [`DEGRADED_LIST_CAP`], `None` beyond it (the summary names the rest).
+    fn note_degraded(
+        &self, z: u32, x: u32, y: u32, why: FetchFailure, filled_from: u32,
+    ) -> Option<String> {
+        let prev = self.degraded.fetch_add(1, Ordering::Relaxed);
+        (prev < DEGRADED_LIST_CAP).then(|| degraded_line(z, x, y, why, filled_from))
+    }
+
+    /// The degraded part of the `[Stats]` block: the overflow line when more
+    /// tiles degraded than were listed, then the `[Stats] DEGRADED:` line.
+    /// Empty when nothing degraded.
+    fn degraded_summary_lines(&self) -> Vec<String> {
+        let n = self.degraded_count();
+        let mut out = Vec::new();
+        if n > DEGRADED_LIST_CAP {
+            out.push(format!("[Degraded] … {} more not listed", n - DEGRADED_LIST_CAP));
+        }
+        if n > 0 {
+            out.push(format!(
+                "[Stats] DEGRADED: {} of {} source tile(s) filled from coarser zooms \
+                 after a failed fetch",
+                n, self.total_tiles()
+            ));
+        }
+        out
     }
 
     fn total_tiles(&self) -> usize {
@@ -605,7 +788,10 @@ impl DownloadStats {
         if parts.is_empty() { "none".to_string() } else { parts.join(", ") }
     }
 
-    fn log_summary(&self, elapsed: f64) {
+    /// `retries` says what the `[Stats] Retries:` line may claim for the path
+    /// that ran: [`Retries::Counted`] with that path's per-tile maximum, or
+    /// [`Retries::Browser`] when the browser retried and nothing was counted.
+    fn log_summary(&self, elapsed: f64, retries: Retries) {
         let ok = self.ok_count.load(Ordering::Relaxed);
         let total = self.total_tiles();
         let bytes = self.bytes_downloaded.load(Ordering::Relaxed);
@@ -617,12 +803,19 @@ impl DownloadStats {
             if total > 0 { ok as f64 / total as f64 * 100.0 } else { 100.0 });
         eprintln!("[Stats] Downloaded: {:.1} MB in {:.1}s = {:.1} MB/s",
             mb, elapsed, throughput);
-        let retries = self.retries.load(Ordering::Relaxed);
-        eprintln!("[Stats] Retries: {} (up to 3 per failed tile)", retries);
+        match retries {
+            Retries::Counted(max) => eprintln!("[Stats] Retries: {} (up to {} per failed tile)",
+                self.retries.load(Ordering::Relaxed), max),
+            Retries::Browser(max) => eprintln!("[Stats] Retries: not counted (the browser \
+                retries up to {} per failed tile)", max),
+        }
         let repaired = self.backfilled.load(Ordering::Relaxed);
         if repaired > 0 {
             eprintln!("[Stats] Repaired from coarser parent tiles: {} \
                        (missing at this zoom, present at a lower one)", repaired);
+        }
+        for line in self.degraded_summary_lines() {
+            eprintln!("{line}");
         }
         eprintln!("[Stats] Peak concurrent requests: {}",
             self.peak_in_flight.load(Ordering::Relaxed));
@@ -649,7 +842,7 @@ impl DownloadStats {
             if n404 > 0 {
                 eprintln!("[Stats] NO-DATA (HTTP 404): {} of {} tile(s) — the \
                            service has no data there; written as void", n404, total);
-                if ok == 0 {
+                if ok == 0 && self.degraded_count() == 0 {
                     eprintln!("[Stats] >>> every answered request was 404 — the \
                                area is entirely outside this service's coverage, \
                                or the source does not serve this zoom. The output \
@@ -676,23 +869,63 @@ impl DownloadStats {
     }
 }
 
+/// The per-tile retry budget a `[Stats] Retries:` line describes.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // each target constructs only its own variant
+enum Retries {
+    /// Retries counted in `DownloadStats::retries`, at most this many per tile.
+    Counted(u32),
+    /// The browser's fetch pool retried (at most this many per tile) and
+    /// reported nothing back, so there is no count to print.
+    Browser(u32),
+}
+
+/// `download_strip` (native CLI `download`): retries per failed tile.
+const STRIP_MAX_RETRIES: u32 = 5;
+/// `download_strip_raw` (native in-memory `run_download_mem`): retries per tile.
+const RAW_MAX_RETRIES: u32 = 3;
+/// `download_all_tiles_web` (browser fetch pool, `doFetch(i, 3)`): retries per tile.
+#[allow(dead_code)] // read on wasm32 only
+const WEB_MAX_RETRIES: u32 = 3;
+
 // -- Resource helpers ---------------------------------------------------------
 
+/// Free bytes on the volume that holds (or will hold) `path`, or `None` when
+/// that cannot be determined — never a guess.
+///
+/// `path` may not exist yet (the output directory is created later), so the
+/// lookup uses its nearest existing ancestor. The mount point is matched on the
+/// path made absolute **as written**, not on `canonicalize`: on Windows that
+/// returns `\\?\C:\...`, whose verbatim prefix never `starts_with` a disk's
+/// `C:\` mount point, so the check silently never fired there. Longest matching
+/// mount point wins.
+///
+/// On Unix the chosen mount must also be the same device as the directory:
+/// sysinfo does not list every filesystem (tmpfs, some bind mounts), and the
+/// longest listed prefix is then `/` — which reports the root disk's free space
+/// for, e.g., a 64 MB `/dev/shm`. Unknown is reported as unknown.
 #[cfg(feature = "native")]
 fn available_disk_space(path: &Path) -> Option<u64> {
-    let canonical = std::fs::canonicalize(path)
-        .or_else(|_| {
-            path.parent()
-                .map(std::fs::canonicalize)
-                .unwrap_or_else(|| Ok(path.to_path_buf()))
-        })
-        .unwrap_or_else(|_| path.to_path_buf());
+    let abs = std::path::absolute(path).ok()?;
+    let mut dir = abs.as_path();
+    while !dir.exists() {
+        dir = dir.parent()?;
+    }
     let disks = Disks::new_with_refreshed_list();
-    disks
+    let best = disks
         .iter()
-        .filter(|d| canonical.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space())
+        .filter(|d| dir.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir_dev = fs::metadata(dir).ok()?.dev();
+        let mount_dev = fs::metadata(best.mount_point()).ok()?.dev();
+        if dir_dev != mount_dev {
+            return None;
+        }
+    }
+    Some(best.available_space())
 }
 
 #[cfg(feature = "native")]
@@ -832,7 +1065,7 @@ async fn download_strip(
                 // strip has drained and a retry gets enough bandwidth to finish
                 // — clearing the deterministic stripe without lowering the
                 // connection count for the bulk download.
-                const MAX_RETRIES: u32 = 5;
+                const MAX_RETRIES: u32 = STRIP_MAX_RETRIES;
                 let mut result: Result<(Vec<f32>, usize)> =
                     Err(anyhow::anyhow!("not started"));
                 let mut retryable;
@@ -893,12 +1126,13 @@ async fn download_strip(
                 // coarser parent tiles instead of leaving a -16 km pit / stripe.
                 // A tile that never arrived at all is the same hole at a
                 // larger scale, so it gets the same repair. `result` keeps the
-                // failure, so the error stats below still see the 404: the
+                // failure, so the classification below still sees it: the
                 // backfill supplies pixels, it does not un-fail the request.
-                let mut repair: Option<(Vec<f32>, usize)> = None;
+                // Bounded by PARENT_FILL_DEADLINE (see there for the worst case).
+                let mut repair: Option<ParentFill> = None;
                 if result.is_err() {
                     repair = fill_from_parents(
-                        &client, url_template, zoom, tx, ty, dec, None,
+                        &client, url_template, zoom, tx, ty, dec, None, PARENT_FILL_DEADLINE,
                     ).await;
                     if repair.is_some() {
                         stats.backfilled.fetch_add(1, Ordering::Relaxed);
@@ -907,8 +1141,10 @@ async fn download_strip(
                     if let Ok((g, ts)) = result {
                         result = fill_from_parents(
                             &client, url_template, zoom, tx, ty, dec, Some((g, ts)),
+                            PARENT_FILL_DEADLINE,
                         )
                         .await
+                        .map(|f| (f.grid, f.edge))
                         .ok_or_else(|| anyhow::anyhow!("unreachable: edge was known"));
                     }
                 }
@@ -921,68 +1157,36 @@ async fn download_strip(
                 stats.tile_us_min.fetch_min(tile_us, Ordering::Relaxed);
 
                 // Classify final result (only after all retries exhausted).
-                // A tile the parent backfill repaired counts as OK, not as an
-                // error: `total_tiles()` is ok+errors and feeds both the
-                // fatal-failure guard and the plugin's success-rate parser, so
-                // counting a repaired tile as a failure would abort a run whose
-                // output is complete. Repairs get their own [Stats] line.
-                if repair.is_some() {
-                    stats.ok_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    match &result {
-                        Ok(_) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
-                        Err(e) => {
-                            let msg = format!("{:#}", e);
-                            if msg.contains("HTTP ") {
-                                let code: u16 = msg.split("HTTP ")
-                                    .nth(1)
-                                    .and_then(|s| s.split_whitespace().next())
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(0);
-                                match code {
-                                    429 => { stats.err_http_429.fetch_add(1, Ordering::Relaxed); }
-                                    // 404 is data ("no tile here"), not failure —
-                                    // never fatal, whatever the count.
-                                    404 => { stats.err_http_404.fetch_add(1, Ordering::Relaxed); }
-                                    400..=499 => { stats.err_http_4xx.fetch_add(1, Ordering::Relaxed); }
-                                    500..=599 => { stats.err_http_5xx.fetch_add(1, Ordering::Relaxed); }
-                                    _ => { stats.err_other.fetch_add(1, Ordering::Relaxed); }
-                                }
-                            } else if msg.contains("timed out")
-                                || msg.contains("operation timed out")
-                            {
-                                let prev = stats.err_timeout.fetch_add(1, Ordering::Relaxed);
-                                if prev == 0 {
-                                    eprintln!("[Download] first timeout: z={}/x={}/y={}",
-                                        zoom, tx, ty);
-                                }
-                            } else if msg.contains("onnect")
-                                || msg.contains("dns")
-                                || msg.contains("resolve")
-                            {
-                                let prev = stats.err_connect.fetch_add(1, Ordering::Relaxed);
-                                if prev == 0 {
-                                    eprintln!("[Download] first connect error: z={}/x={}/y={} — {}",
-                                        zoom, tx, ty, msg);
-                                }
-                            } else if msg.contains("decode")
-                                || msg.contains("png")
-                                || msg.contains("PNG")
-                                || msg.contains("nvalid")
-                                || msg.contains(TILE_GEOMETRY_ERR)
-                            {
-                                let prev = stats.err_decode.fetch_add(1, Ordering::Relaxed);
-                                if prev == 0 {
-                                    eprintln!("[Download] first decode error: z={}/x={}/y={} — {}",
-                                        zoom, tx, ty, msg);
-                                }
-                            } else {
-                                let prev = stats.err_other.fetch_add(1, Ordering::Relaxed);
-                                if prev == 0 {
-                                    eprintln!("[Download] first unknown error: z={}/x={}/y={} — {}",
-                                        zoom, tx, ty, msg);
+                //
+                // A 404 the parent backfill repaired is DATA — the service has
+                // no tile at this zoom and the coarser one is what exists — so
+                // it counts as OK, as before (CONTRACT changelog 16).
+                //
+                // Any other failure the backfill repaired is DEGRADED: the
+                // tile exists at this zoom and we failed to get it, so its
+                // pixels are a coarser stand-in. It is classified in the error
+                // tallies like an unrepaired failure and NOT counted as OK —
+                // reporting it as OK let a consumer cache 2 m near-field
+                // terrain that was silently z14-or-coarser. One `[Degraded]`
+                // line per tile names it; it stays out of the fatal majority
+                // (see `fatal_errors`), because its output is coarse, not void.
+                match (&result, &repair) {
+                    (Ok(_), _) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
+                    (Err(e), repair) => {
+                        let msg = format!("{:#}", e);
+                        let why = FetchFailure::classify(&msg);
+                        match repair {
+                            Some(_) if why == FetchFailure::Http(404) => {
+                                stats.ok_count.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(fill) => {
+                                stats.record_failure(why, zoom, tx, ty, &msg);
+                                let from = fill.coarsest_zoom.unwrap_or(zoom.saturating_sub(1));
+                                if let Some(line) = stats.note_degraded(zoom, tx, ty, why, from) {
+                                    eprintln!("{line}");
                                 }
                             }
+                            None => stats.record_failure(why, zoom, tx, ty, &msg),
                         }
                     }
                 }
@@ -1023,7 +1227,7 @@ async fn download_strip(
                     );
                 }
 
-                (tx, ty, repair.map(Ok).unwrap_or(result))
+                (tx, ty, repair.map(|f| Ok((f.grid, f.edge))).unwrap_or(result))
             }
         })
         .buffer_unordered(concurrency)
@@ -1086,7 +1290,7 @@ async fn download_strip_raw(
                 // Retry loop: up to 3 retries with exponential backoff (1s, 2s, 4s).
                 // Retries on: timeout, connection error, HTTP 429, HTTP 5xx.
                 // No retry on: HTTP 4xx (except 429).
-                const MAX_RETRIES: u32 = 3;
+                const MAX_RETRIES: u32 = RAW_MAX_RETRIES;
                 let mut result: Result<Vec<u8>> = Err(anyhow::anyhow!("not started"));
                 let mut retryable;
 
@@ -2037,8 +2241,9 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     let failed = stats.fatal_errors();
     let attempted = stats.total_tiles();
     if fetch_failure_is_fatal(failed, attempted) {
-        stats.log_summary(start.elapsed().as_secs_f64());
+        stats.log_summary(start.elapsed().as_secs_f64(), Retries::Counted(STRIP_MAX_RETRIES));
         let no_data = stats.no_data_count();
+        let degraded = stats.degraded_count();
         anyhow::bail!(
             "Tile download failed: {} of {} terrain tiles ({}%) could not be fetched; \
              the output would be mostly void, not terrain. Errors: {}.{} Check that \
@@ -2048,12 +2253,22 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
             attempted,
             failed * 100 / attempted.max(1),
             stats.error_breakdown(),
-            if no_data > 0 {
-                format!(" (A further {} tile(s) answered HTTP 404 — no data there — \
-                         which alone would not fail the run.)", no_data)
-            } else {
-                String::new()
-            },
+            format!(
+                "{}{}",
+                if no_data > 0 {
+                    format!(" (A further {} tile(s) answered HTTP 404 — no data there — \
+                             which alone would not fail the run.)", no_data)
+                } else {
+                    String::new()
+                },
+                if degraded > 0 {
+                    format!(" (A further {} tile(s) failed but were filled from coarser \
+                             zooms — degraded, not lost — which alone would not fail the \
+                             run.)", degraded)
+                } else {
+                    String::new()
+                },
+            ),
             job.zoom
         );
     }
@@ -2063,7 +2278,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    stats.log_summary(elapsed);
+    stats.log_summary(elapsed, Retries::Counted(STRIP_MAX_RETRIES));
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     cleanup.keep();
     Ok(())
@@ -2509,7 +2724,13 @@ pub async fn run_download_mem(
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    stats.log_summary(elapsed);
+    // The in-memory path never repairs a failed tile from parents (only the
+    // file-based `download_strip` does), so it has no degraded tiles to report.
+    #[cfg(not(target_arch = "wasm32"))]
+    let retries = Retries::Counted(RAW_MAX_RETRIES);
+    #[cfg(target_arch = "wasm32")]
+    let retries = Retries::Browser(WEB_MAX_RETRIES);
+    stats.log_summary(elapsed, retries);
     eprintln!("[DownloadMem] TOTAL: {:.1}s", elapsed);
     Ok(result)
 }
@@ -3155,5 +3376,191 @@ mod tests {
         // Nothing attempted is not a failure — an empty job is caught elsewhere.
         assert!(!fetch_failure_is_fatal(0, 0));
     }
-}
 
+    // ── Degraded tiles, parent-fill deadline, disk lookup (changelog 24) ──
+
+    #[test]
+    fn a_fetch_failure_is_classified_once_for_tallies_and_reason() {
+        let c = |m: &str| FetchFailure::classify(m);
+        assert_eq!(c("HTTP 503"), FetchFailure::Http(503));
+        assert_eq!(c("HTTP 404"), FetchFailure::Http(404));
+        assert_eq!(c("error sending request: operation timed out"), FetchFailure::Timeout);
+        assert_eq!(c("error trying to connect: tcp connect error"), FetchFailure::Connect);
+        assert_eq!(c("Invalid PNG signature"), FetchFailure::Decode);
+        assert_eq!(c("something else"), FetchFailure::Other);
+        assert_eq!(c("HTTP garbage"), FetchFailure::Other);
+        assert_eq!(c("HTTP 429").reason(), "http_429");
+        assert_eq!(FetchFailure::Timeout.reason(), "timeout");
+        assert_eq!(FetchFailure::Connect.reason(), "connect");
+        assert_eq!(FetchFailure::Decode.reason(), "decode");
+        assert_eq!(FetchFailure::Other.reason(), "other");
+
+        // The tally the classifier feeds is the one the [Stats] ERRORS line prints.
+        let s = DownloadStats::new();
+        for m in ["HTTP 503", "HTTP 429", "HTTP 403", "HTTP 404", "HTTP 302",
+                  "operation timed out", "tcp connect error", "Invalid PNG", "?"] {
+            s.record_failure(FetchFailure::classify(m), 14, 1, 2, m);
+        }
+        assert_eq!(s.error_breakdown(),
+            "timeout=1, connect=1, HTTP_429_rate_limited=1, HTTP_404_no_data=1, \
+             HTTP_4xx=1, HTTP_5xx=1, decode=1, other=2");
+    }
+
+    #[test]
+    fn the_degraded_line_has_the_frozen_shape() {
+        assert_eq!(
+            degraded_line(14, 8646, 5700, FetchFailure::Timeout, 13),
+            "[Degraded] z=14 x=8646 y=5700 reason=timeout filled_from=z13"
+        );
+        assert_eq!(
+            degraded_line(14, 1, 2, FetchFailure::Http(503), 11),
+            "[Degraded] z=14 x=1 y=2 reason=http_503 filled_from=z11"
+        );
+    }
+
+    #[test]
+    fn degraded_tiles_are_failures_but_never_fatal_and_never_ok() {
+        let s = DownloadStats::new();
+        s.ok_count.fetch_add(1, Ordering::Relaxed);
+        for x in 0..3 {
+            s.record_failure(FetchFailure::Timeout, 14, x, 0, "timed out");
+            assert!(s.note_degraded(14, x, 0, FetchFailure::Timeout, 13).is_some());
+        }
+        assert_eq!(s.total_tiles(), 4);
+        assert_eq!(s.total_errors(), 3, "tallied in their class");
+        assert_eq!(s.fatal_errors(), 0, "a coarse patch is not a lost tile");
+        assert!(!fetch_failure_is_fatal(s.fatal_errors(), s.total_tiles()));
+        assert_eq!(s.degraded_summary_lines(), vec![
+            "[Stats] DEGRADED: 3 of 4 source tile(s) filled from coarser zooms after a \
+             failed fetch".to_string(),
+        ]);
+        assert!(DownloadStats::new().degraded_summary_lines().is_empty(),
+                "the line appears only when something degraded");
+    }
+
+    #[test]
+    fn degraded_lines_stop_at_the_cap_and_the_summary_counts_the_rest() {
+        let s = DownloadStats::new();
+        s.degraded.store(DEGRADED_LIST_CAP - 1, Ordering::Relaxed);
+        assert!(s.note_degraded(14, 0, 0, FetchFailure::Other, 13).is_some(), "the last listed");
+        assert!(s.note_degraded(14, 1, 0, FetchFailure::Other, 13).is_none());
+        assert!(s.note_degraded(14, 2, 0, FetchFailure::Other, 13).is_none());
+        s.ok_count.fetch_add(DEGRADED_LIST_CAP + 2, Ordering::Relaxed);
+        let lines = s.degraded_summary_lines();
+        assert_eq!(lines[0], "[Degraded] … 2 more not listed");
+        assert!(lines[1].starts_with(&format!("[Stats] DEGRADED: {} of ", DEGRADED_LIST_CAP + 2)));
+    }
+
+    /// Loopback tile server for `fill_from_parents`: z13 never answers, z12
+    /// serves a 256 px 300 m Terrarium tile, everything else 404s.
+    fn stalled_parent_server() -> u16 {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let png = {
+            let mut out = Vec::new();
+            let mut enc = png::Encoder::new(&mut out, 256, 256);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            // 129*256 + 44 - 32768 = 300 m.
+            let px: Vec<u8> = [129u8, 44, 0].iter().copied().cycle().take(256 * 256 * 3).collect();
+            enc.write_header().unwrap().write_image_data(&px).unwrap();
+            out
+        };
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let png = png.clone();
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(stream.try_clone().unwrap());
+                    let mut req = String::new();
+                    let _ = r.read_line(&mut req);
+                    let mut l = String::new();
+                    while r.read_line(&mut l).unwrap_or(0) > 0 && l != "\r\n" { l.clear(); }
+                    if req.contains(" /13/") {
+                        std::thread::sleep(std::time::Duration::from_secs(600));
+                        return;
+                    }
+                    let (st, body) = if req.contains(" /12/") {
+                        ("200 OK", png)
+                    } else {
+                        ("404 Not Found", b"none".to_vec())
+                    };
+                    let _ = write!(stream, "HTTP/1.1 {st}\r\nContent-Length: {}\r\n\
+                                            Connection: close\r\n\r\n", body.len());
+                    let _ = stream.write_all(&body);
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn the_parent_fill_is_bounded_by_its_deadline_and_uses_what_arrived() {
+        // z-1 stalls forever, z-2 answers at once. The fill must give up on
+        // z-1 at the deadline (not at the client's own 30 s timeout, and not
+        // per level) and still use z-2 — reporting z-2 as the zoom it came from.
+        let port = stalled_parent_server();
+        let tpl = format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}.png");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30)).build().unwrap();
+        let t0 = std::time::Instant::now();
+        let fill = rt.block_on(fill_from_parents(
+            &client, &tpl, 14, 8646, 5700, dec_terrarium, None,
+            std::time::Duration::from_millis(1500),
+        ));
+        let secs = t0.elapsed().as_secs_f64();
+        assert!(secs < 5.0, "the fill ran {secs:.1}s past a 1.5 s deadline");
+        let fill = fill.expect("z12 supplied the tile");
+        assert_eq!(fill.edge, 256);
+        assert_eq!(fill.coarsest_zoom, Some(12));
+        assert!(fill.grid.iter().all(|&v| (v - 300.0).abs() < 0.01));
+    }
+
+    #[test]
+    fn an_ancestor_with_no_terrain_is_no_repair() {
+        // Nothing but 404s at every candidate zoom: a hole, not "repaired".
+        let port = stalled_parent_server();
+        let tpl = format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}.png");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let client = reqwest::Client::new();
+        // z=11: candidates z10..z6, all 404.
+        let fill = rt.block_on(fill_from_parents(
+            &client, &tpl, 11, 1080, 712, dec_terrarium, None,
+            std::time::Duration::from_secs(5),
+        ));
+        assert!(fill.is_none());
+    }
+
+    #[test]
+    fn the_disk_lookup_finds_a_path_that_does_not_exist_yet() {
+        // The output directory is created after the check. A relative path
+        // two levels below anything that exists used to resolve to itself and
+        // match no mount point, so the check silently never ran.
+        let p = Path::new("not_created_yet_8f3a/deeper/out");
+        assert!(!p.exists());
+        assert!(available_disk_space(p).is_some(), "the cwd's volume is known");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_disk_lookup_never_reports_another_volumes_free_space() {
+        // /dev/shm is a small tmpfs sysinfo does not list, so the longest
+        // listed prefix is `/` — whose free space is not /dev/shm's. Unknown
+        // must be reported as unknown, never as the root disk's figure.
+        use std::os::unix::fs::MetadataExt;
+        let shm = Path::new("/dev/shm");
+        let dev = |p: &Path| fs::metadata(p).unwrap().dev();
+        assert!(shm.is_dir() && dev(shm) != dev(Path::new("/")),
+                "precondition: /dev/shm is its own filesystem on Linux");
+        let listed = Disks::new_with_refreshed_list().iter()
+            .any(|d| d.mount_point() == shm);
+        let got = available_disk_space(&shm.join("out"));
+        if listed {
+            assert!(got.is_some());
+        } else {
+            assert_eq!(got, None, "reported {got:?} B — the root disk's space, not /dev/shm's");
+        }
+    }
+}

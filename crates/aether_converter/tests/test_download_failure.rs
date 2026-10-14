@@ -75,6 +75,27 @@ fn serve_tiles<F>(route: F) -> u16
 where
     F: Fn(u32, u32, u32) -> Option<Vec<u8>> + Send + Sync + 'static,
 {
+    serve_replies(move |z, x, y| match route(z, x, y) {
+        Some(png) => Reply::Png(png),
+        None => Reply::Status("404 Not Found"),
+    })
+}
+
+/// What [`serve_replies`] does with one tile request.
+enum Reply {
+    /// `200 OK` with this PNG.
+    Png(Vec<u8>),
+    /// This status line (e.g. `"403 Forbidden"`) and a short text body.
+    Status(&'static str),
+    /// Read the request and never answer — a stalled upstream.
+    Stall,
+}
+
+/// Like [`serve_tiles`], but the route picks any [`Reply`] per `(z, x, y)`.
+fn serve_replies<F>(route: F) -> u16
+where
+    F: Fn(u32, u32, u32) -> Reply + Send + Sync + 'static,
+{
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let route = std::sync::Arc::new(route);
@@ -103,10 +124,19 @@ where
                     .split('/')
                     .filter_map(|p| p.parse().ok())
                     .collect();
-                let served = if zxy.len() == 3 { route(zxy[0], zxy[1], zxy[2]) } else { None };
+                let served = if zxy.len() == 3 {
+                    route(zxy[0], zxy[1], zxy[2])
+                } else {
+                    Reply::Status("404 Not Found")
+                };
                 let (status, body) = match served {
-                    Some(png) => ("200 OK", png),
-                    None => ("404 Not Found", b"no tile here".to_vec()),
+                    Reply::Png(png) => ("200 OK", png),
+                    Reply::Status(status) => (status, b"no tile here".to_vec()),
+                    Reply::Stall => {
+                        // Hold the socket open, unanswered, far past any timeout.
+                        thread::sleep(std::time::Duration::from_secs(600));
+                        return;
+                    }
                 };
                 let head = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: image/png\r\n\
@@ -569,4 +599,158 @@ fn a_non_square_tile_is_refused_naming_its_dimensions() {
     assert!(msg.contains("must be square"), "and the rule; got: {msg}");
     assert!(!abts[0].exists(), "a refused run left {:?} behind", abts[0]);
     assert_eq!(abt_files(&dir.path().join("out")), Vec::<String>::new());
+}
+
+// ── Degraded tiles: a failed fetch filled from a coarser zoom ───────────────
+//
+// CONTRACT changelog 24. A tile whose fetch FAILED (anything but 404) and was
+// then filled from an ancestor is coarser terrain standing in for data that
+// exists at the requested zoom. It used to count as OK, so `[Stats] Tiles:
+// 760/760 OK (100.0% success)` was printed over 2 m near-field terrain that
+// was silently z14-or-coarser, and the Waveshed plugin cached it as complete.
+
+/// Runs the real `aether_converter download` binary on `job`, returning
+/// (exit success, stderr). The `[Degraded]`/`[Stats]` lines are a parsed
+/// stderr surface, so they are tested where the consumer reads them.
+fn run_cli(job: &Path) -> (bool, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_aether_converter"))
+        .args(["download", "--job-file"])
+        .arg(job)
+        .output()
+        .unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// One `.abt` half an XYZ tile wide starting three quarters into tile `tx`,
+/// so columns 32.. are tile `tx+1`, and short enough (half a tile's width,
+/// under its height) to stay in tile row `ty`: exactly two fetches. Returns
+/// `(tx, ty, job, abt)`; the caller's `route` decides what each tile does.
+fn straddle_job<F>(dir: &Path, route: F) -> (u32, u32, PathBuf, PathBuf)
+where
+    F: Fn(u32, u32, u32, u32, u32) -> Reply + Send + Sync + 'static,
+{
+    const Z: u32 = 12;
+    let (tx, ty) = (lon2tx(8.5, Z), lat2ty(47.0, Z));
+    let w = tx2lon(tx + 1, Z) - tx2lon(tx, Z);
+    let port = serve_replies(move |z, x, y| route(tx, ty, z, x, y));
+    let (job, abt) = write_job_at(
+        dir, port, ty2lat(ty, Z), tx2lon(tx, Z) + w * 0.75, 64, w / 128.0,
+    );
+    assert!(w / 2.0 < ty2lat(ty, Z) - ty2lat(ty + 1, Z), "must stay in one tile row");
+    (tx, ty, job, abt)
+}
+
+#[test]
+fn a_failed_tile_filled_from_a_parent_is_degraded_not_ok() {
+    // East tile answers 403 (non-retryable, so the test is fast); its z11
+    // parent serves 300 m. The fill still happens — a coarse patch beats a
+    // hole — but the tile is DEGRADED: named on its own line, out of the OK
+    // count, tallied in its error class.
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, ty, job, abt) = straddle_job(dir.path(), |tx, ty, z, x, y| match (z, x, y) {
+        (12, x, _) if x == tx => Reply::Png(terrarium_tile(256, |_, _| 100.0)),
+        (12, _, _) => Reply::Status("403 Forbidden"),
+        (11, x, y) if x == (tx + 1) >> 1 && y == ty >> 1 => {
+            Reply::Png(terrarium_tile(256, |_, _| 300.0))
+        }
+        _ => Reply::Status("404 Not Found"),
+    });
+
+    let (ok, err) = run_cli(&job);
+    assert!(ok, "a degraded tile is not fatal; stderr:\n{err}");
+
+    let line = format!("[Degraded] z=12 x={} y={ty} reason=http_403 filled_from=z11", tx + 1);
+    assert_eq!(err.lines().filter(|l| *l == line).count(), 1, "want `{line}` once; stderr:\n{err}");
+    assert_eq!(err.lines().filter(|l| l.starts_with("[Degraded]")).count(), 1, "{err}");
+    assert!(err.lines().any(|l| l == "[Stats] Tiles: 1/2 OK (50.0% success)"),
+            "the degraded tile is not OK; stderr:\n{err}");
+    assert!(err.lines().any(|l| l == "[Stats] DEGRADED: 1 of 2 source tile(s) filled from \
+                                       coarser zooms after a failed fetch"), "{err}");
+    assert!(err.lines().any(|l| l.starts_with("[Stats] ERRORS (1): HTTP_4xx=1")),
+            "classified in its error class; stderr:\n{err}");
+    assert!(err.lines().any(|l| l == "[Stats] Retries: 0 (up to 5 per failed tile)"),
+            "the CLI path retries 5 times and must say so; stderr:\n{err}");
+
+    // The pixels are still the parent's — degraded, not voided.
+    let g = read_abt(&abt, 64);
+    for y in 0..64 {
+        assert_eq!(g[y * 64 + 10], 200, "west tile arrived: 100 m");
+        assert_eq!(g[y * 64 + 50], 600, "east tile filled from z11: 300 m");
+    }
+}
+
+#[test]
+fn a_404_filled_from_a_parent_stays_ok_and_is_not_degraded() {
+    // "No tile at this zoom" + a parent that has one is the service's data,
+    // not a failure: unchanged semantics (changelog 16).
+    let dir = tempfile::tempdir().unwrap();
+    let (_tx, _ty, job, abt) = straddle_job(dir.path(), |tx, ty, z, x, y| match (z, x, y) {
+        (12, x, _) if x == tx => Reply::Png(terrarium_tile(256, |_, _| 100.0)),
+        (11, x, y) if x == (tx + 1) >> 1 && y == ty >> 1 => {
+            Reply::Png(terrarium_tile(256, |_, _| 300.0))
+        }
+        _ => Reply::Status("404 Not Found"),
+    });
+
+    let (ok, err) = run_cli(&job);
+    assert!(ok, "{err}");
+    assert!(err.lines().any(|l| l == "[Stats] Tiles: 2/2 OK (100.0% success)"), "{err}");
+    assert!(!err.contains("[Degraded]") && !err.contains("DEGRADED"), "{err}");
+    assert!(err.lines().any(|l| l.starts_with("[Stats] Repaired from coarser parent tiles: 1")),
+            "{err}");
+    assert_eq!(read_abt(&abt, 64)[50], 600, "repaired from z11");
+}
+
+#[test]
+fn a_degraded_fill_names_the_coarsest_zoom_it_used() {
+    // The z11 parent is a checkerboard of voids, so every pixel it cannot
+    // supply comes from z10: two levels contributed, the line names z10.
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, ty, job, abt) = straddle_job(dir.path(), |tx, ty, z, x, y| match (z, x, y) {
+        (12, x, _) if x == tx => Reply::Png(terrarium_tile(256, |_, _| 100.0)),
+        (12, _, _) => Reply::Status("410 Gone"),
+        (11, x, y) if x == (tx + 1) >> 1 && y == ty >> 1 => Reply::Png(terrarium_tile(
+            256,
+            |px, py| if (px + py) % 2 == 0 { -32768.0 } else { 300.0 },
+        )),
+        (10, x, y) if x == (tx + 1) >> 2 && y == ty >> 2 => {
+            Reply::Png(terrarium_tile(256, |_, _| 500.0))
+        }
+        _ => Reply::Status("404 Not Found"),
+    });
+
+    let (ok, err) = run_cli(&job);
+    assert!(ok, "{err}");
+    let line = format!("[Degraded] z=12 x={} y={ty} reason=http_410 filled_from=z10", tx + 1);
+    assert!(err.lines().any(|l| l == line), "want `{line}`; stderr:\n{err}");
+    let east: Vec<i16> = read_abt(&abt, 64).iter().enumerate()
+        .filter(|(i, _)| i % 64 >= 34).map(|(_, v)| *v).collect();
+    assert!(east.iter().all(|&v| (600..=1000).contains(&v)),
+            "east half is z11/z10 terrain, no voids");
+}
+
+#[test]
+fn a_stalled_upstream_cannot_hold_a_tile_past_one_repair_deadline() {
+    // The east tile 403s and every ancestor accepts the connection and never
+    // answers. Fetched one level at a time with the client's 30 s timeout,
+    // that held the tile for (12 - 6) × 30 s = 180 s (240 s at z14 — the
+    // observed 299 s max tile latency). All levels now go out at once under
+    // one 30 s deadline, so the whole run ends well inside a minute.
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, _ty, job, abt) = straddle_job(dir.path(), |tx, _ty, z, x, _y| match (z, x) {
+        (12, x) if x == tx => Reply::Png(terrarium_tile(256, |_, _| 100.0)),
+        (12, _) => Reply::Status("403 Forbidden"),
+        _ => Reply::Stall,
+    });
+
+    let t0 = std::time::Instant::now();
+    let (ok, err) = run_cli(&job);
+    let secs = t0.elapsed().as_secs_f64();
+    assert!(secs < 60.0, "the repair took {secs:.0}s; one deadline is 30 s. stderr:\n{err}");
+
+    // Nothing could be filled: an ordinary unrepaired failure, void, not degraded.
+    assert!(ok, "1 of 2 lost is not a majority; stderr:\n{err}");
+    assert!(!err.contains("[Degraded]"), "{err}");
+    assert!(err.lines().any(|l| l == "[Stats] Tiles: 1/2 OK (50.0% success)"), "{err}");
+    assert_eq!(read_abt(&abt, 64)[50], -9999, "unrepaired: void");
 }
