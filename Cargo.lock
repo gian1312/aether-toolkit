@@ -35,6 +35,7 @@ dependencies = [
  "flate2",
  "flatgeobuf",
  "futures",
+ "image-webp",
  "image_dds",
  "js-sys",
  "libc",

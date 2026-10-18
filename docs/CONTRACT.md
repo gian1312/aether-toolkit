@@ -289,7 +289,33 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    existing ancestor, longest mount point) and, on Unix, also requires the
 >    same device, else reports "unknown" and skips the check rather than
 >    quoting another volume's free space. The in-memory/WASM downloaders
->    never repair a failed tile from parents, so they have no degraded tiles.
+>    never repair a *failed* tile from parents, so they have no degraded
+>    tiles (the browser path repairs **404s** since item 25 — those count OK,
+>    as on the native paths).
+> 25. **`download`: WebP source tiles decode; the browser path fills a 404
+>    from the coarser zoom (§1.2, §9b; additive; 2026-10-16).** Motivated by
+>    Mapterhorn (`https://tiles.mapterhorn.com/{z}/{x}/{y}.webp`): 512 px
+>    lossless-WebP Terrarium tiles, z12 worldwide and z13–z17 only where a
+>    country publishes finer open data. (a) `decode_png` became
+>    `decode_tile`: the body is sniffed (`RIFF…WEBP` → WebP, else PNG) and
+>    both arms feed one sample loop; the tile-geometry rules and messages are
+>    unchanged. A WebP source used to fail every tile with `decode=N`. The
+>    job JSON is unchanged — there is no format field. (b) In the browser
+>    path (`download_terrain`, WASM), a source tile the service answered
+>    **HTTP 404** is now filled from the nearest coarser zoom that has one
+>    (z-1, z-2, … down to z6, one level at a time, each ancestor fetched
+>    once through the page's `fetch_fn` so siblings share it), exactly the
+>    pixel mapping of the native parent backfill (`upsample_from_ancestor`).
+>    A filled 404 counts **OK** and in `Repaired from coarser parent tiles`,
+>    as items 16/24 define for the native paths; a 404 no ancestor could
+>    supply stays `HTTP_404_no_data`. Failures other than 404 are still not
+>    repaired there (no degraded tiles in the browser path, as item 24
+>    says). One informational stderr line is new:
+>    `[DownloadWeb] <n> tile(s) answered 404 at z<z>; <k> filled from coarser zooms`.
+>    (c) The browser fetch pool no longer retries a **4xx other than 429**
+>    (the native paths never did): a 404 used to cost three retries and
+>    ~3 s before it was accepted as the answer. `.abt` bytes change only for
+>    jobs that had 404 tiles in the browser path (void → coarser terrain).
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -596,9 +622,10 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   ```
 
   Without it, "could not be fetched" reads as a network fault for every cause.
-  It is not one: a source that serves **WebP** to this PNG decoder (MapTiler's
-  Terrain-RGB v2 does) fails every tile with `decode=N`, and the repair is a
-  different tile source, not a different network.
+  It is not one: a source that serves bytes the decoder cannot read (JPEG, a
+  16-bit PNG, an HTML error page) fails every tile with `decode=N`, and the
+  repair is a different tile source, not a different network. (PNG and WebP
+  both decode since item 25; a WebP source was such a failure before it.)
 
   > **Behaviour change for consumers.** The `Errors: {}.` sentence is new; it
   > is inserted before the `Check that the tile source…` sentence. The clause
@@ -1604,12 +1631,20 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `size_px` | u32 | Tile side (px). |
 | `resolution_m` | f64 | Metres per pixel; the writer sets `scale_x = scale_y = resolution_m / 111111`. |
 
+**Tile format is read, never assumed.** A source tile is **PNG or WebP**
+(lossless `VP8L` as Mapterhorn serves, or lossy), told apart by the bytes
+(`RIFF…WEBP` magic), never by the URL or a content type. The job carries no
+format field; `encoding` describes the pixel→metre mapping only, and the same
+job runs unchanged against `…/terrarium/{z}/{x}/{y}.png` (AWS, 256 px) and
+`https://tiles.mapterhorn.com/{z}/{x}/{y}.webp` (512 px). Both decode to 8-bit
+RGB(A) and go through one sample loop. (Changelog item 25.)
+
 **Tile size is read, never assumed.** The job says nothing about how large the
 source's XYZ tiles are, and services disagree: AWS Terrarium serves **256 px**
-tiles, MapTiler's `terrain-rgb` serves **512 px** ones (its `tiles.json`
-declares `"scale": "2.000000"`, i.e. `@2x`). The edge is therefore taken from
-the first PNG that decodes and held for the rest of the run; the assembly grid,
-its row stride and the per-tile-row sample count all follow it.
+tiles, Mapterhorn and MapTiler's `terrain-rgb` serve **512 px** ones (MapTiler's
+`tiles.json` declares `"scale": "2.000000"`, i.e. `@2x`). The edge is therefore
+taken from the first tile that decodes and held for the rest of the run; the
+assembly grid, its row stride and the per-tile-row sample count all follow it.
 
 This does **not** change the ground resolution: `zoom` is the caller's choice
 and is untouched. A 512 px z12 tile covers exactly the ground a 256 px z12 tile
@@ -1629,7 +1664,7 @@ These are distinct from the `Tile download failed:` refusal above: that one
 counts lost tiles against a majority threshold, whereas any single tile with
 unusable geometry stops the run. Both remove the `.abt` files the run created.
 
-Anything else a tile source does wrong — a 404, a timeout, a WebP body — stays a
+Anything else a tile source does wrong — a 404, a timeout, a JPEG body — stays a
 per-tile failure, tallied in `[Stats] ERRORS` and judged by the majority rule.
 
 What becomes of each source tile, and how the `[Stats]` block counts it

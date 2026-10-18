@@ -41,8 +41,10 @@ sysinfo = { version = "0.30", optional = true }
 reqwest = { version = "0.12", features = ["rustls-tls", "http2"], default-features = false }
 tokio = { version = "1", features = ["macros", "sync", "time"] }
 futures = "0.3"
-# PNG decoding (for terrain tile decode)
+# Terrain tile decoding: PNG (AWS Terrarium, MapTiler v1) and WebP (Mapterhorn,
+# MapTiler v2). `image-webp` is pure Rust and already in the tree via `tiff`.
 png = "0.17"
+image-webp = "0.2"
 # MVT/PBF vector tile decoding (for building data from OpenFreeMap)
 prost = "0.13"
 # Gzip decompression (for PBF tiles that may be internally gzipped)

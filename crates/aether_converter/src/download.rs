@@ -142,7 +142,14 @@ const DEFAULT_TILE_PX: usize = 256;
 /// made before the first tile arrives. MapTiler's `@2x` terrain-RGB is 512.
 const MAX_TILE_PX: usize = 512;
 
-/// Decode one terrain PNG into metres, with the square tile edge it came at.
+/// Decode one terrain tile — PNG or WebP — into metres, with the square tile
+/// edge it came at.
+///
+/// The format is read from the bytes, never from the URL or a content type:
+/// AWS Terrarium serves PNG, Mapterhorn serves lossless WebP (`VP8L`) under the
+/// same Terrarium encoding, MapTiler's Terrain-RGB v2 serves WebP as well. A
+/// job therefore carries no format field and a source may switch formats
+/// without anyone noticing.
 ///
 /// The edge is returned rather than assumed: MapTiler's terrain-RGB v1 serves
 /// **512 px** (`"scale": "2.000000"`) tiles where AWS Terrarium serves 256, and
@@ -150,10 +157,13 @@ const MAX_TILE_PX: usize = 512;
 /// west half onto the even output rows, the east half onto the odd ones. That
 /// produced terrain off by ~555 m at p95 while looking entirely plausible.
 ///
-/// Anything this loop cannot read as 8-bit RGB(A) is refused instead of being
+/// Anything this cannot read as 8-bit RGB(A) is refused instead of being
 /// decoded into confident nonsense: a non-square tile has no assembly stride,
 /// and a 16-bit tile puts two bytes where the decoder reads one channel.
-pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<(Vec<f32>, usize)> {
+pub fn decode_tile(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<(Vec<f32>, usize)> {
+    if body.len() >= 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WEBP" {
+        return decode_webp(body, dec);
+    }
     let decoder = png::Decoder::new(std::io::Cursor::new(body));
     let mut reader = decoder.read_info()?;
     let info = reader.info().clone();
@@ -171,6 +181,35 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<(Vec<f32>, 
         );
     }
     let ch = if info.color_type == png::ColorType::Rgba { 4 } else { 3 };
+    Ok((samples_to_metres(bytes, w, h, ch, dec), w))
+}
+
+/// The WebP arm of [`decode_tile`]. `image-webp` always hands back 8-bit
+/// RGB(A), so only the square check applies; its errors are prefixed
+/// `WebP decode error` so the retry classifier files them as decode, not network.
+fn decode_webp(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<(Vec<f32>, usize)> {
+    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(body))
+        .map_err(|e| anyhow::anyhow!("WebP decode error: {e}"))?;
+    let (w, h) = decoder.dimensions();
+    let (w, h) = (w as usize, h as usize);
+    if w != h || w == 0 {
+        anyhow::bail!("{TILE_GEOMETRY_ERR}: tile is {w}x{h} px; XYZ tiles must be square");
+    }
+    let ch = if decoder.has_alpha() { 4 } else { 3 };
+    let n = decoder
+        .output_buffer_size()
+        .ok_or_else(|| anyhow::anyhow!("WebP decode error: output size overflows"))?;
+    let mut buf = vec![0u8; n];
+    decoder
+        .read_image(&mut buf)
+        .map_err(|e| anyhow::anyhow!("WebP decode error: {e}"))?;
+    Ok((samples_to_metres(&buf, w, h, ch, dec), w))
+}
+
+/// Interleaved 8-bit samples (`ch` per pixel, RGB first) → metres via `dec`.
+fn samples_to_metres(
+    bytes: &[u8], w: usize, h: usize, ch: usize, dec: fn(u8, u8, u8) -> f32,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; w * h];
     for i in 0..w * h {
         let o = i * ch;
@@ -178,7 +217,7 @@ pub fn decode_png(body: &[u8], dec: fn(u8, u8, u8) -> f32) -> Result<(Vec<f32>, 
             out[i] = dec(bytes[o], bytes[o + 1], bytes[o + 2]);
         }
     }
-    Ok((out, w))
+    out
 }
 
 // Terrarium NODATA backfill ---------------------------------------------------
@@ -396,7 +435,7 @@ async fn fetch_decode_raw(
         return None;
     }
     let body = resp.bytes().await.ok()?;
-    decode_png(&body, dec).ok()
+    decode_tile(&body, dec).ok()
 }
 
 /// Wall-clock budget for one tile's whole parent backfill (all ancestor levels).
@@ -769,8 +808,9 @@ impl DownloadStats {
     ///
     /// Rendered both by the `[Stats] ERRORS` line and by the fatal
     /// `Tile download failed:` bail, so a caller that only sees the failure
-    /// message still learns *which* failure it was: a source serving WebP
-    /// (`decode=N`) is a different repair from an unreachable one (`connect=N`).
+    /// message still learns *which* failure it was: a source serving bytes the
+    /// decoder cannot read (`decode=N`) is a different repair from an
+    /// unreachable one (`connect=N`).
     /// Only non-zero classes appear; `"none"` if there are no errors at all.
     fn error_breakdown(&self) -> String {
         let mut parts = Vec::new();
@@ -1088,7 +1128,7 @@ async fn download_strip(
                         }
                         let body = resp.bytes().await?;
                         stats.bytes_downloaded.fetch_add(body.len() as u64, Ordering::Relaxed);
-                        decode_png(&body, dec)
+                        decode_tile(&body, dec)
                     }
                     .await;
 
@@ -1544,6 +1584,145 @@ fn intersect_fetch_rect(
     }
 }
 
+/// What the in-memory strip loop gets per source tile: the bytes the service
+/// sent, or — for a tile the service answered **404** and the browser path
+/// repaired from a coarser zoom — the grid already decoded, since the repair
+/// works on samples, not on PNG/WebP bytes.
+enum RawTile {
+    Bytes(Vec<u8>),
+    Decoded(Vec<f32>, usize),
+}
+
+/// The zoom-`z` child tile `(x, y)` cut out of its ancestor `level` zooms up
+/// and upsampled by sample repetition — the pixel mapping of
+/// [`fill_from_parents`] for a child that never arrived at all. Ancestor
+/// voids stay void ([`NO_TILE_M`]), as in the native repair.
+fn upsample_from_ancestor(anc: &[f32], edge: usize, level: u32, x: u32, y: u32) -> Vec<f32> {
+    let t = edge as u64;
+    let (bx, by) = ((x >> level) as u64 * t, (y >> level) as u64 * t);
+    let mut out = vec![NO_TILE_M; edge * edge];
+    if anc.len() != edge * edge {
+        return out;
+    }
+    for py in 0..t {
+        for px in 0..t {
+            let apx = (((x as u64) * t + px) >> level) - bx;
+            let apy = (((y as u64) * t + py) >> level) - by;
+            let v = anc[(apy * t + apx) as usize];
+            if v > NODATA_M {
+                out[(py * t + px) as usize] = v;
+            }
+        }
+    }
+    out
+}
+
+/// Fetch every URL once through the page's fetch (or the global one) and hand
+/// back the bodies that answered 2xx — `None` for anything else, no retry.
+/// Used for ancestor tiles only; the main pool is [`download_all_tiles_web`].
+#[cfg(target_arch = "wasm32")]
+async fn fetch_bodies_web(urls: &[String], js_fetch: Option<&js_sys::Function>) -> Vec<Option<Vec<u8>>> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let all = js_sys::Function::new_with_args(
+        "urls,f",
+        "return Promise.all(urls.map(function(u){\
+            return (f||fetch)(u).then(function(r){return r.ok?r.arrayBuffer():null})\
+                .catch(function(){return null});\
+        }))",
+    );
+    let js_urls = js_sys::Array::new_with_length(urls.len() as u32);
+    for (i, u) in urls.iter().enumerate() {
+        js_urls.set(i as u32, wasm_bindgen::JsValue::from_str(u));
+    }
+    let fetch_val: wasm_bindgen::JsValue = match js_fetch {
+        Some(f) => f.clone().into(),
+        None => wasm_bindgen::JsValue::NULL,
+    };
+    let promise = match all.call2(&wasm_bindgen::JsValue::NULL, &js_urls, &fetch_val) {
+        Ok(p) => js_sys::Promise::from(p),
+        Err(_) => return vec![None; urls.len()],
+    };
+    match JsFuture::from(promise).await {
+        Ok(settled) => {
+            let arr: js_sys::Array = settled.unchecked_into();
+            (0..urls.len() as u32)
+                .map(|i| {
+                    let v = arr.get(i);
+                    if v.is_null() || v.is_undefined() {
+                        None
+                    } else {
+                        Some(js_sys::Uint8Array::new(&v).to_vec())
+                    }
+                })
+                .collect()
+        }
+        Err(_) => vec![None; urls.len()],
+    }
+}
+
+/// Browser-path counterpart of [`fill_from_parents`] for tiles the service
+/// answered **404**: "no tile at this zoom" is data, and the coarsest zoom
+/// that has one is the terrain that exists there. Mapterhorn is the case this
+/// serves — z12 worldwide, z13–z17 only where a country publishes finer data —
+/// so without it a 10 m run outside those regions came back as void strips.
+///
+/// One zoom level at a time: the unique ancestors of every still-missing child
+/// are fetched once (four siblings share a parent; the page's fetch de-duplicates
+/// and caches them on top), decoded, and cut into the children with
+/// [`upsample_from_ancestor`]. Children whose ancestor is missing too go one
+/// level coarser, down to [`NODATA_FILL_MIN_ZOOM`]. Failures other than 404 are
+/// not repaired here, as before — they stay holes, and the run stays honest
+/// about them (contract item 24: the browser path has no degraded tiles).
+#[cfg(target_arch = "wasm32")]
+async fn fill_404_from_parents_web(
+    url_template: &str,
+    zoom: u32,
+    missing: Vec<(u32, u32)>,
+    dec: fn(u8, u8, u8) -> f32,
+    js_fetch: Option<&js_sys::Function>,
+) -> std::collections::HashMap<(u32, u32), (Vec<f32>, usize)> {
+    let mut filled = std::collections::HashMap::new();
+    let mut todo = missing;
+    for level in 1..=zoom.saturating_sub(NODATA_FILL_MIN_ZOOM) {
+        if todo.is_empty() {
+            break;
+        }
+        let az = zoom - level;
+        let mut parents: Vec<(u32, u32)> = todo.iter().map(|&(x, y)| (x >> level, y >> level)).collect();
+        parents.sort_unstable();
+        parents.dedup();
+        let urls: Vec<String> = parents
+            .iter()
+            .map(|&(ax, ay)| {
+                url_template
+                    .replace("{z}", &az.to_string())
+                    .replace("{x}", &ax.to_string())
+                    .replace("{y}", &ay.to_string())
+            })
+            .collect();
+        let bodies = fetch_bodies_web(&urls, js_fetch).await;
+        let mut grids: std::collections::HashMap<(u32, u32), (Vec<f32>, usize)> =
+            std::collections::HashMap::new();
+        for (p, body) in parents.iter().zip(bodies) {
+            if let Some(b) = body {
+                if let Ok(g) = decode_tile(&b, dec) {
+                    grids.insert(*p, g);
+                }
+            }
+        }
+        todo.retain(|&(x, y)| match grids.get(&(x >> level, y >> level)) {
+            Some((anc, edge)) => {
+                filled.insert((x, y), (upsample_from_ancestor(anc, *edge, level, x, y), *edge));
+                false
+            }
+            None => true,
+        });
+    }
+    filled
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn download_all_tiles_web(
     url_template: &str,
@@ -1557,7 +1736,8 @@ async fn download_all_tiles_web(
     // Optional JS fetch replacement: `(url) => Promise<{ok, status, arrayBuffer()}>`.
     // When absent the snippet uses the global `fetch`, byte-identical to before.
     js_fetch: Option<&js_sys::Function>,
-) -> std::collections::HashMap<(u32, u32), Vec<u8>> {
+    dec: fn(u8, u8, u8) -> f32,
+) -> std::collections::HashMap<(u32, u32), RawTile> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
@@ -1565,6 +1745,8 @@ async fn download_all_tiles_web(
     let ny = (y1 - y0 + 1) as usize;
     let total = nx * ny;
     let mut result_map = std::collections::HashMap::with_capacity(total);
+    // Tiles the service answered 404, repaired from coarser zooms below.
+    let mut missing_404: Vec<(u32, u32)> = Vec::new();
 
     // Domain sharding: expand single S3 URL into multiple hostnames.
     // Browser allows 6 HTTP/1.1 connections per hostname.
@@ -1585,21 +1767,27 @@ async fn download_all_tiles_web(
 
     // ── Streaming fetch pool with retry + 5 % progress ─────────
     // Each failed tile retries up to 3× with exponential backoff
-    // (500 ms, 1 s, 1.5 s).  `prog(phase, done, total)` is called
-    // every 5 % of tiles (plus first and last) so the UI stays live.
+    // (500 ms, 1 s, 1.5 s) — except on a 4xx other than 429, which is
+    // the service's final answer (the native paths draw the same line).
+    // `prog(phase, done, total)` is called every 5 % of tiles (plus
+    // first and last) so the UI stays live.
     let fetch_pool = js_sys::Function::new_with_args(
         "urls,conc,prog,f",
         "return new Promise(function(resolve){\
             var r=new Array(urls.length),n=0,d=0,t=urls.length,lp=-1;\
             function doFetch(i,retries){\
                 (f||fetch)(urls[i]).then(function(resp){\
-                    if(!resp.ok)throw new Error('HTTP '+resp.status);\
+                    if(!resp.ok){\
+                        var e=new Error('HTTP '+resp.status);\
+                        e.final=resp.status>=400&&resp.status<500&&resp.status!==429;\
+                        throw e;\
+                    }\
                     return resp.arrayBuffer();\
                 }).then(function(buf){\
                     r[i]={status:'fulfilled',value:buf};\
                     fin();\
                 }).catch(function(err){\
-                    if(retries>0){\
+                    if(retries>0&&!err.final){\
                         setTimeout(function(){doFetch(i,retries-1)},(4-retries)*500);\
                     }else{\
                         r[i]={status:'rejected',reason:String(err)};\
@@ -1676,7 +1864,7 @@ async fn download_all_tiles_web(
                     let bytes = js_sys::Uint8Array::new(&value).to_vec();
                     stats.bytes_downloaded.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     stats.ok_count.fetch_add(1, Ordering::Relaxed);
-                    result_map.insert((*tx, *ty), bytes);
+                    result_map.insert((*tx, *ty), RawTile::Bytes(bytes));
                 } else {
                     let reason = js_sys::Reflect::get(&entry, &"reason".into())
                         .ok()
@@ -1690,8 +1878,9 @@ async fn download_all_tiles_web(
                     if reason.contains("429") {
                         stats.err_http_429.fetch_add(1, Ordering::Relaxed);
                     } else if reason.contains("404") {
-                        // Same rule as the native paths: 404 = no data there.
-                        stats.err_http_404.fetch_add(1, Ordering::Relaxed);
+                        // Same rule as the native paths: 404 = no data there,
+                        // and the coarser zoom that has data stands in for it.
+                        missing_404.push((*tx, *ty));
                     } else if reason.contains("HTTP 5") {
                         stats.err_http_5xx.fetch_add(1, Ordering::Relaxed);
                     } else if reason.contains("HTTP 4") {
@@ -1705,6 +1894,29 @@ async fn download_all_tiles_web(
         Err(e) => {
             eprintln!("[DownloadWeb] Pool rejected: {:?}", e);
             stats.err_other.fetch_add(total, Ordering::Relaxed);
+        }
+    }
+
+    // A 404 repaired from a coarser zoom is OK, as on the native paths
+    // (contract items 16, 24); one the ancestors could not supply stays the
+    // "no data there" it always was.
+    if !missing_404.is_empty() {
+        let n404 = missing_404.len();
+        let filled = fill_404_from_parents_web(url_template, zoom, missing_404.clone(), dec, js_fetch).await;
+        for key in missing_404 {
+            if filled.contains_key(&key) {
+                stats.ok_count.fetch_add(1, Ordering::Relaxed);
+                stats.backfilled.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.err_http_404.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        eprintln!(
+            "[DownloadWeb] {} tile(s) answered 404 at z{}; {} filled from coarser zooms",
+            n404, zoom, filled.len()
+        );
+        for (key, (grid, edge)) in filled {
+            result_map.insert(key, RawTile::Decoded(grid, edge));
         }
     }
 
@@ -1777,7 +1989,7 @@ pub fn run_download(job_file: &Path) -> Result<()> {
 /// it": there the line is drawn at a **majority** of the requested tiles.
 /// Below it the output is still mostly real terrain and the `[Stats] ERRORS`
 /// summary is the right response; above it (the network died, the key
-/// expired, the source serves WebP to a PNG decoder) there is nothing worth
+/// expired, the source serves JPEG to a PNG/WebP decoder) there is nothing worth
 /// keeping — a mostly-void output that LOOKS like a bounded source is exactly
 /// the silent flat-sea failure this guard exists for.
 #[cfg(feature = "native")]
@@ -2230,7 +2442,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     // bytes the decoder cannot read, and a mostly-void output would cache as
     // plausible flat sea. Name the error class: "could not be fetched" alone
     // reads as a network fault even when the real cause is a source serving
-    // WebP to a PNG decoder. `cleanup` takes the files with it.
+    // JPEG to a PNG/WebP decoder. `cleanup` takes the files with it.
     //
     // 404s are deliberately NOT in `failed`: the service answering "no tile
     // here" is data, not failure. A run over the edge of a bounded source (or
@@ -2509,7 +2721,7 @@ pub async fn run_download_mem(
         download_all_tiles_web(
             &job.url_template, zoom, fx0, fx1, fy0, fy1,
             conns.min(200),
-            &stats, start, js_progress, js_fetch,
+            &stats, start, js_progress, js_fetch, dec,
         ).await
     };
     #[cfg(target_arch = "wasm32")]
@@ -2539,37 +2751,48 @@ pub async fn run_download_mem(
         let fsy1 = sy1.min(fy1);
 
         #[cfg(target_arch = "wasm32")]
-        let raw_results: Vec<(u32, u32, Result<Vec<u8>>)> = if fsy0 > fsy1 {
+        let raw_results: Vec<(u32, u32, Result<RawTile>)> = if fsy0 > fsy1 {
             Vec::new()
         } else {
             (fsy0..=fsy1)
                 .flat_map(|ty| (fx0..=fx1).map(move |tx| (tx, ty)))
                 .map(|(tx, ty)| match tile_cache.remove(&(tx, ty)) {
-                    Some(bytes) => (tx, ty, Ok(bytes)),
+                    Some(tile) => (tx, ty, Ok(tile)),
                     None => (tx, ty, Err(anyhow::anyhow!("download failed"))),
                 })
                 .collect()
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        let raw_results = if fsy0 > fsy1 {
+        let raw_results: Vec<(u32, u32, Result<RawTile>)> = if fsy0 > fsy1 {
             Vec::new()
         } else {
             download_strip_raw(
                 client, &job.url_template, zoom, fx0, fx1, fsy0, fsy1,
                 conns, &progress, ftotal, &stats, start, &semaphore,
                 on_progress,
-            ).await
+            )
+            .await
+            .into_iter()
+            .map(|(tx, ty, r)| (tx, ty, r.map(RawTile::Bytes)))
+            .collect()
         };
 
-        // Phase 2: Decode PNGs sequentially, then classify decode errors.
+        // Phase 2: Decode tiles sequentially, then classify decode errors.
+        // A tile the browser path already repaired from a coarser zoom
+        // arrives decoded and only needs placing.
 
         let mut results: Vec<(u32, u32, Result<(Vec<f32>, usize)>)> =
             Vec::with_capacity(raw_results.len());
         for (tx, ty, raw) in raw_results {
             match raw {
-                Ok(png_bytes) => {
-                    match decode_png(&png_bytes, dec) {
+                Ok(RawTile::Decoded(grid, edge)) => {
+                    results.push((tx, ty, Ok((grid, edge))));
+                    #[cfg(target_arch = "wasm32")]
+                    { decoded_count += 1; }
+                }
+                Ok(RawTile::Bytes(png_bytes)) => {
+                    match decode_tile(&png_bytes, dec) {
                         Ok(tile) => {
                             results.push((tx, ty, Ok(tile)));
 
@@ -2951,7 +3174,7 @@ mod tests {
         // Assuming either is how a 512 px tile got folded in half.
         for edge in [256u32, 512] {
             let (grid, ts) =
-                decode_png(&terrarium_png(edge, edge, png::BitDepth::Eight), dec_terrarium)
+                decode_tile(&terrarium_png(edge, edge, png::BitDepth::Eight), dec_terrarium)
                     .unwrap();
             assert_eq!(ts, edge as usize);
             assert_eq!(grid.len(), (edge * edge) as usize);
@@ -2959,19 +3182,75 @@ mod tests {
         }
     }
 
+    /// A `w`x`h` lossless-WebP (`VP8L`) Terrarium tile of uniform 100 m
+    /// terrain — the format Mapterhorn serves.
+    #[cfg(test)]
+    fn terrarium_webp(w: u32, h: u32) -> Vec<u8> {
+        let px: Vec<u8> =
+            [128u8, 100, 0].iter().copied().cycle().take((w * h * 3) as usize).collect();
+        let mut out = Vec::new();
+        image_webp::WebPEncoder::new(&mut out)
+            .encode(&px, w, h, image_webp::ColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_webp_tile_decodes_exactly_like_a_png_one() {
+        // Mapterhorn serves 512 px lossless WebP under the Terrarium encoding.
+        // The format is sniffed from the bytes, so the job carries no format
+        // field and the same job runs against either source.
+        for edge in [256u32, 512] {
+            let (grid, ts) = decode_tile(&terrarium_webp(edge, edge), dec_terrarium).unwrap();
+            assert_eq!(ts, edge as usize);
+            assert_eq!(grid.len(), (edge * edge) as usize);
+            assert_eq!(grid[0], 100.0);
+            assert_eq!(grid[grid.len() - 1], 100.0);
+        }
+        // The geometry rule is the same in both arms.
+        let e = decode_tile(&terrarium_webp(256, 128), dec_terrarium).unwrap_err().to_string();
+        assert!(e.contains("256x128"), "the dimensions must be named; got {e:?}");
+        assert!(e.contains(TILE_GEOMETRY_ERR), "must be classed as geometry; got {e:?}");
+        // Garbage with a RIFF/WEBP header is a decode error, never a panic.
+        let e = decode_tile(b"RIFF\0\0\0\0WEBPjunk", dec_terrarium).unwrap_err().to_string();
+        assert!(e.contains("decode"), "must be classed as decode; got {e:?}");
+    }
+
     #[test]
     fn a_tile_the_assembly_cannot_place_is_refused_naming_what_arrived() {
         // No square grid to fold into: refuse rather than guess a stride.
-        let e = decode_png(&terrarium_png(256, 128, png::BitDepth::Eight), dec_terrarium)
+        let e = decode_tile(&terrarium_png(256, 128, png::BitDepth::Eight), dec_terrarium)
             .unwrap_err().to_string();
         assert!(e.contains("256x128"), "the dimensions must be named; got {e:?}");
         assert!(e.contains(TILE_GEOMETRY_ERR), "must be classed as geometry; got {e:?}");
 
         // 16 bits per channel puts two bytes where this decoder reads one.
-        let e = decode_png(&terrarium_png(256, 256, png::BitDepth::Sixteen), dec_terrarium)
+        let e = decode_tile(&terrarium_png(256, 256, png::BitDepth::Sixteen), dec_terrarium)
             .unwrap_err().to_string();
         assert!(e.contains("16-bit"), "the depth must be named; got {e:?}");
         assert!(e.contains(TILE_GEOMETRY_ERR), "must be classed as geometry; got {e:?}");
+    }
+
+    #[test]
+    fn a_child_cut_from_its_ancestor_repeats_the_right_quadrant() {
+        // A 4 px ancestor numbered 0..16 row-major; the child one zoom finer
+        // at (x=3, y=3) is the south-east quadrant of parent (1, 1) — cols
+        // 2..4, rows 2..4 — each sample doubled. Three zooms up, child
+        // (x=5, y=0) of ancestor (0, 0) maps to column 2 of row 0, every
+        // sample ×8. Voids stay void.
+        let anc: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let c = upsample_from_ancestor(&anc, 4, 1, 3, 3);
+        assert_eq!(&c[0..4], &[10.0, 10.0, 11.0, 11.0]);
+        assert_eq!(&c[12..16], &[14.0, 14.0, 15.0, 15.0]);
+        let c = upsample_from_ancestor(&anc, 4, 3, 5, 0);
+        assert!(c.iter().all(|&v| v == 2.0), "{c:?}");
+        let mut holed = anc.clone();
+        holed[10] = -32768.0;
+        let c = upsample_from_ancestor(&holed, 4, 1, 3, 3);
+        assert_eq!(c[0], NO_TILE_M);
+        assert_eq!(c[2], 11.0);
+        // An ancestor of the wrong size cannot be addressed: all void.
+        assert!(upsample_from_ancestor(&anc[..12], 4, 1, 3, 3).iter().all(|&v| v == NO_TILE_M));
     }
 
     #[test]
