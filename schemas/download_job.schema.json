@@ -40,7 +40,7 @@
         "null"
       ],
       "minimum": 1,
-      "description": "Concurrent HTTP connections. Defaults to 256 when absent."
+      "description": "Concurrent HTTP connections. Defaults to 256 when absent. The CLI download starts here and uses it as the ceiling of an adaptive (AIMD) window that shrinks only on congestion (CONTRACT 9b, changelog 27)."
     },
     "buildings_pbf_dir": {
       "type": [
@@ -83,6 +83,42 @@
           "type": "number"
         }
       }
+    },
+    "tile_deadline_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0,
+      "maximum": 86400,
+      "description": "Per-source-tile wall-clock cap in seconds across all attempts, back-offs and Retry-After waits; absent = 60. At expiry the tile is a `timeout` failure and goes to the parent fill. CLI download only. Additive, aether_converter >= 0.2.6 (CONTRACT 9b, changelog 28)."
+    },
+    "repair_source_tiles": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          }
+        ],
+        "items": false,
+        "minItems": 3,
+        "maxItems": 3
+      },
+      "description": "Source tiles [z, x, y] (z = the job's zoom) to fetch again and patch into the job's EXISTING .abt files; only output pixels wholly determined by listed tiles are rewritten, every other byte is unchanged. Each tile must intersect an output tile and every touched output file must exist, else the run fails before any request. Additive, aether_converter >= 0.2.6 (older builds ignore it and download the whole job); CONTRACT 9b 'Repair jobs', changelog 28."
     }
   },
   "$defs": {

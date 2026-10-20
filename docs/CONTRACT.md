@@ -316,6 +316,68 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    (the native paths never did): a 404 used to cost three retries and
 >    ~3 s before it was accepted as the answer. `.abt` bytes change only for
 >    jobs that had 404 tiles in the browser path (void → coarser terrain).
+> 26. **`ingest` decodes tiled LZW sources with padded edge tiles (§9a;
+>    2026-10-20).** A tiled LZW GeoTIFF whose width is not a multiple of the
+>    tile width — every swissALTI3D 2 m file (500 px, 128² tiles) — failed
+>    each output tile with `loading source "…": no lzw end code found`. Cause:
+>    the `tiff` 0.11 row-by-row read of a padded tile skips the padding with a
+>    small read, which weezl 0.1 can answer with a false `NoProgress`
+>    (image-rs/image-tiff#395; fixed upstream only by the unreleased weezl 0.2
+>    upgrade). `ingest` now reads every strip/tile whole and crops the padding
+>    itself. Files that decoded before give byte-identical `.abt` output; the
+>    job JSON and messages are unchanged.
+> 27. **CLI `download` transport (§1.2, §9b; 2026-10-20).** Five changes,
+>    none to the job JSON or the `.abt` bytes:
+>    (a) **Retries are decided by error type.** The old rule substring-matched
+>    the error message for decode words, and reqwest quotes the URL in every
+>    transport error — so for any `….png` source (AWS Terrarium) every
+>    connection reset and pre-header timeout was treated as permanent, never
+>    retried, and became a `[Degraded]` tile (which the Waveshed plugin then
+>    re-downloads as a whole output tile). They are now retried. Tally side
+>    effect: a truncated body (reqwest body error that is not a timeout) is
+>    classed `connect`, no longer `decode`.
+>    (b) **Timeouts:** 10 s connect + 15 s read-idle instead of a 30 s total.
+>    Measured on a 7 Mbit/s link at 256 connections: the old client ran 809 s,
+>    timed out 4925 attempts, discarded 248 MB and failed the run; now 148 s,
+>    no error. `Retry-After` is honoured (per tile and as a gate on new
+>    requests).
+>    (c) **Strips are assembled in completion order** (a straggler no longer
+>    idles the strips behind it) and the prefetch depth is re-sized from the
+>    real source tile edge once the first tile decodes (it assumed 512 px
+>    throughout); additive line `[Download] source tiles are <e> px: prefetch
+>    depth <d>`. Output is byte-identical.
+>    (d) **`[Download] SLOW tile` is replaced by `[Download] STALL tile`** and
+>    a `[Stats] STALL:` summary (§1.2). SLOW was undocumented and had no
+>    parsing consumer.
+>    (e) **Adaptive connection window** (AIMD, ceiling and start =
+>    `max_connections`, default still 256; §9b) and the additive `[Stats]
+>    Connection window:` line. The native in-memory downloader gets (a), the
+>    STALL lines and `Retry-After`, not the window; the browser path is
+>    unchanged.
+> 28. **CLI `download`: shared ancestor fetches, a per-tile deadline, and
+>    repair jobs (§1.2, §1.5, §9b; additive; `aether_converter` 0.2.6;
+>    2026-10-20).** (a) **Each ancestor tile is fetched at most once per
+>    run.** The parent fill (404 repair and degraded fill alike) used to let
+>    every failed tile fetch all of its ancestors itself — an all-404 z15 run
+>    of 13,700 tiles made 123,300 ancestor requests. A per-run cache now
+>    starts each `(z, x, y)` once; concurrent and later requesters share the
+>    result, failed ancestors are remembered as failed, decoded ones are kept
+>    up to 256 MB (oldest dropped first, refetched if needed again). Each
+>    ancestor request is capped at 30 s; a tile still waits at most 30 s for
+>    its ancestors. Pixel mapping unchanged: `.abt` bytes are identical for
+>    the same tile answers. (b) **Per-tile deadline:** 60 s per source tile
+>    across all attempts, back-offs and `Retry-After` waits (optional job
+>    field `tile_deadline_s`). At expiry the tile is a `timeout` failure
+>    (also a congestion event for the adaptive window) and goes to the
+>    parent fill. A silent server used to hold a tile 143 s, a trickle with
+>    gaps under 15 s without limit; now 90 s at most including the fill.
+>    Tally side effect: a tile whose retries could not fit in the deadline is
+>    classed `timeout`, not by its last attempt's error. (c) **Repair jobs:**
+>    optional `repair_source_tiles: [[z, x, y], …]` fetches only those tiles
+>    and patches them into the job's existing `.abt` files, leaving every
+>    other byte unchanged (§9b *Repair jobs*). The `aether_converter` version
+>    is 0.2.6 so consumers can gate on it (§1.5) — older builds ignore the
+>    field and would re-download the whole job over the files.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -550,10 +612,42 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   it as degraded. Degraded tiles do not count toward the fatal majority below.
 
   `[Stats] Retries: <n> (up to <m> per failed tile)` — `m` is 5 for the CLI
-  `download`, 3 for the native in-memory downloader. Each tile's parent
-  backfill is bounded by one 30 s deadline (all ancestor zooms requested
-  concurrently), so a tile's worst case is `6 × 30 s` attempts `+ 23 s`
-  backoff `+ 30 s` = 233 s.
+  `download`, 3 for the native in-memory downloader. What is retried is
+  decided by the error's **type**, never its text: every transport failure
+  (connect, reset, connect/read-idle timeout, truncated body), HTTP 429 and
+  5xx retry; any other status and any decode/geometry error is final. The
+  backoff is 1, 2, 4, 8, 8 s, or the server's `Retry-After` (delta-seconds,
+  capped at 120 s) when that is longer. Native clients use a 10 s connect
+  timeout and a 15 s **read-idle** timeout — no total per-request timeout, so a
+  body that keeps arriving is never cut off. Each tile's parent backfill is
+  bounded by one 30 s deadline (all ancestor zooms requested concurrently), so
+  a silent server costs a tile at most `6 × 15 s + 23 s + 30 s` = 143 s.
+  Since changelog item 28 the CLI `download` also caps each source tile at
+  **60 s across all attempts, back-offs and `Retry-After` waits** (job field
+  `tile_deadline_s`, §9b): a tile still unfinished then — silent, or trickling
+  with gaps under 15 s, which had no limit before — stops as a `timeout`
+  failure and goes to the parent fill, so its worst case is 60 + 30 = 90 s.
+  Each ancestor tile is fetched at most once per run and shared by every
+  descendant that needs it.
+
+  Additive lines (CLI `download`, changelog item 27; not frozen in wording —
+  match the prefix):
+
+  ```
+  [Download] STALL tile z=<z>/x=<x>/y=<y>: first byte after <s>s, longest body gap <s>s
+  [Download] (suppressing further stall warnings; [Stats] STALL counts them all)
+  [Stats] STALL: <n> of <total> tile(s) waited > 5 s for the first byte or between body chunks
+  [Stats] Connection window: start <max>, min <m>, final <f> (adaptive <lo>..=<max>, <k> back-off(s))
+  ```
+
+  A STALL tile is one with an attempt that waited more than 5 s for its
+  response head or between two body chunks; at most 5 per-tile lines, then
+  the suppression note. The `[Stats] STALL:` line follows `[Stats] Tile
+  latency:` and appears only when `n > 0`. The window line follows it and is
+  always printed by the CLI `download` (see `max_connections`, §9b). They
+  replace the undocumented `[Download] SLOW tile …` line (wall time > 5 s),
+  which flagged nearly every tile on any link where the connections outnumber
+  the bandwidth and is no longer printed.
 * **Disk-space failure — `[MPT-critical]` / QGIS-critical.** When the estimated
   `.abt` output exceeds free space, `download` **fails** (`anyhow::bail!`, non-zero
   exit). The exact and only emitted string (`crates/aether_converter/src/download.rs`,
@@ -792,6 +886,7 @@ Known capability gates consumers rely on:
 |------------|-----------------|
 | `aether_core` coverage at resolutions outside `{2, 5, 10, 30}` m on the GPU backend (the hardcoded list was removed; the CPU/WASM paths never had it) | `aether_core 0.4.3` |
 | `aether_core --fingerprint` | `aether_core 0.4.2` |
+| `download` job fields `repair_source_tiles` and `tile_deadline_s` (§9b; older builds ignore both silently — a repair job would run as a full download over the existing files) | `aether_converter 0.2.6` |
 
 ---
 
@@ -1616,10 +1711,12 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `encoding` | string | **required** | `"terrarium"` or `"mapbox"` (case-insensitive). Any other value fails: `Unknown encoding '<x>'`. |
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
-| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. |
+| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` starts at this value and treats it as the ceiling of an adaptive (AIMD) window: once a second it halves (floor `min(16, max_connections)`) after ≥ 3 timeouts/resets/HTTP 429/503 in that second or a median body-chunk gap over 5 s, and grows by 8 after a clean second. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` (§1.2). |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
+| `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **60**. At expiry the tile stops as a `timeout` failure (counted by the adaptive window as a congestion event) and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
+| `repair_source_tiles` | array of `[z, x, y]`? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6 (gate on `--version`, §1.5: older builds ignore the field and download the whole job). Fetch **only** these source tiles and patch them into the job's **existing** `.abt` files — see *Repair jobs* below. |
 
 `SubTileSpec`:
 
@@ -1684,6 +1781,50 @@ classifier as the tally: `timeout`, `connect`, `http_<code>` (any status),
 `decode`, `other`. This table describes the file-based CLI `download`; the
 in-memory/WASM downloaders never fill a failed tile from parents, so for them
 every failure is the last row.
+
+**Repair jobs (`repair_source_tiles`, changelog 28).** A job carrying
+`repair_source_tiles: [[z, x, y], …]` is the full job (same `url_template`,
+`encoding`, `output_dir`, `zoom`, `tiles`) plus the list of source tiles to
+fetch again — typically the tiles a previous run named on `[Degraded]` lines.
+The CLI `download` then:
+
+1. validates before any request, failing (non-zero exit, nothing written)
+   with: `repair_source_tiles is empty — nothing to repair`;
+   `repair_source_tiles: tile [z, x, y] is not at the job's zoom <zoom>`;
+   `repair_source_tiles: tile [z, x, y] does not intersect any output tile of this job`;
+   `repair_source_tiles: output tile <path> does not exist — a repair patches the files of a finished download; run the job without repair_source_tiles first`
+   (every output file a listed tile touches must exist); or
+   `repair_source_tiles: <path> is not this job's output tile (…)` when its
+   44-byte header or length differs from what the job's spec writes;
+2. fetches only the listed tiles (duplicates once) with the normal retries,
+   per-tile deadline, parent fill and classification, and prints the normal
+   protocol restricted to them — `[Download] <pct>% (<done>/<n>) …`,
+   `[Degraded] …`, the `[Stats]` block with `<total>` = the number of listed
+   tiles — preceded by
+   `[Download] repair: z=<z> <n> source tile(s) into <m> existing output tile(s) connections=<c>`
+   and followed by
+   `[Download] repair: <p> px rewritten in <k> output tile(s)` (and, when some
+   listed tile still failed with nothing to fill it,
+   `[Download] repair: <f> listed tile(s) still failed with no coarser fill; their pixels were left unchanged`);
+   informational, match the prefix;
+3. rewrites an output pixel **only** when every source sample under its
+   footprint belongs to a listed tile that produced data (arrived, or filled
+   from an ancestor). Such a pixel gets exactly the bytes a full run with the
+   same tile answers writes (same grid, same area averaging). Every other
+   byte — header, row padding, all other pixels — is left unchanged,
+   including the one-pixel border column where a footprint straddles a
+   listed and an unlisted tile (list the neighbour too to rewrite it) and
+   the pixels of a listed tile that failed with no ancestor (a void would be
+   no better than what is there);
+4. applies the majority rule of §1.2 over the listed tiles: a fatal repair
+   fails with `Tile download failed: <f> of <n> listed repair tiles (<p>%) could not be fetched; nothing was written — the existing .abt files are unchanged. Errors: <breakdown>.`
+   and, unlike a full run, never removes a file;
+5. with `buildings_pbf_dir`, rasterizes buildings onto the repaired terrain
+   and takes only the repaired pixels from it (`[Buildings] repair: …`); a
+   building straddling the repair edge is resolved over a mix of repaired
+   and already-built pixels.
+
+`fetch_bounds` stays rejected on this path, as for every file-based run.
 
 ---
 

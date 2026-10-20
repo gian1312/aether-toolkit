@@ -822,6 +822,71 @@ fn tiff_decoder(file: File, buf_bytes: usize) -> Result<Decoder<BufReader<File>>
     Ok(Decoder::new(BufReader::with_capacity(buf_bytes, file))?.with_limits(Limits::unlimited()))
 }
 
+/// Width of one stored chunk row: `(samples, bytes)`. A strip is as wide as
+/// the image; a tile is its stored width, padding included. `None` for
+/// sub-byte sample depths, which keep the plain `read_chunk` path.
+fn chunk_row(dec: &mut Decoder<BufReader<File>>) -> Result<Option<(usize, usize)>> {
+    let bits = match dec.colortype()? {
+        tiff::ColorType::Gray(b) => b,
+        tiff::ColorType::Multiband { bit_depth, num_samples: 1 } => bit_depth,
+        _ => return Ok(None),
+    };
+    if bits == 0 || bits % 8 != 0 {
+        return Ok(None);
+    }
+    let samples = if matches!(dec.get_chunk_type(), tiff::decoder::ChunkType::Tile) {
+        dec.chunk_dimensions().0
+    } else {
+        dec.dimensions()?.0
+    } as usize;
+    Ok(Some((samples, samples * (bits as usize / 8))))
+}
+
+/// Decode chunk `idx` to its `dw x dh` data samples, row-major.
+///
+/// The chunk is read WHOLE — output row stride = the stored chunk row — and
+/// the right-edge padding is cropped here. `read_chunk` / `read_image`
+/// instead read a padded tile row by row and skip the padding with a small
+/// read; weezl 0.1 (required by tiff 0.11) can answer that read with
+/// `NoProgress` although it produced output, and tiff turns it into
+/// "no lzw end code found". Every right-edge tile of a tiled LZW GeoTIFF
+/// whose width is not a multiple of the tile width can hit it (swissALTI3D
+/// 2 m: 500 px, 128² tiles). image-rs/image-tiff#395; fixed upstream only by
+/// the weezl 0.2 upgrade (unreleased as of tiff 0.11.3). Go back to
+/// `read_chunk` once a tiff release on weezl 0.2 is in the lockfile — the
+/// canary in tests/test_lzw_edge_tiles.rs says when.
+fn decode_chunk(
+    dec: &mut Decoder<BufReader<File>>,
+    idx: u32,
+    row: Option<(usize, usize)>,
+    nodata: Option<f64>,
+    value_xform: Option<(f64, f64)>,
+) -> Result<Vec<i16>> {
+    let Some((row_samples, row_bytes)) = row else {
+        return Ok(convert_samples(dec.read_chunk(idx)?, nodata, value_xform));
+    };
+    let (dw, dh) = dec.chunk_data_dimensions(idx);
+    let (dw, dh) = (dw as usize, dh as usize);
+    let mut buf = DecodingResult::U8(Vec::new());
+    dec.read_chunk_to_buffer(&mut buf, idx, row_bytes)?;
+    let mut full = convert_samples(buf, nodata, value_xform);
+    if dw == row_samples {
+        full.truncate(dw * dh);
+        return Ok(full);
+    }
+    if dw > row_samples || full.len() < (dh - 1) * row_samples + dw {
+        anyhow::bail!(
+            "TIFF chunk {}: {} samples decoded for {}x{} data in {}-sample rows",
+            idx, full.len(), dw, dh, row_samples
+        );
+    }
+    let mut out = Vec::with_capacity(dw * dh);
+    for y in 0..dh {
+        out.extend_from_slice(&full[y * row_samples..y * row_samples + dw]);
+    }
+    Ok(out)
+}
+
 /// TIFF compression codes this build decodes. Everything else is refused up
 /// front, naming the file and the codec, so a caller can route that one file
 /// through GDAL instead of losing the batch.
@@ -1194,7 +1259,35 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
     let hdr = read_tiff_header(&mut decoder, path, nodata_override)?;
     let (w, h) = (hdr.geom.width, hdr.geom.height);
 
-    let data = convert_samples(decoder.read_image()?, hdr.nodata, hdr.value_xform);
+    // Assembled chunk by chunk through `decode_chunk`, not `read_image`: the
+    // latter takes the padded-row path that trips weezl 0.1 (see there).
+    let tiled = matches!(decoder.get_chunk_type(), tiff::decoder::ChunkType::Tile);
+    let (cw, ch) = decoder.chunk_dimensions();
+    if cw == 0 || ch == 0 {
+        anyhow::bail!("source {:?}: zero-sized TIFF strip/tile ({}x{})", path, cw, ch);
+    }
+    let (cw, across) = if tiled { (cw, w.div_ceil(cw)) } else { (w, 1) };
+    let row = chunk_row(&mut decoder)?;
+    let mut data = vec![VOID_ELEV; w as usize * h as usize];
+    for cy in 0..h.div_ceil(ch) {
+        for cx in 0..across {
+            let chunk = decode_chunk(&mut decoder, cy * across + cx, row, hdr.nodata, hdr.value_xform)?;
+            let (x0, y0) = ((cx * cw) as usize, (cy * ch) as usize);
+            let dw = (cw as usize).min(w as usize - x0);
+            let dh = (ch as usize).min(h as usize - y0);
+            if chunk.len() != dw * dh {
+                anyhow::bail!(
+                    "source {:?}: decoded {} samples for a {}x{} chunk of a {}x{} \
+                     raster — the file is not a single-band elevation grid",
+                    path, chunk.len(), dw, dh, w, h
+                );
+            }
+            for y in 0..dh {
+                let dst = (y0 + y) * w as usize + x0;
+                data[dst..dst + dw].copy_from_slice(&chunk[y * dw..(y + 1) * dw]);
+            }
+        }
+    }
 
     // Belt over the braces above: the samplers index `y*w + x`, so a decode
     // that returned anything but exactly w*h samples (interleaved bands,
@@ -1311,6 +1404,7 @@ fn load_window(
     // — holding a whole window's worth of decoded chunks beside the window
     // itself would double the band's footprint.
     let mut decoder: Option<Decoder<BufReader<File>>> = None;
+    let mut row: Option<(usize, usize)> = None;
     let mut pending: Vec<(ChunkKey, Arc<Vec<i16>>)> = Vec::new();
     for (slot, &(key, cx0, cy0, dw, dh)) in got.into_iter().zip(&wanted) {
         let data = match slot {
@@ -1327,10 +1421,12 @@ fn load_window(
                         if decoder.is_none() {
                             let file = File::open(&src.path)
                                 .with_context(|| format!("Opening {:?}", src.path))?;
-                            decoder = Some(tiff_decoder(file, 64 * 1024)?);
+                            let mut dec = tiff_decoder(file, 64 * 1024)?;
+                            row = chunk_row(&mut dec)?;
+                            decoder = Some(dec);
                         }
                         let dec = decoder.as_mut().unwrap();
-                        let data = convert_samples(dec.read_chunk(key.1)?, *nodata, *value_xform);
+                        let data = decode_chunk(dec, key.1, row, *nodata, *value_xform)?;
                         if data.len() != dw as usize * dh as usize {
                             anyhow::bail!(
                                 "source {:?}: decoded {} samples for a {}x{} chunk of a {}x{} \

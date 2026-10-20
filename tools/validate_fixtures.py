@@ -187,6 +187,20 @@ def validate_download(obj, ctx):
                 check(_is_num(t.get("ul_lon")), f"{c}.ul_lon: number")
                 check(isinstance(t.get("size_px"), int) and not isinstance(t.get("size_px"), bool), f"{c}.size_px: integer")
                 check(_is_num(t.get("resolution_m")) and t.get("resolution_m", 0) > 0, f"{c}.resolution_m: positive number")
+    # Additive, changelog 28 (aether_converter >= 0.2.6).
+    if obj.get("tile_deadline_s") is not None:
+        v = obj["tile_deadline_s"]
+        check(_is_num(v) and 0 < v <= 86400, f"{ctx}.tile_deadline_s: number in (0, 86400]")
+    if obj.get("repair_source_tiles") is not None:
+        r = obj["repair_source_tiles"]
+        check(isinstance(r, list), f"{ctx}.repair_source_tiles: array of [z, x, y]")
+        if isinstance(r, list):
+            for i, t in enumerate(r):
+                check(isinstance(t, list) and len(t) == 3
+                      and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in t),
+                      f"{ctx}.repair_source_tiles[{i}]: [z, x, y] of non-negative integers")
+                if isinstance(t, list) and t and isinstance(obj.get("zoom"), int):
+                    check(t[0] == obj["zoom"], f"{ctx}.repair_source_tiles[{i}]: z must equal zoom")
 
 
 def validate_batch_links(path, ctx):
