@@ -276,3 +276,83 @@ fn a_tile_never_holds_more_decoded_source_than_its_budgets() {
     let (reference, _) = run(&job, whole_file_cache(&job), &IngestOptions::default()).unwrap();
     assert!(bytes == reference, "banded output differs from the whole-file path");
 }
+
+/// A stack whose top source covers the whole tile but has void holes: an
+/// `.abt` of 300 rows (two 256-row strips on the streaming path) above an
+/// LV95 tile that lies inside it and a geographic base under both. The LV95
+/// tile is shadowed — its window is decoded only when the sampler falls
+/// through a hole to it — and the `.abt` is read strip by strip. Neither may
+/// change a byte against the whole-file path.
+#[test]
+fn a_shadowed_stack_streams_byte_identical_to_the_whole_file_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+
+    let top = d.join("top.abt");
+    let n = 300usize;
+    let deg = 5.0 / 111111.0;
+    let mut vt: Vec<i16> = (0..n * n).map(|i| 9000 + (i % n) as i16 + (i / n) as i16).collect();
+    for (r0, r1, c0, c1) in [(20, 60, 10, 60), (150, 170, 150, 200), (0, n, 120, 121)] {
+        for r in r0..r1 {
+            for c in c0..c1 {
+                vt[r * n + c] = VOID_ELEV;
+            }
+        }
+    }
+    write_abt(&top, n as u16, UL_LAT + 0.0002, UL_LON - 0.0002, deg, &vt);
+
+    let mid = d.join("mid_lv95_i16.tif");
+    let (w, h) = (203u32, 197u32);
+    let vm: Vec<i16> = (0..w * h).map(|i| (1000 + (i % w) + 3 * (i / w)) as i16).collect();
+    write_tif(
+        &mid,
+        &Tif {
+            w,
+            h,
+            px: Px::I16(vm),
+            layout: Layout::Tiles(16, 16),
+            compression: 8,
+            geo: Geo::TieScale(E0 - 100.0, N0 + 50.0, 2.5, 2.5),
+            geokeys: &[(3072, 2056)],
+            nodata: None,
+            gdal_metadata: None,
+        },
+    );
+
+    let base = d.join("base_wgs84_u16.tif");
+    let (w, h) = (120u32, 120u32);
+    let vb: Vec<u16> = (0..w * h).map(|i| 3000 + (i % w) as u16 + (i / w) as u16).collect();
+    write_tif(
+        &base,
+        &Tif {
+            w,
+            h,
+            px: Px::U16(vb),
+            layout: Layout::Strips(9),
+            compression: 1,
+            geo: Geo::TieScale(UL_LON - 0.001, UL_LAT + 0.001, 0.0001, 0.0001),
+            geokeys: &[(2048, 4326)],
+            nodata: None,
+            gdal_metadata: None,
+        },
+    );
+
+    let job = serde_json::json!({
+        "output_path": d.join("stack.abt"),
+        "format": "r16sint",
+        "ul_lat": UL_LAT, "ul_lon": UL_LON,
+        "resolution_m": RES_M, "size_px": SIZE,
+        "sources": [{"path": top}, {"path": mid}, {"path": base}],
+    });
+    let (reference, _) = run(&job, whole_file_cache(&job), &IngestOptions::default()).unwrap();
+    let px = payload(&reference, SIZE);
+    let has = |lo: i16, hi: i16| px.iter().any(|&v| v >= lo && v < hi);
+    assert!(has(9000, 10000), "the .abt never won a pixel");
+    assert!(has(2000, 3000), "the shadowed LV95 tile never won a pixel through a hole");
+    assert!(has(6000, 7000), "the base never won a pixel");
+
+    for (band, cache) in [(1usize, 0usize), (30_000, 64 << 10), (usize::MAX, 64 << 20)] {
+        let (bytes, _) = run(&job, empty_cache(), &opts(band, cache)).unwrap();
+        assert!(bytes == reference, "band budget {band} / cache {cache}: streamed stack differs");
+    }
+}

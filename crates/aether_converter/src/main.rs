@@ -8,6 +8,7 @@ mod download;
 mod ingest;
 mod mvt;
 mod plan;
+mod tiff_io;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

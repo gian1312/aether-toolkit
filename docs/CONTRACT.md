@@ -378,6 +378,12 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    other byte unchanged (§9b *Repair jobs*). The `aether_converter` version
 >    is 0.2.6 so consumers can gate on it (§1.5) — older builds ignore the
 >    field and would re-download the whole job over the files.
+> 29. **CLI `download` progress cadence (§1.2; 2026-10-20).** The
+>    `[Download] <pct>% (<done>/<total>) — …` line is printed on every whole
+>    percent instead of every 10 %, and still once at `done == total`. Its
+>    format is unchanged; a parser that accepts any `<pct>` (the Waveshed
+>    plugin's does) sees more updates and nothing else. Job JSON, `.abt`
+>    bytes and every other line are unchanged.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -572,7 +578,10 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   resolution list, and requests over 2,000,000 tiles (`bbox too large`) all
   fail with a non-zero exit.
 * **Download progress** (stderr):
-  `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight`.
+  `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight`,
+  printed whenever `<pct>` (= `done * 100 / total`, rounded down) reaches a
+  new whole percent, and once more at `done == total` (changelog item 29;
+  it used to be every 10 %). Parse any `<pct>`, never a fixed step.
 
   > **Parsed interface (frozen).** The `download` subcommand's stdout/stderr
   > progress lines — the `[Download] …` progress format above and the

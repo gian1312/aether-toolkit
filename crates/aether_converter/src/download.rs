@@ -1884,7 +1884,9 @@ async fn download_tiles(
                     }
                 }
 
-                if pct / 10 > prev_pct / 10 || done == total {
+                // Every whole percent (CONTRACT §1.2): a large job used to sit
+                // silent for minutes between 10 % lines.
+                if pct > prev_pct || done == total {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64
                         / (1024.0 * 1024.0);
@@ -2020,7 +2022,9 @@ async fn download_strip_raw(
                     }
                 }
 
-                if pct / 10 > prev_pct / 10 || done == total {
+                // Every whole percent (CONTRACT §1.2): a large job used to sit
+                // silent for minutes between 10 % lines.
+                if pct > prev_pct || done == total {
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64
                         / (1024.0 * 1024.0);

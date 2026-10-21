@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use serde::Deserialize;
 #[cfg(feature = "native")]
 use rayon::prelude::*;
@@ -21,6 +21,7 @@ use crate::buildings::{
     DEFAULT_HEIGHT_M,
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
+use crate::tiff_io::{read_full_at, BlockReader, ChunkHeader, DirectChunks};
 #[cfg(feature = "bc6h")]
 use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
 
@@ -175,8 +176,8 @@ pub fn estimate_job_bytes(job: &IngestJob, opts: &IngestOptions) -> u64 {
     buffers + opts.band_budget_bytes as u64 + (64 << 20)
 }
 
-/// `(source id, chunk index)` — one decoded TIFF strip/tile, or (chunk 0) the
-/// whole payload of an `.abt` source.
+/// `(source id, chunk index)` — one decoded TIFF strip/tile, or one
+/// [`ABT_STRIP_ROWS`]-row strip of an `.abt` source.
 type ChunkKey = (u64, u32);
 
 struct ChunkCacheInner {
@@ -201,6 +202,9 @@ struct ChunkCacheInner {
 pub struct ChunkCache {
     inner: std::sync::Mutex<ChunkCacheInner>,
     budget: usize,
+    /// Parsed projections by proj string, for the WGS84 bounding box every
+    /// file source gets at header time (`None`: the string did not parse).
+    projs: std::sync::Mutex<HashMap<String, Option<Arc<Proj>>>>,
 }
 
 impl ChunkCache {
@@ -216,6 +220,7 @@ impl ChunkCache {
                 next_id: 0,
             }),
             budget: budget_bytes,
+            projs: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -290,7 +295,8 @@ impl ChunkCache {
         }
         // Parsed without the lock held: thousands of headers per batch must
         // not serialise every tile behind one file open.
-        let parsed = read_file_source(&spec.path, spec.nodata)?;
+        let mut parsed = read_file_source(&spec.path, spec.nodata)?;
+        parsed.wgs84_bbox = self.projected_bbox(spec, &parsed.geom);
         let mut g = self.inner.lock().unwrap();
         if let Some(m) = g.metas.get(&key) {
             return Ok(m.clone());
@@ -301,6 +307,72 @@ impl ChunkCache {
         g.metas.insert(key, m.clone());
         Ok(m)
     }
+
+    /// The WGS84 bounding box of a projected file source under the CRS
+    /// *spec* resolves to (the job's `crs`, else the file's GeoKeys), with
+    /// the proj string it was computed for. Best effort: anything that does
+    /// not resolve here is left to `process_tile_opts`, which raises the
+    /// proper error. Geographic sources need no transform and get `None`.
+    fn projected_bbox(&self, spec: &SourceSpec, geom: &SourceGeom) -> Option<(String, Option<[f64; 4]>)> {
+        if geom.is_abt {
+            return None;
+        }
+        let crs = spec.crs.as_ref().or(geom.embedded_crs.as_ref())?;
+        let proj_string = crs_to_proj_string(crs, &spec.path).ok()?;
+        let proj = {
+            let cached = self.projs.lock().unwrap().get(&proj_string).cloned();
+            match cached {
+                Some(p) => p,
+                None => {
+                    let p = Proj::from_proj_string(&proj_string).ok().map(Arc::new);
+                    self.projs.lock().unwrap().insert(proj_string.clone(), p.clone());
+                    p
+                }
+            }
+        }?;
+        if proj.is_latlong() {
+            return None;
+        }
+        let bbox = wgs84_bbox_of_projected(geom, &proj, wgs84());
+        Some((proj_string, bbox))
+    }
+}
+
+/// WGS84 as proj4rs knows it (built once per process).
+fn wgs84() -> &'static Proj {
+    static WGS84: OnceLock<Proj> = OnceLock::new();
+    WGS84.get_or_init(|| {
+        Proj::from_proj_string("+proj=longlat +datum=WGS84 +no_defs")
+            .expect("the WGS84 proj string is a constant and always parses")
+    })
+}
+
+/// `[lon_min, lat_min, lon_max, lat_max]` of a geographic source's extent.
+fn geographic_bbox(g: &SourceGeom) -> [f64; 4] {
+    [g.origin_e, g.limit_n, g.limit_e, g.origin_n]
+}
+
+/// WGS84 bounding box `[lon_min, lat_min, lon_max, lat_max]` of a projected
+/// source's extent: its corners and edge midpoints, transformed back.
+/// `None` when a point is outside the projection's domain. Only the
+/// shadowing heuristic in [`process_tile_opts`] uses it, so its precision
+/// decides speed, never bytes.
+fn wgs84_bbox_of_projected(g: &SourceGeom, proj: &Proj, wgs84: &Proj) -> Option<[f64; 4]> {
+    let mut bb = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let em = 0.5 * (g.origin_e + g.limit_e);
+    let nm = 0.5 * (g.origin_n + g.limit_n);
+    for e in [g.origin_e, em, g.limit_e] {
+        for n in [g.origin_n, nm, g.limit_n] {
+            let mut pt = (e, n, 0.0);
+            transform(proj, wgs84, &mut pt).ok()?;
+            let (lon, lat) = (pt.0.to_degrees(), pt.1.to_degrees());
+            if !lon.is_finite() || !lat.is_finite() {
+                return None;
+            }
+            bb = [bb[0].min(lon), bb[1].min(lat), bb[2].max(lon), bb[3].max(lat)];
+        }
+    }
+    Some(bb)
 }
 
 /// The value written for a pixel with no terrain under it.
@@ -474,6 +546,10 @@ struct FileSource {
     path: PathBuf,
     geom: SourceGeom,
     layout: FileLayout,
+    /// For a projected source: the proj string its CRS resolved to at header
+    /// time and the source's WGS84 bounding box under it (see
+    /// [`ChunkCache::projected_bbox`]).
+    wgs84_bbox: Option<(String, Option<[f64; 4]>)>,
 }
 
 enum FileLayout {
@@ -489,10 +565,23 @@ enum FileLayout {
         chunk_h: u32,
         /// Chunks per chunk row (1 for strips).
         across: u32,
+        /// Chunk offsets and byte counts, codec, predictor, sample type and
+        /// byte order — everything a band needs to read and decode a chunk
+        /// without re-parsing the IFD. `None` for encodings the direct
+        /// decoder does not mirror (PackBits, JPEG, WebP, ZSTD, sub-byte or
+        /// multi-sample layouts, …): those re-open the `tiff` decoder per
+        /// band, over a [`BlockReader`].
+        direct: Option<DirectChunks>,
     },
-    /// An `.abt` tile: chunk 0 is the whole payload.
+    /// An `.abt` tile, read as [`ABT_STRIP_ROWS`]-row strips.
     Abt { size: usize, stride: usize },
 }
+
+/// Rows per chunk of an `.abt` source on the streaming path: a band reads and
+/// decodes only the strips its rows reach, never the whole payload.
+const ABT_STRIP_ROWS: u32 = 256;
+/// Bytes of the `.abt` header (contract §6) before the first payload row.
+const ABT_HEADER_BYTES: u64 = 44;
 
 /// Decoded source pixels covering `[x0, x1) x [y0, y1)` of one source, in
 /// half-metres; row `y` starts at `(y - y0) * stride`.
@@ -814,18 +903,40 @@ fn open_source(path: &Path, nodata_override: Option<f64>) -> Result<(File, bool)
     Ok((file, false))
 }
 
-/// A GeoTIFF decoder over *file* with the decode-buffer cap lifted.
+/// [`open_source`] for the streaming path: the file behind a [`BlockReader`]
+/// whose first block — fetched with one positioned read — also answers the
+/// magic sniff. The reader sits just past the magic for an `.abt`, at 0 for
+/// anything else.
+fn open_source_blocks(path: &Path, nodata_override: Option<f64>) -> Result<(BlockReader, bool)> {
+    use std::io::{Seek, SeekFrom};
+    let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
+    let mut reader = BlockReader::new(file);
+    let is_abt = reader.head(4).with_context(|| format!("Reading {:?}", path))? == b"AETH";
+    if is_abt {
+        if nodata_override.is_some() {
+            anyhow::bail!(
+                "source {:?}: .abt sources are self-describing — remove \"nodata\" \
+                 from this source (its voids are already the -9999 sentinel)",
+                path
+            );
+        }
+        reader.seek(SeekFrom::Start(4)).with_context(|| format!("Reading {:?}", path))?;
+    }
+    Ok((reader, is_abt))
+}
+
+/// A GeoTIFF decoder over *reader* with the decode-buffer cap lifted.
 ///
 /// The default tiff cap (~256 MB) rejects large rasters with "The Decoder
 /// limits are exceeded"; reads are bounded by the band machinery instead.
-fn tiff_decoder(file: File, buf_bytes: usize) -> Result<Decoder<BufReader<File>>> {
-    Ok(Decoder::new(BufReader::with_capacity(buf_bytes, file))?.with_limits(Limits::unlimited()))
+fn tiff_decoder<R: std::io::Read + std::io::Seek>(reader: R) -> Result<Decoder<R>> {
+    Ok(Decoder::new(reader)?.with_limits(Limits::unlimited()))
 }
 
 /// Width of one stored chunk row: `(samples, bytes)`. A strip is as wide as
 /// the image; a tile is its stored width, padding included. `None` for
 /// sub-byte sample depths, which keep the plain `read_chunk` path.
-fn chunk_row(dec: &mut Decoder<BufReader<File>>) -> Result<Option<(usize, usize)>> {
+fn chunk_row<R: std::io::Read + std::io::Seek>(dec: &mut Decoder<R>) -> Result<Option<(usize, usize)>> {
     let bits = match dec.colortype()? {
         tiff::ColorType::Gray(b) => b,
         tiff::ColorType::Multiband { bit_depth, num_samples: 1 } => bit_depth,
@@ -855,8 +966,8 @@ fn chunk_row(dec: &mut Decoder<BufReader<File>>) -> Result<Option<(usize, usize)
 /// the weezl 0.2 upgrade (unreleased as of tiff 0.11.3). Go back to
 /// `read_chunk` once a tiff release on weezl 0.2 is in the lockfile — the
 /// canary in tests/test_lzw_edge_tiles.rs says when.
-fn decode_chunk(
-    dec: &mut Decoder<BufReader<File>>,
+fn decode_chunk<R: std::io::Read + std::io::Seek>(
+    dec: &mut Decoder<R>,
     idx: u32,
     row: Option<(usize, usize)>,
     nodata: Option<f64>,
@@ -866,10 +977,14 @@ fn decode_chunk(
         return Ok(convert_samples(dec.read_chunk(idx)?, nodata, value_xform));
     };
     let (dw, dh) = dec.chunk_data_dimensions(idx);
-    let (dw, dh) = (dw as usize, dh as usize);
     let mut buf = DecodingResult::U8(Vec::new());
     dec.read_chunk_to_buffer(&mut buf, idx, row_bytes)?;
-    let mut full = convert_samples(buf, nodata, value_xform);
+    crop_chunk(convert_samples(buf, nodata, value_xform), idx, row_samples, dw as usize, dh as usize)
+}
+
+/// Crop a chunk decoded in full stored rows of *row_samples* to its
+/// `dw x dh` data samples (the right-edge padding of a tile goes).
+fn crop_chunk(mut full: Vec<i16>, idx: u32, row_samples: usize, dw: usize, dh: usize) -> Result<Vec<i16>> {
     if dw == row_samples {
         full.truncate(dw * dh);
         return Ok(full);
@@ -1255,7 +1370,7 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
     if is_abt {
         return load_abt_to_ram(path, file);
     }
-    let mut decoder = tiff_decoder(file, 1024 * 1024)?;
+    let mut decoder = tiff_decoder(BufReader::with_capacity(1024 * 1024, file))?;
     let hdr = read_tiff_header(&mut decoder, path, nodata_override)?;
     let (w, h) = (hdr.geom.width, hdr.geom.height);
 
@@ -1324,14 +1439,23 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
 /// parameters and chunk layout — no pixels. Raises every header-level hard
 /// error (no geotransform, rotation, picture, codec, `.abt` corruption) the
 /// whole-file path raises, before any pixel is decoded.
+///
+/// The parse runs over a [`BlockReader`]: the IFD and its tag data cost a few
+/// 16 KB positioned reads wherever they sit, not a refill of a large buffer
+/// at every seek the `tiff` crate makes.
 fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSource> {
-    let (file, is_abt) = open_source(path, nodata_override)?;
+    let (mut reader, is_abt) = open_source_blocks(path, nodata_override)?;
     if is_abt {
-        let mut reader = BufReader::with_capacity(64, file);
         let (geom, size, stride) = read_abt_header(path, &mut reader)?;
-        return Ok(FileSource { id: 0, path: path.to_path_buf(), geom, layout: FileLayout::Abt { size, stride } });
+        return Ok(FileSource {
+            id: 0,
+            path: path.to_path_buf(),
+            geom,
+            layout: FileLayout::Abt { size, stride },
+            wgs84_bbox: None,
+        });
     }
-    let mut decoder = tiff_decoder(file, 64 * 1024)?;
+    let mut decoder = tiff_decoder(reader)?;
     let hdr = read_tiff_header(&mut decoder, path, nodata_override)?;
     let tiled = matches!(decoder.get_chunk_type(), tiff::decoder::ChunkType::Tile);
     let (chunk_w, chunk_h) = decoder.chunk_dimensions();
@@ -1340,6 +1464,8 @@ fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSou
     }
     let across = if tiled { hdr.geom.width.div_ceil(chunk_w) } else { 1 };
     let chunk_w = if tiled { chunk_w } else { hdr.geom.width };
+    let chunks = across as usize * hdr.geom.height.div_ceil(chunk_h) as usize;
+    let direct = direct_chunks(&mut decoder, tiled, chunk_w as usize, chunks);
     Ok(FileSource {
         id: 0,
         path: path.to_path_buf(),
@@ -1350,7 +1476,43 @@ fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSou
             chunk_w,
             chunk_h,
             across,
+            direct,
         },
+        wgs84_bbox: None,
+    })
+}
+
+/// The header facts of the image *dec* points at that the direct chunk
+/// decoder needs, read from the already-parsed IFD (the offset/byte-count
+/// arrays come out of the block reader's cache). `None` when the file is
+/// outside what [`DirectChunks`] mirrors.
+fn direct_chunks<R: std::io::Read + std::io::Seek>(
+    dec: &mut Decoder<R>,
+    tiled: bool,
+    row_samples: usize,
+    chunks: usize,
+) -> Option<DirectChunks> {
+    fn short<R: std::io::Read + std::io::Seek>(dec: &mut Decoder<R>, tag: Tag) -> Option<u16> {
+        dec.find_tag_unsigned::<u16>(tag).ok().flatten()
+    }
+    let (off_tag, cnt_tag) = if tiled {
+        (Tag::TileOffsets, Tag::TileByteCounts)
+    } else {
+        (Tag::StripOffsets, Tag::StripByteCounts)
+    };
+    DirectChunks::from_header(ChunkHeader {
+        compression: short(dec, Tag::Compression).unwrap_or(1),
+        predictor: short(dec, Tag::Predictor).unwrap_or(1),
+        photometric: short(dec, Tag::PhotometricInterpretation),
+        samples_per_pixel: short(dec, Tag::SamplesPerPixel).unwrap_or(1),
+        bits_per_sample: dec.find_tag_unsigned_vec(Tag::BitsPerSample).ok().flatten().unwrap_or_else(|| vec![1]),
+        sample_format: dec.find_tag_unsigned_vec(Tag::SampleFormat).ok().flatten().unwrap_or_default(),
+        planar_config: short(dec, Tag::PlanarConfiguration).unwrap_or(1),
+        byte_order: dec.byte_order(),
+        offsets: dec.get_tag_u64_vec(off_tag).ok()?,
+        byte_counts: dec.get_tag_u64_vec(cnt_tag).ok()?,
+        row_samples,
+        chunks,
     })
 }
 
@@ -1359,8 +1521,72 @@ fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSou
 /// per band.
 type TileHold = std::sync::Mutex<HashMap<ChunkKey, Arc<Vec<i16>>>>;
 
+/// One chunk a window needs: key, image-pixel origin and data size.
+#[derive(Clone, Copy)]
+struct Wanted {
+    key: ChunkKey,
+    cx0: u32,
+    cy0: u32,
+    dw: u32,
+    dh: u32,
+}
+
+/// Largest positioned read a window makes in one call; a single chunk larger
+/// than this is still read in one.
+const MAX_RUN_BYTES: u64 = 8 << 20;
+/// Chunks this close in the file share one read (the gap is read and dropped).
+const MAX_RUN_GAP: u64 = 16 << 10;
+
+/// One positioned read covering several chunks' file ranges.
+struct Run {
+    start: u64,
+    end: u64,
+    /// `(offset, len, chunk)` in file order.
+    items: Vec<(u64, u64, Wanted)>,
+}
+
+/// Group chunk file ranges into reads: sorted by offset, neighbours at most
+/// [`MAX_RUN_GAP`] apart share one read of at most [`MAX_RUN_BYTES`].
+fn plan_runs(mut items: Vec<(u64, u64, Wanted)>) -> Vec<Run> {
+    items.sort_by_key(|it| it.0);
+    let mut runs: Vec<Run> = Vec::new();
+    for (off, len, w) in items {
+        let end = off.saturating_add(len);
+        if let Some(r) = runs.last_mut() {
+            if off <= r.end.saturating_add(MAX_RUN_GAP) && end.max(r.end) - r.start <= MAX_RUN_BYTES {
+                r.end = r.end.max(end);
+                r.items.push((off, len, w));
+                continue;
+            }
+        }
+        runs.push(Run { start: off, end, items: vec![(off, len, w)] });
+    }
+    runs
+}
+
+/// Read one run with one positioned read; the buffer is short only at end of
+/// file. A run past [`MAX_RUN_BYTES`] (one huge chunk) is clamped to the
+/// file's length first, so a corrupt byte count cannot allocate past it.
+fn read_run(file: &File, path: &Path, run: &Run) -> Result<Vec<u8>> {
+    let mut len = run.end - run.start;
+    if len > MAX_RUN_BYTES {
+        let file_len = file.metadata().with_context(|| format!("Reading {:?}", path))?.len();
+        len = len.min(file_len.saturating_sub(run.start));
+    }
+    let mut buf = vec![0u8; len as usize];
+    let got = read_full_at(file, &mut buf, run.start).with_context(|| format!("Reading {:?}", path))?;
+    buf.truncate(got);
+    Ok(buf)
+}
+
 /// Decode the window `[x0, x1) x [y0, y1)` of one file source (clamped to
 /// the file by the caller), through the chunk cache.
+///
+/// The chunks the cache does not hold are read with one positioned read per
+/// run of neighbouring chunks — one open, no IFD parse — and decoded by
+/// [`DirectChunks`] (an `.abt` strip is raw rows). A file the direct decoder
+/// does not cover, and any chunk it cannot decode, goes through the `tiff`
+/// decoder instead, so the samples (and any error) are the `tiff` crate's.
 fn load_window(
     src: &FileSource,
     (x0, x1, y0, y1): (u32, u32, u32, u32),
@@ -1375,19 +1601,19 @@ fn load_window(
     // The chunk grid, and per chunk the rectangle of image pixels it holds.
     let (cw, ch, across) = match &src.layout {
         FileLayout::Tiff { chunk_w, chunk_h, across, .. } => (*chunk_w, *chunk_h, *across),
-        FileLayout::Abt { size, .. } => (*size as u32, *size as u32, 1),
+        FileLayout::Abt { size, .. } => (*size as u32, ABT_STRIP_ROWS.min(*size as u32), 1),
     };
-    let mut wanted: Vec<(ChunkKey, u32, u32, u32, u32)> = Vec::new(); // key, cx0, cy0, dw, dh
+    let mut wanted: Vec<Wanted> = Vec::new();
     for cy in y0 / ch..=(y1 - 1) / ch {
         for cx in x0 / cw..=(x1 - 1) / cw {
             let (cx0, cy0) = (cx * cw, cy * ch);
             let dw = cw.min(g.width - cx0);
             let dh = ch.min(g.height - cy0);
-            wanted.push(((src.id, cy * across + cx), cx0, cy0, dw, dh));
+            wanted.push(Wanted { key: (src.id, cy * across + cx), cx0, cy0, dw, dh });
         }
     }
 
-    let keys: Vec<ChunkKey> = wanted.iter().map(|w| w.0).collect();
+    let keys: Vec<ChunkKey> = wanted.iter().map(|w| w.key).collect();
     let mut got = cache.get_many(&keys);
     {
         let held = hold.lock().unwrap();
@@ -1398,73 +1624,155 @@ fn load_window(
         }
     }
 
-    // Walk the chunks in order: take each from the cache or decode it, copy
-    // its overlap into the window, and let go of it at once. Fresh chunks
-    // enter the cache in small batches as they are made, never all at the end
-    // — holding a whole window's worth of decoded chunks beside the window
-    // itself would double the band's footprint.
-    let mut decoder: Option<Decoder<BufReader<File>>> = None;
-    let mut row: Option<(usize, usize)> = None;
-    let mut pending: Vec<(ChunkKey, Arc<Vec<i16>>)> = Vec::new();
-    for (slot, &(key, cx0, cy0, dw, dh)) in got.into_iter().zip(&wanted) {
-        let data = match slot {
-            Some(d) => d,
-            None => {
-                let d = Arc::new(match &src.layout {
-                    FileLayout::Abt { size, stride } => {
-                        let (file, _) = open_source(&src.path, None)?;
-                        let mut reader = BufReader::with_capacity(1024 * 1024, file);
-                        read_abt_header(&src.path, &mut reader)?;
-                        read_abt_payload(&src.path, &mut reader, *size, *stride)?
-                    }
-                    FileLayout::Tiff { nodata, value_xform, .. } => {
-                        if decoder.is_none() {
-                            let file = File::open(&src.path)
-                                .with_context(|| format!("Opening {:?}", src.path))?;
-                            let mut dec = tiff_decoder(file, 64 * 1024)?;
-                            row = chunk_row(&mut dec)?;
-                            decoder = Some(dec);
-                        }
-                        let dec = decoder.as_mut().unwrap();
-                        let data = decode_chunk(dec, key.1, row, *nodata, *value_xform)?;
-                        if data.len() != dw as usize * dh as usize {
-                            anyhow::bail!(
-                                "source {:?}: decoded {} samples for a {}x{} chunk of a {}x{} \
-                                 raster — the file is not a single-band elevation grid",
-                                src.path, data.len(), dw, dh, g.width, g.height
-                            );
-                        }
-                        data
-                    }
-                });
-                if cache.admits(d.len() * 2) {
-                    pending.push((key, d.clone()));
-                    if pending.len() >= 16 {
-                        cache.insert_many(std::mem::take(&mut pending));
-                    }
-                } else {
-                    hold.lock().unwrap().insert(key, d.clone());
-                }
-                d
-            }
-        };
-
-        let (ix0, ix1) = (x0.max(cx0), x1.min(cx0 + dw));
-        let (iy0, iy1) = (y0.max(cy0), y1.min(cy0 + dh));
+    // Copy one chunk's overlap with the window into it.
+    let mut place = |w: &Wanted, data: &[i16]| {
+        let (ix0, ix1) = (x0.max(w.cx0), x1.min(w.cx0 + w.dw));
+        let (iy0, iy1) = (y0.max(w.cy0), y1.min(w.cy0 + w.dh));
         if ix0 >= ix1 {
-            continue;
+            return;
         }
         let n = (ix1 - ix0) as usize;
         for y in iy0..iy1 {
-            let s = (y - cy0) as usize * dw as usize + (ix0 - cx0) as usize;
+            let s = (y - w.cy0) as usize * w.dw as usize + (ix0 - w.cx0) as usize;
             let d = (y - y0) as usize * ww + (ix0 - x0) as usize;
             out[d..d + n].copy_from_slice(&data[s..s + n]);
+        }
+    };
+
+    let mut misses: Vec<Wanted> = Vec::new();
+    for (slot, w) in got.into_iter().zip(&wanted) {
+        match slot {
+            Some(d) => place(w, &d),
+            None => misses.push(*w),
+        }
+    }
+
+    // Fresh chunks enter the cache in small batches as they are made, never
+    // all at the end — holding a whole window's worth of decoded chunks
+    // beside the window itself would double the band's footprint.
+    let mut pending: Vec<(ChunkKey, Arc<Vec<i16>>)> = Vec::new();
+    let mut keep = |key: ChunkKey, d: Vec<i16>| {
+        let d = Arc::new(d);
+        if cache.admits(d.len() * 2) {
+            pending.push((key, d));
+            if pending.len() >= 16 {
+                cache.insert_many(std::mem::take(&mut pending));
+            }
+        } else {
+            hold.lock().unwrap().insert(key, d);
+        }
+    };
+    let bad_len = |len: usize, w: &Wanted| {
+        anyhow::anyhow!(
+            "source {:?}: decoded {} samples for a {}x{} chunk of a {}x{} \
+             raster — the file is not a single-band elevation grid",
+            src.path, len, w.dw, w.dh, g.width, g.height
+        )
+    };
+    let open = || File::open(&src.path).with_context(|| format!("Opening {:?}", src.path));
+
+    if !misses.is_empty() {
+        match &src.layout {
+            FileLayout::Abt { size, stride } => {
+                let (size, stride) = (*size, *stride);
+                let row_bytes = size * 2;
+                let file = open()?;
+                let items = misses
+                    .iter()
+                    .map(|w| {
+                        let off = ABT_HEADER_BYTES + u64::from(w.cy0) * stride as u64;
+                        (off, (w.dh as u64 - 1) * stride as u64 + row_bytes as u64, *w)
+                    })
+                    .collect();
+                for run in plan_runs(items) {
+                    let buf = read_run(&file, &src.path, &run)?;
+                    for (off, _, w) in &run.items {
+                        let base = (off - run.start) as usize;
+                        let mut data = vec![0i16; size * w.dh as usize];
+                        for (r, row) in data.chunks_exact_mut(size).enumerate() {
+                            let s = base + r * stride;
+                            let Some(raw) = buf.get(s..s + row_bytes) else {
+                                anyhow::bail!(
+                                    "source {:?}: truncated .abt payload (row {} of {size} is \
+                                     incomplete); the file cannot be used as a terrain source",
+                                    src.path,
+                                    w.cy0 as usize + r
+                                );
+                            };
+                            // RAW half-metres — .abt already stores the target unit.
+                            for (v, px) in row.iter_mut().zip(raw.chunks_exact(2)) {
+                                *v = i16::from_le_bytes([px[0], px[1]]);
+                            }
+                        }
+                        place(w, &data);
+                        keep(w.key, data);
+                    }
+                }
+            }
+            FileLayout::Tiff { nodata, value_xform, direct: Some(direct), .. } => {
+                let file = open()?;
+                let mut lzw = None;
+                // The `tiff` decoder, opened only if a chunk needs it.
+                let mut fallback: Option<(Decoder<BlockReader>, Option<(usize, usize)>)> = None;
+                let items = misses
+                    .iter()
+                    .map(|w| {
+                        let (off, len) = direct.extent(w.key.1, w.dh as usize);
+                        (off, len, *w)
+                    })
+                    .collect();
+                for run in plan_runs(items) {
+                    let buf = read_run(&file, &src.path, &run)?;
+                    for (off, len, w) in &run.items {
+                        let lo = ((off - run.start) as usize).min(buf.len());
+                        let hi = (lo as u64 + len).min(buf.len() as u64) as usize;
+                        let decoded = direct.decode(&buf[lo..hi], w.dh as usize, &mut lzw);
+                        let data = match decoded {
+                            Some(full) => crop_chunk(
+                                convert_samples(full, *nodata, *value_xform),
+                                w.key.1,
+                                direct.row_samples,
+                                w.dw as usize,
+                                w.dh as usize,
+                            )?,
+                            None => {
+                                if fallback.is_none() {
+                                    let mut dec = tiff_decoder(BlockReader::new(open()?))?;
+                                    let row = chunk_row(&mut dec)?;
+                                    fallback = Some((dec, row));
+                                }
+                                let (dec, row) = fallback.as_mut().unwrap();
+                                decode_chunk(dec, w.key.1, *row, *nodata, *value_xform)?
+                            }
+                        };
+                        if data.len() != w.dw as usize * w.dh as usize {
+                            return Err(bad_len(data.len(), w));
+                        }
+                        place(w, &data);
+                        keep(w.key, data);
+                    }
+                }
+            }
+            FileLayout::Tiff { nodata, value_xform, direct: None, .. } => {
+                let mut dec = tiff_decoder(BlockReader::new(open()?))?;
+                let row = chunk_row(&mut dec)?;
+                for w in &misses {
+                    let data = decode_chunk(&mut dec, w.key.1, row, *nodata, *value_xform)?;
+                    if data.len() != w.dw as usize * w.dh as usize {
+                        return Err(bad_len(data.len(), w));
+                    }
+                    place(w, &data);
+                    keep(w.key, data);
+                }
+            }
         }
     }
     cache.insert_many(pending);
 
     Ok(Window { buf: WinBuf::Own(out), x0, y0, x1, y1, stride: ww })
 }
+
+
 
 /// Parse an `.abt` header (contract §6) from just past the magic.
 /// Returns the geometry, the tile size and the row stride in bytes.
@@ -1892,6 +2200,28 @@ fn px_hi(v: f64, dim: u32) -> u32 {
     }
 }
 
+/// Which candidates of one band are shadowed: a candidate (a file source with
+/// a window in this band) whose WGS84 box clipped to *band* (`[lon_min,
+/// lat_min, lon_max, lat_max]`) lies inside the box of a candidate before it
+/// in priority order — or whose box misses the band altogether. Sources
+/// without a box are never shadowed and shadow nothing.
+fn shadowed_sources(
+    rects: &[Option<(u32, u32, u32, u32)>],
+    bboxes: &[Option<[f64; 4]>],
+    band: [f64; 4],
+) -> Vec<bool> {
+    let mut shadowed = vec![false; rects.len()];
+    let mut above: Vec<[f64; 4]> = Vec::new();
+    for (i, (rect, bb)) in rects.iter().zip(bboxes).enumerate() {
+        let (Some(_), Some(bb)) = (rect, bb) else { continue };
+        let clip = [bb[0].max(band[0]), bb[1].max(band[1]), bb[2].min(band[2]), bb[3].min(band[3])];
+        shadowed[i] = !(clip[0] < clip[2] && clip[1] < clip[3])
+            || above.iter().any(|a| a[0] <= clip[0] && a[1] <= clip[1] && a[2] >= clip[2] && a[3] >= clip[3]);
+        above.push(*bb);
+    }
+    shadowed
+}
+
 /// Convert one tile with explicit memory knobs.
 ///
 /// **Streaming.** The output tile is produced in row bands. For each band
@@ -1924,19 +2254,28 @@ pub fn process_tile_opts(
     // 1.-2. Resolve every source's header (pixels come later, per band). A
     // listed source that cannot be opened or parsed is FATAL — even one this
     // tile never samples: writing the tile without it would silently drop
-    // terrain and the run would still report success.
-    let mut srcs: Vec<Src> = Vec::with_capacity(sources.len());
-    for s in &sources {
+    // terrain and the run would still report success. The headers are read
+    // in parallel (each is an open and a positioned read or two, so the pass
+    // is I/O-bound); the error reported is still the first in source order.
+    let resolve = |s: &SourceSpec| -> Result<Src> {
         let key = cache_key(s);
         let injected = cache_arc.lock().unwrap().get(&key).cloned();
-        srcs.push(match injected {
+        Ok(match injected {
             Some(img) => Src::Mem(img),
             None => Src::File(
                 chunk_cache
                     .meta(s)
                     .with_context(|| format!("loading source {:?}", key.0))?,
             ),
-        });
+        })
+    };
+    #[cfg(feature = "native")]
+    let resolved: Vec<Result<Src>> = sources.par_iter().map(resolve).collect();
+    #[cfg(not(feature = "native"))]
+    let resolved: Vec<Result<Src>> = sources.iter().map(resolve).collect();
+    let mut srcs: Vec<Src> = Vec::with_capacity(sources.len());
+    for s in resolved {
+        srcs.push(s?);
     }
     let geoms: Vec<SourceGeom> = srcs
         .iter()
@@ -1954,6 +2293,8 @@ pub fn process_tile_opts(
     let mut proj_cache: HashMap<String, (usize, Arc<Proj>)> = HashMap::new();
     let mut groups: Vec<ProjGroup> = Vec::new();
     let mut kinds: Vec<SourceKind> = Vec::with_capacity(sources.len());
+    // The proj string of each projected source (`None` for geographic ones).
+    let mut proj_strings: Vec<Option<String>> = Vec::with_capacity(sources.len());
     for (spec, img) in sources.iter().zip(&geoms) {
         // An .abt source is self-describing: geographic degrees by format
         // definition. A crs field on it is refused rather than ignored — the
@@ -1969,6 +2310,7 @@ pub fn process_tile_opts(
                 );
             }
             kinds.push(SourceKind::Geographic);
+            proj_strings.push(None);
             continue;
         }
         let crs = match (&spec.crs, &img.embedded_crs) {
@@ -1997,7 +2339,7 @@ pub fn process_tile_opts(
                 } else {
                     let group_idx = groups.len();
                     let proj = Arc::new(proj);
-                    proj_cache.insert(proj_string, (group_idx, proj.clone()));
+                    proj_cache.insert(proj_string.clone(), (group_idx, proj.clone()));
                     groups.push(ProjGroup { proj, min_scale: img.scale_x.min(img.scale_y) });
                     SourceKind::Projected(group_idx)
                 }
@@ -2006,8 +2348,28 @@ pub fn process_tile_opts(
         if let SourceKind::Projected(gi) = kind {
             groups[gi].min_scale = groups[gi].min_scale.min(img.scale_x).min(img.scale_y);
         }
+        proj_strings.push(matches!(kind, SourceKind::Projected(_)).then_some(proj_string));
         kinds.push(kind);
     }
+
+    // Each file source's WGS84 bounding box, for the per-band shadowing
+    // test below: geographic extents as they are, projected ones from the
+    // header-time box when it was computed for this same CRS.
+    let bbox_of = |i: usize| -> Option<[f64; 4]> {
+        let Src::File(f) = &srcs[i] else { return None };
+        match (&kinds[i], &proj_strings[i]) {
+            (SourceKind::Geographic, _) => Some(geographic_bbox(&geoms[i])),
+            (SourceKind::Projected(gi), Some(ps)) => match &f.wgs84_bbox {
+                Some((cached, bb)) if cached == ps => *bb,
+                _ => wgs84_bbox_of_projected(&geoms[i], &groups[*gi].proj, &wgs84),
+            },
+            _ => None,
+        }
+    };
+    #[cfg(feature = "native")]
+    let bboxes: Vec<Option<[f64; 4]>> = (0..srcs.len()).into_par_iter().map(bbox_of).collect();
+    #[cfg(not(feature = "native"))]
+    let bboxes: Vec<Option<[f64; 4]>> = (0..srcs.len()).map(bbox_of).collect();
 
     let deg_per_meter = 1.0 / 111111.0;
     let pixel_deg = job.resolution_m * deg_per_meter;
@@ -2099,11 +2461,13 @@ pub fn process_tile_opts(
         .collect();
 
     /// One row-ready source, in job priority order.
+    // `lazy` is `Some(source index)` while a shadowed source's window is not
+    // yet fetched for this row (`win` is then empty).
     enum RowSrc<'a> {
-        Geo { win: WinView<'a>, spans: &'a [(u32, u32)], py0: u32, py1: u32 },
+        Geo { win: WinView<'a>, lazy: Option<usize>, spans: &'a [(u32, u32)], py0: u32, py1: u32 },
         // `inv_x` / `inv_y` carry 1/scale per axis so the per-pixel footprint
         // maths is multiplies, not a division per pixel per candidate image.
-        Prj { img: &'a SourceGeom, win: WinView<'a>, inv_x: f64, inv_y: f64, geom_idx: usize },
+        Prj { img: &'a SourceGeom, win: WinView<'a>, lazy: Option<usize>, inv_x: f64, inv_y: f64, geom_idx: usize },
     }
 
     // Pixels a source actually reached, folded once per row. Counted before
@@ -2197,7 +2561,22 @@ pub fn process_tile_opts(
             continue; // re-plan a thinner band
         }
 
-        // Decode the band's windows, sources in parallel.
+        // Shadowing: a candidate whose WGS84 box, clipped to the band, lies
+        // inside the box of a higher-priority candidate is probably never
+        // sampled — the sampler stops at the first source with ground. Its
+        // window is decoded only if the sampling loop actually falls through
+        // to it (a void in the source above, a gap the box overstates). A
+        // window never sampled was never needed, so the bytes do not change;
+        // a mosaic of side-by-side tiles shadows nothing and loads eagerly.
+        let band_box = [
+            job.ul_lon,
+            job.ul_lat - r1 as f64 * pixel_deg,
+            job.ul_lon + out_size as f64 * pixel_deg,
+            job.ul_lat - r0 as f64 * pixel_deg,
+        ];
+        let shadowed = shadowed_sources(&rects, &bboxes, band_box);
+
+        // Decode the band's unshadowed windows, sources in parallel.
         let load = |i: usize| -> Result<Option<Window>> {
             match (&srcs[i], rects[i]) {
                 (Src::File(f), Some(rect)) => load_window(f, rect, chunk_cache, &hold)
@@ -2206,17 +2585,30 @@ pub fn process_tile_opts(
                 _ => Ok(None),
             }
         };
+        let eager = |i: usize| if shadowed[i] { Ok(None) } else { load(i) };
         #[cfg(feature = "native")]
-        let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).into_par_iter().map(load).collect();
+        let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).into_par_iter().map(eager).collect();
         #[cfg(not(feature = "native"))]
-        let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).map(load).collect();
+        let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).map(eager).collect();
         let mut windows: Vec<Option<Window>> = Vec::with_capacity(loaded.len());
         for w in loaded {
             windows.push(w?);
         }
-        let held: usize = hold.lock().unwrap().values().map(|d| d.len() * 2).sum();
-        let band_bytes = windows.iter().flatten().map(Window::owned_bytes).sum::<usize>() + held;
-        peak_window_bytes = peak_window_bytes.max(band_bytes);
+
+        // Shadowed windows, decoded once on first use by whichever row needs
+        // them (other rows wait for that one decode).
+        let lazy: Vec<OnceLock<Result<Option<Window>>>> = (0..srcs.len()).map(|_| OnceLock::new()).collect();
+        let lazy_failed = AtomicBool::new(false);
+        let lazy_view = |i: usize| -> WinView<'_> {
+            match lazy[i].get_or_init(|| load(i)) {
+                Ok(Some(w)) => w.view(),
+                Ok(None) => WinView::EMPTY,
+                Err(_) => {
+                    lazy_failed.store(true, Ordering::Relaxed);
+                    WinView::EMPTY
+                }
+            }
+        };
 
         let views: Vec<WinView> = windows
             .iter()
@@ -2240,14 +2632,17 @@ pub fn process_tile_opts(
             let row_lat = row_lat_of(y);
             let row_geoms = &band_geoms[k];
 
-            // Row candidates, in source priority order.
+            // Row candidates, in source priority order. A shadowed source
+            // carries its index in `lazy` until the row first needs it.
             let mut row_srcs: Vec<RowSrc> = Vec::with_capacity(sources.len());
             for (i, (kind, img)) in kinds.iter().zip(&geoms).enumerate() {
+                let lazy = shadowed[i].then_some(i);
                 match kind {
                     SourceKind::Geographic => {
                         if let Some((py0, py1)) = geo_row_span(img, row_lat, pixel_deg) {
                             row_srcs.push(RowSrc::Geo {
                                 win: views[i],
+                                lazy,
                                 spans: geo_x_spans[i].as_deref().unwrap(),
                                 py0,
                                 py1,
@@ -2260,6 +2655,7 @@ pub fn process_tile_opts(
                                 row_srcs.push(RowSrc::Prj {
                                     img,
                                     win: views[i],
+                                    lazy,
                                     inv_x: 1.0 / img.scale_x,
                                     inv_y: 1.0 / img.scale_y,
                                     geom_idx: *gi,
@@ -2278,18 +2674,22 @@ pub fn process_tile_opts(
                 let mut cached_geom = usize::MAX;
                 let mut cell = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
 
-                for src in &row_srcs {
+                for src in row_srcs.iter_mut() {
                     match src {
-                        RowSrc::Geo { win, spans, py0, py1 } => {
+                        RowSrc::Geo { win, lazy, spans, py0, py1 } => {
                             let (px0, px1) = spans[x];
                             if px0 < px1 {
+                                if let Some(i) = *lazy {
+                                    *lazy = None;
+                                    *win = lazy_view(i);
+                                }
                                 if let Some(v) = sample_cell(win, px0, px1, *py0, *py1, &mut row_miss) {
                                     val = v;
                                     break;
                                 }
                             }
                         }
-                        RowSrc::Prj { img, win, inv_x, inv_y, geom_idx } => {
+                        RowSrc::Prj { img, win, lazy, inv_x, inv_y, geom_idx } => {
                             if *geom_idx != cached_geom {
                                 // The cell this output pixel stands for: one
                                 // output pixel wide and one output row tall,
@@ -2312,13 +2712,13 @@ pub fn process_tile_opts(
                                 && e >= img.origin_e && e < img.limit_e
                             {
                                 let (px0, px1) = sample_span(
-                                    (e_lo - img.origin_e) * inv_x,
-                                    (e_hi - img.origin_e) * inv_x,
+                                    (e_lo - img.origin_e) * *inv_x,
+                                    (e_hi - img.origin_e) * *inv_x,
                                     img.width,
                                 );
                                 let (py0, py1) = sample_span(
-                                    (img.origin_n - n_hi) * inv_y,
-                                    (img.origin_n - n_lo) * inv_y,
+                                    (img.origin_n - n_hi) * *inv_y,
+                                    (img.origin_n - n_lo) * *inv_y,
                                     img.height,
                                 );
                                 // First source that has real ground under the cell
@@ -2326,6 +2726,10 @@ pub fn process_tile_opts(
                                 // one image, so a cell straddling two source tiles
                                 // averages the part inside the tile its corner
                                 // landed in — still an average of real terrain.
+                                if let Some(i) = *lazy {
+                                    *lazy = None;
+                                    *win = lazy_view(i);
+                                }
                                 if let Some(v) = sample_cell(win, px0, px1, py0, py1, &mut row_miss) {
                                     val = v;
                                     break;
@@ -2347,6 +2751,28 @@ pub fn process_tile_opts(
                 window_miss.store(true, Ordering::Relaxed);
             }
         });
+
+        let lazy_bytes: usize = lazy
+            .iter()
+            .filter_map(|c| match c.get() {
+                Some(Ok(Some(w))) => Some(w.owned_bytes()),
+                _ => None,
+            })
+            .sum();
+        let held: usize = hold.lock().unwrap().values().map(|d| d.len() * 2).sum();
+        let band_bytes = windows.iter().flatten().map(Window::owned_bytes).sum::<usize>() + lazy_bytes + held;
+        peak_window_bytes = peak_window_bytes.max(band_bytes);
+
+        // A shadowed window that failed to decode fails the tile exactly as
+        // an eager one does (first failure in source order).
+        if lazy_failed.load(Ordering::Relaxed) {
+            for cell in lazy {
+                if let Some(Err(e)) = cell.into_inner() {
+                    return Err(e);
+                }
+            }
+            anyhow::bail!("internal error converting {:?}: a deferred source window failed without an error", job.output_path);
+        }
 
         if window_miss.load(Ordering::Relaxed) {
             anyhow::bail!(
@@ -3263,5 +3689,87 @@ mod tests {
         assert!(point_in_poly(5.0, 4.0, &u));
         assert!(!point_in_poly(3.0, 4.0, &u), "the notch is outside");
         assert!(point_in_poly(3.0, 1.0, &u), "the base is inside");
+    }
+
+    // ── Streaming reads ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_truncated_abt_strip_fails_naming_its_first_incomplete_row() {
+        // 300 x 300 rows of 600 bytes in a 768-byte stride, cut 100 bytes
+        // into row 280 (the second 256-row strip).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cut.abt");
+        let (size, stride) = (300usize, 768usize);
+        let mut buf: Vec<u8> = b"AETH".to_vec();
+        buf.write_u16::<LittleEndian>(1).unwrap();
+        buf.write_u16::<LittleEndian>(size as u16).unwrap();
+        for v in [46.0f64, 7.0, 1e-4, 1e-4] {
+            buf.write_f64::<LittleEndian>(v).unwrap();
+        }
+        buf.write_i16::<LittleEndian>(0).unwrap();
+        buf.write_u16::<LittleEndian>(stride as u16).unwrap();
+        for r in 0..size {
+            let mut row = vec![0u8; stride];
+            for c in 0..size {
+                row[2 * c..2 * c + 2].copy_from_slice(&((r + c) as i16).to_le_bytes());
+            }
+            buf.extend_from_slice(&row);
+        }
+        buf.truncate(44 + 280 * stride + 100);
+        std::fs::write(&path, &buf).unwrap();
+
+        let src = read_file_source(&path, None).unwrap();
+        let cache = ChunkCache::new(1 << 20);
+        let hold: TileHold = std::sync::Mutex::new(HashMap::new());
+        // Rows of the intact first strip load, and hold the stored values.
+        let w = load_window(&src, (5, 300, 10, 100), &cache, &hold).unwrap();
+        assert_eq!(w.data()[0], 15);
+        assert_eq!(w.data()[(99 - 10) * w.stride + (299 - 5)], 398);
+        let err = load_window(&src, (0, 300, 250, 290), &cache, &hold).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("truncated .abt payload (row 280 of 300 is incomplete)"),
+            "got {err:#}"
+        );
+    }
+
+    #[test]
+    fn a_projected_source_gets_its_wgs84_box() {
+        // LV95 (2600000, 1200000) is the Bern origin, 46.95108 N 7.43864 E;
+        // a 1 km tile east/south of it spans ~0.0131 deg of longitude and
+        // ~0.0090 deg of latitude.
+        let proj = Proj::from_proj_string(&crs_to_proj_string("EPSG:2056", Path::new("t")).unwrap()).unwrap();
+        let g = SourceGeom {
+            width: 500,
+            height: 500,
+            origin_e: 2_600_000.0,
+            origin_n: 1_200_000.0,
+            limit_e: 2_601_000.0,
+            limit_n: 1_199_000.0,
+            scale_x: 2.0,
+            scale_y: 2.0,
+            embedded_crs: None,
+            is_abt: false,
+        };
+        let [w, s, e, n] = wgs84_bbox_of_projected(&g, &proj, wgs84()).unwrap();
+        assert!((w - 7.43864).abs() < 1e-3 && (n - 46.95108).abs() < 1e-3, "NW corner {w} {n}");
+        assert!((e - w - 0.0131).abs() < 5e-4 && (n - s - 0.0090).abs() < 5e-4, "span {} x {}", e - w, n - s);
+    }
+
+    #[test]
+    fn only_a_candidate_inside_a_higher_priority_box_is_shadowed() {
+        let band = [7.0, 46.0, 8.0, 47.0];
+        let r = Some((0u32, 1u32, 0u32, 1u32));
+        // Side by side (a mosaic): nothing is shadowed.
+        let mosaic = [Some([7.0, 46.0, 7.5, 47.0]), Some([7.5, 46.0, 8.0, 47.0]), Some([7.2, 46.2, 7.8, 46.8])];
+        assert_eq!(shadowed_sources(&[r, r, r], &mosaic, band), [false, false, false]);
+        // A big box first hides a small one, clipped to the band (the small
+        // one reaches past the band's south edge); not the other way round.
+        let stack = [Some([7.05, 45.95, 7.9, 47.1]), Some([7.1, 45.5, 7.3, 46.5]), Some([6.0, 45.0, 9.0, 48.0])];
+        assert_eq!(shadowed_sources(&[r, r, r], &stack, band), [false, true, false]);
+        // No window this band, or no box: never shadowed, shadows nothing.
+        assert_eq!(shadowed_sources(&[None, r], &stack[..2], band), [false, false]);
+        assert_eq!(shadowed_sources(&[r, r], &[None, stack[1]], band), [false, false]);
+        // A box that misses the band entirely is deferred.
+        assert_eq!(shadowed_sources(&[r], &[Some([9.0, 46.0, 9.5, 47.0])], band), [true]);
     }
 }

@@ -4,3 +4,4 @@ pub mod download;
 pub mod ingest;
 pub mod mvt;
 pub mod plan;
+mod tiff_io;
