@@ -25,6 +25,215 @@ use crate::tiff_io::{read_full_at, BlockReader, ChunkHeader, DirectChunks};
 #[cfg(feature = "bc6h")]
 use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
 
+// -- Diagnostics: the per-tile `[Rust] tile …` and the `[Rust] run: …` lines --
+//
+// CONTRACT changelog 31: diagnostic stdout lines for people reading a log, not
+// parsed by any consumer; their wording may change.
+
+/// A monotonic clock; a no-op on wasm32, where `std::time::Instant` panics
+/// (the browser build compiles this module but never ingests).
+#[derive(Clone, Copy)]
+struct Clock(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
+
+impl Clock {
+    fn now() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Clock(std::time::Instant::now())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Clock()
+        }
+    }
+
+    /// Nanoseconds since [`Clock::now`] (0 on wasm32).
+    fn ns(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.0.elapsed().as_nanos() as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+}
+
+thread_local! {
+    /// Source files opened on this thread, and the nanoseconds spent opening.
+    static OPENS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// `File::open`, counted and timed for the per-tile diagnostic line.
+fn open_counted(path: &Path) -> std::io::Result<File> {
+    let t = Clock::now();
+    let r = File::open(path);
+    let ns = t.ns();
+    OPENS.with(|c| {
+        let (n, s) = c.get();
+        c.set((n + 1, s + ns));
+    });
+    r
+}
+
+/// This thread's I/O tallies at one moment. [`IoMark::since`] is what a call
+/// in between did — valid for calls that stay on one thread (a header read,
+/// a window load).
+#[derive(Clone, Copy)]
+struct IoMark {
+    opens: u64,
+    open_ns: u64,
+    bytes: u64,
+    at: Clock,
+}
+
+/// `(opens, ns opening, bytes read, ns elapsed)` since an [`IoMark`].
+type IoDelta = (u64, u64, u64, u64);
+
+impl IoMark {
+    fn now() -> Self {
+        let (opens, open_ns) = OPENS.with(|c| c.get());
+        IoMark { opens, open_ns, bytes: crate::tiff_io::thread_bytes_read(), at: Clock::now() }
+    }
+
+    fn since(&self) -> IoDelta {
+        let (opens, open_ns) = OPENS.with(|c| c.get());
+        (
+            opens - self.opens,
+            open_ns - self.open_ns,
+            crate::tiff_io::thread_bytes_read() - self.bytes,
+            self.at.ns(),
+        )
+    }
+}
+
+/// Where one tile's time went (the `[Rust] tile …` line). Atomic: header
+/// reads and window loads run on the rayon pool.
+#[derive(Default)]
+struct TileDiag {
+    /// Header reads that opened a file (cache misses), their open and
+    /// read-and-parse nanoseconds.
+    hdr_opens: AtomicU64,
+    hdr_open_ns: AtomicU64,
+    hdr_read_ns: AtomicU64,
+    /// Wall time of the eager window loads, summed over bands.
+    dec_ns: AtomicU64,
+    /// Time inside deferred (shadowed-source) window loads, which run during
+    /// sampling.
+    lazy_ns: AtomicU64,
+    dec_bytes: AtomicU64,
+}
+
+impl TileDiag {
+    fn header(&self, (opens, open_ns, _, ns): IoDelta) {
+        if opens > 0 {
+            self.hdr_opens.fetch_add(opens, Ordering::Relaxed);
+            self.hdr_open_ns.fetch_add(open_ns, Ordering::Relaxed);
+            self.hdr_read_ns.fetch_add(ns.saturating_sub(open_ns), Ordering::Relaxed);
+        }
+    }
+}
+
+/// CPU time and page faults of this process.
+struct ProcUsage {
+    user_s: f64,
+    sys_s: f64,
+    page_faults: u64,
+}
+
+/// The batch's rayon pool size, noted by `main` when it builds the pool;
+/// 0 = no batch ran (single job). The `[Rust] run:` line reports it: at exit
+/// the pool is gone, so a live thread count would always read 1.
+static BATCH_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Record the batch's worker-thread count for the `[Rust] run:` line.
+pub fn note_batch_threads(n: usize) {
+    BATCH_THREADS.store(n, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn proc_usage() -> ProcUsage {
+    // SAFETY: getrusage fills the zeroed struct it is handed; on failure it
+    // stays zeroed and reads as 0.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    ProcUsage {
+        user_s: secs(ru.ru_utime),
+        sys_s: secs(ru.ru_stime),
+        // Minor + major, the same count Windows' PageFaultCount reports.
+        page_faults: (ru.ru_minflt as u64).saturating_add(ru.ru_majflt as u64),
+    }
+}
+
+#[cfg(windows)]
+fn proc_usage() -> ProcUsage {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // FILETIME durations are 100 ns units.
+    let secs = |f: FILETIME| ((u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)) as f64 / 1e7;
+    // SAFETY: plain Win32 queries on the current-process pseudo handle (never
+    // closed) into zeroed out-structs sized as the API requires.
+    unsafe {
+        let me = GetCurrentProcess();
+        let (mut created, mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
+            (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+        let times = GetProcessTimes(me, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        let mut mem: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        mem.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let faults = if GetProcessMemoryInfo(me, &mut mem, mem.cb) != 0 { u64::from(mem.PageFaultCount) } else { 0 };
+        ProcUsage {
+            user_s: if times { secs(user) } else { 0.0 },
+            sys_s: if times { secs(kernel) } else { 0.0 },
+            page_faults: faults,
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn proc_usage() -> ProcUsage {
+    ProcUsage { user_s: 0.0, sys_s: 0.0, page_faults: 0 }
+}
+
+/// The process diagnostic line (stdout; changelog 31, not parsed):
+/// `[Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>`.
+/// `page faults` counts minor and major faults (Windows: `PageFaultCount`);
+/// `threads` is the batch's rayon pool size ([`note_batch_threads`]) and is
+/// omitted, with its comma, when no batch ran.
+pub fn print_run_stats(wall_s: f64) {
+    let u = proc_usage();
+    let threads = match BATCH_THREADS.load(Ordering::Relaxed) {
+        0 => String::new(),
+        n => format!(", threads {n}"),
+    };
+    println!(
+        "[Rust] run: wall {:.1}s, cpu user {:.1}s sys {:.1}s, page faults {}{}",
+        wall_s, u.user_s, u.sys_s, u.page_faults, threads
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// Prints [`print_run_stats`] when dropped — created at the top of `main`, it
+/// prints at the very end, after the batch result, on every way out
+/// (an early `?`/`bail!` included).
+pub struct RunStats {
+    start: Clock,
+}
+
+impl RunStats {
+    pub fn start() -> Self {
+        RunStats { start: Clock::now() }
+    }
+}
+
+impl Drop for RunStats {
+    fn drop(&mut self) {
+        print_run_stats(self.start.ns() as f64 / 1e9);
+    }
+}
+
 /// One terrain input of an ingest job.
 ///
 /// `sources` is ordered by priority: for every output pixel the first source
@@ -909,7 +1118,7 @@ fn open_source(path: &Path, nodata_override: Option<f64>) -> Result<(File, bool)
 /// anything else.
 fn open_source_blocks(path: &Path, nodata_override: Option<f64>) -> Result<(BlockReader, bool)> {
     use std::io::{Seek, SeekFrom};
-    let file = File::open(path).with_context(|| format!("Opening {:?}", path))?;
+    let file = open_counted(path).with_context(|| format!("Opening {:?}", path))?;
     let mut reader = BlockReader::new(file);
     let is_abt = reader.head(4).with_context(|| format!("Reading {:?}", path))? == b"AETH";
     if is_abt {
@@ -1669,7 +1878,7 @@ fn load_window(
             src.path, len, w.dw, w.dh, g.width, g.height
         )
     };
-    let open = || File::open(&src.path).with_context(|| format!("Opening {:?}", src.path));
+    let open = || open_counted(&src.path).with_context(|| format!("Opening {:?}", src.path));
 
     if !misses.is_empty() {
         match &src.layout {
@@ -2257,22 +2466,27 @@ pub fn process_tile_opts(
     // terrain and the run would still report success. The headers are read
     // in parallel (each is an open and a positioned read or two, so the pass
     // is I/O-bound); the error reported is still the first in source order.
+    // Where this tile's time goes, for the `[Rust] tile …` line (changelog 31).
+    let diag = TileDiag::default();
+    let hdr_clock = Clock::now();
     let resolve = |s: &SourceSpec| -> Result<Src> {
         let key = cache_key(s);
         let injected = cache_arc.lock().unwrap().get(&key).cloned();
         Ok(match injected {
             Some(img) => Src::Mem(img),
-            None => Src::File(
-                chunk_cache
-                    .meta(s)
-                    .with_context(|| format!("loading source {:?}", key.0))?,
-            ),
+            None => {
+                let mark = IoMark::now();
+                let meta = chunk_cache.meta(s);
+                diag.header(mark.since());
+                Src::File(meta.with_context(|| format!("loading source {:?}", key.0))?)
+            }
         })
     };
     #[cfg(feature = "native")]
     let resolved: Vec<Result<Src>> = sources.par_iter().map(resolve).collect();
     #[cfg(not(feature = "native"))]
     let resolved: Vec<Result<Src>> = sources.iter().map(resolve).collect();
+    let hdr_ns = hdr_clock.ns();
     let mut srcs: Vec<Src> = Vec::with_capacity(sources.len());
     for s in resolved {
         srcs.push(s?);
@@ -2479,6 +2693,9 @@ pub fn process_tile_opts(
     let hold: TileHold = std::sync::Mutex::new(HashMap::new());
     let mut peak_window_bytes: usize = 0;
     let mut bands: u32 = 0;
+    // Sources whose windows had to be read from disk (not all from cache).
+    let dec_files: Vec<AtomicBool> = (0..srcs.len()).map(|_| AtomicBool::new(false)).collect();
+    let mut sample_ns = 0u64;
     let mut band_rows = out_size.clamp(1, MAX_BAND_ROWS);
     let mut r0 = 0usize;
 
@@ -2579,17 +2796,26 @@ pub fn process_tile_opts(
         // Decode the band's unshadowed windows, sources in parallel.
         let load = |i: usize| -> Result<Option<Window>> {
             match (&srcs[i], rects[i]) {
-                (Src::File(f), Some(rect)) => load_window(f, rect, chunk_cache, &hold)
-                    .map(Some)
-                    .with_context(|| format!("loading source {:?}", f.path)),
+                (Src::File(f), Some(rect)) => {
+                    let mark = IoMark::now();
+                    let w = load_window(f, rect, chunk_cache, &hold);
+                    let (opens, _, bytes, _) = mark.since();
+                    diag.dec_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    if opens > 0 {
+                        dec_files[i].store(true, Ordering::Relaxed);
+                    }
+                    w.map(Some).with_context(|| format!("loading source {:?}", f.path))
+                }
                 _ => Ok(None),
             }
         };
         let eager = |i: usize| if shadowed[i] { Ok(None) } else { load(i) };
+        let dec_clock = Clock::now();
         #[cfg(feature = "native")]
         let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).into_par_iter().map(eager).collect();
         #[cfg(not(feature = "native"))]
         let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).map(eager).collect();
+        diag.dec_ns.fetch_add(dec_clock.ns(), Ordering::Relaxed);
         let mut windows: Vec<Option<Window>> = Vec::with_capacity(loaded.len());
         for w in loaded {
             windows.push(w?);
@@ -2600,7 +2826,13 @@ pub fn process_tile_opts(
         let lazy: Vec<OnceLock<Result<Option<Window>>>> = (0..srcs.len()).map(|_| OnceLock::new()).collect();
         let lazy_failed = AtomicBool::new(false);
         let lazy_view = |i: usize| -> WinView<'_> {
-            match lazy[i].get_or_init(|| load(i)) {
+            let loaded = lazy[i].get_or_init(|| {
+                let t = Clock::now();
+                let w = load(i);
+                diag.lazy_ns.fetch_add(t.ns(), Ordering::Relaxed);
+                w
+            });
+            match loaded {
                 Ok(Some(w)) => w.view(),
                 Ok(None) => WinView::EMPTY,
                 Err(_) => {
@@ -2620,6 +2852,7 @@ pub fn process_tile_opts(
             .collect();
 
         // Terrain Rasterization
+        let sample_clock = Clock::now();
         let band_buf = &mut buffer[r0 * out_size..r1 * out_size];
         #[cfg(feature = "native")]
         let iter = band_buf.par_chunks_mut(out_size);
@@ -2751,6 +2984,7 @@ pub fn process_tile_opts(
                 window_miss.store(true, Ordering::Relaxed);
             }
         });
+        sample_ns += sample_clock.ns();
 
         let lazy_bytes: usize = lazy
             .iter()
@@ -2794,6 +3028,35 @@ pub fn process_tile_opts(
         r0 = r1;
     }
     drop(hold);
+
+    // The per-tile diagnostic line (stdout; changelog 31, not parsed). Header
+    // averages are over the headers this tile actually read (cache misses);
+    // deferred window loads run inside sampling and are counted as decode.
+    {
+        let opens = diag.hdr_opens.load(Ordering::Relaxed);
+        let avg_ms = |ns: &AtomicU64| {
+            if opens > 0 { ns.load(Ordering::Relaxed) as f64 / opens as f64 / 1e6 } else { 0.0 }
+        };
+        let lazy_ns = diag.lazy_ns.load(Ordering::Relaxed);
+        let name = job.output_path.file_name().map_or_else(
+            || job.output_path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        println!(
+            "[Rust] tile {}: {} sources, header {:.1}s (open {:.1} ms, read {:.1} ms avg), \
+             decode {:.1}s ({} files, {:.1} MB read), sample {:.1}s, bands {}",
+            name,
+            sources.len(),
+            hdr_ns as f64 / 1e9,
+            avg_ms(&diag.hdr_open_ns),
+            avg_ms(&diag.hdr_read_ns),
+            (diag.dec_ns.load(Ordering::Relaxed) + lazy_ns) as f64 / 1e9,
+            dec_files.iter().filter(|f| f.load(Ordering::Relaxed)).count(),
+            diag.dec_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
+            sample_ns.saturating_sub(lazy_ns) as f64 / 1e9,
+            bands
+        );
+    }
 
     let stats = TileStats {
         covered_px: covered_px.load(Ordering::Relaxed),
@@ -2854,9 +3117,12 @@ pub fn process_tile_opts(
         fs::create_dir_all(dir)
             .with_context(|| format!("creating output directory {:?}", dir))?;
     }
-    let f = File::create(&job.output_path)
-        .with_context(|| format!("creating output tile {:?}", job.output_path))?;
-    let mut w = BufWriter::with_capacity(1024 * 1024, f);
+    // Written to `<output>.tmp-<pid>` beside the output and renamed over it
+    // only once flushed and synced ([`TileFile`]): a failed write (a full
+    // disk) leaves no truncated tile under the final name, and an existing
+    // tile is replaced by a new inode instead of being truncated in place —
+    // views hardlink pool tiles, and their inode stays intact.
+    let mut w = TileFile::create(&job.output_path)?;
 
     w.write_all(b"AETH")?;
 
@@ -2951,8 +3217,223 @@ pub fn process_tile_opts(
             }
         }
     }
+    w.commit()?;
 
     Ok(stats)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: when set, the next [`TileFile`]s created on this thread
+    /// fail like a full disk once this many bytes have reached the file.
+    static FAIL_TILE_WRITES_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The file under a [`TileFile`]'s buffer.
+struct TileSink {
+    file: File,
+    /// Bytes left before writes fail with a simulated ENOSPC (tests only).
+    #[cfg(test)]
+    fail_after: Option<usize>,
+}
+
+impl Write for TileSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(left) = self.fail_after.as_mut() {
+            if *left == 0 {
+                return Err(std::io::Error::other("No space left on device (simulated ENOSPC)"));
+            }
+            let n = self.file.write(&buf[..buf.len().min(*left)])?;
+            *left -= n;
+            return Ok(n);
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// An output tile being written. Bytes go to `<output>.tmp-<pid>` in the
+/// output's own directory; [`TileFile::commit`] flushes, `sync_data`s, closes
+/// and only then renames the temp file over `<output>` (atomic on one
+/// volume). Dropped uncommitted — any `?` between create and commit — it
+/// removes the temp file. So a write that fails part-way (ENOSPC, an I/O
+/// error, a failed final flush, which `BufWriter`'s drop used to swallow)
+/// never leaves a truncated tile under the final name, and a tile that
+/// already exists keeps its old inode: it is replaced by rename, never
+/// truncated in place, so hardlinks to it (views of pool tiles) keep the old
+/// bytes.
+pub(crate) struct TileFile {
+    w: Option<BufWriter<TileSink>>,
+    tmp: PathBuf,
+    dst: PathBuf,
+    done: bool,
+}
+
+impl TileFile {
+    /// `<output>.tmp-<pid>`, beside the output so the rename stays on one
+    /// volume.
+    pub(crate) fn temp_path(dst: &Path) -> PathBuf {
+        let mut s = dst.as_os_str().to_owned();
+        s.push(format!(".tmp-{}", std::process::id()));
+        PathBuf::from(s)
+    }
+
+    pub(crate) fn create(dst: &Path) -> Result<TileFile> {
+        let tmp = Self::temp_path(dst);
+        let file = File::create(&tmp)
+            .with_context(|| format!("creating output tile {:?} (as {:?})", dst, tmp))?;
+        let sink = TileSink {
+            file,
+            #[cfg(test)]
+            fail_after: FAIL_TILE_WRITES_AFTER.with(|c| c.get()),
+        };
+        Ok(TileFile {
+            w: Some(BufWriter::with_capacity(1024 * 1024, sink)),
+            tmp,
+            dst: dst.to_path_buf(),
+            done: false,
+        })
+    }
+
+    /// Flush, sync and close the temp file, then rename it over the output.
+    /// On any error the temp file is removed and the output is untouched.
+    pub(crate) fn commit(mut self) -> Result<()> {
+        let mut w = self.w.take().expect("a TileFile is committed once");
+        w.flush().with_context(|| format!("writing output tile {:?}", self.tmp))?;
+        w.get_ref()
+            .file
+            .sync_data()
+            .with_context(|| format!("syncing output tile {:?}", self.tmp))?;
+        drop(w); // closed before the rename: an open handle can fail it on Windows
+        fs::rename(&self.tmp, &self.dst)
+            .with_context(|| format!("renaming {:?} over output tile {:?}", self.tmp, self.dst))?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Write for TileFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.w.as_mut().expect("a TileFile is not written after commit").write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.w.as_mut().expect("a TileFile is not written after commit").flush()
+    }
+}
+
+impl Drop for TileFile {
+    fn drop(&mut self) {
+        if !self.done {
+            drop(self.w.take()); // close first: Windows cannot remove an open file
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tile_file_tests {
+    use super::*;
+
+    /// A one-source geographic job over an in-memory image: `(job, cache)`.
+    fn job(dir: &Path, size_px: u32) -> (IngestJob, ImageCache) {
+        let src = dir.join("src.tif");
+        let job: IngestJob = serde_json::from_value(serde_json::json!({
+            "output_path": dir.join("tile.abt"),
+            "format": "r16sint",
+            "ul_lat": 47.0, "ul_lon": 8.0, "resolution_m": 10.0, "size_px": size_px,
+            "sources": [{"path": src, "crs": "EPSG:4326"}],
+        }))
+        .unwrap();
+        let (w, h, scale) = (2400u32, 2400u32, 0.0001);
+        let img = LoadedImage {
+            width: w,
+            height: h,
+            data: (0..w * h).map(|i| (i % 977) as i16).collect(),
+            origin_e: 7.99,
+            origin_n: 47.01,
+            limit_e: 7.99 + w as f64 * scale,
+            limit_n: 47.01 - h as f64 * scale,
+            scale_x: scale,
+            scale_y: scale,
+            name: "mem".into(),
+            embedded_crs: None,
+            is_abt: false,
+        };
+        let mut cache = HashMap::new();
+        cache.insert((src, None), Arc::new(img));
+        (job, Arc::new(std::sync::Mutex::new(cache)))
+    }
+
+    fn convert(dir: &Path, size_px: u32, fail_after: Option<usize>) -> Result<TileStats> {
+        let (job, cache) = job(dir, size_px);
+        FAIL_TILE_WRITES_AFTER.with(|c| c.set(fail_after));
+        let r = process_tile(job, cache, None);
+        FAIL_TILE_WRITES_AFTER.with(|c| c.set(None));
+        r
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_full_disk_leaves_no_tile_and_no_temp_file() {
+        // 16 px: the whole tile fits the 1 MiB buffer, so the failure surfaces
+        // at the final flush — the error BufWriter's drop used to swallow,
+        // leaving a truncated tile and an exit 0. 1024 px (2 MiB): it
+        // surfaces in the middle of the payload writes.
+        for (size, fail_after) in [(16u32, 0usize), (16, 100), (1024, 1 << 20), (1024, 0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let err = convert(dir.path(), size, Some(fail_after)).unwrap_err();
+            assert!(format!("{err:#}").contains("No space left on device"), "{err:#}");
+            assert_eq!(names(dir.path()), Vec::<String>::new(), "size {size}, fail after {fail_after}");
+        }
+    }
+
+    #[test]
+    fn a_failed_rewrite_keeps_the_old_tile_and_its_hardlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let tile = dir.path().join("tile.abt");
+        fs::write(&tile, b"OLD TILE").unwrap();
+        fs::hard_link(&tile, dir.path().join("view.abt")).unwrap();
+        assert!(convert(dir.path(), 16, Some(10)).is_err());
+        assert_eq!(fs::read(&tile).unwrap(), b"OLD TILE");
+        assert_eq!(fs::read(dir.path().join("view.abt")).unwrap(), b"OLD TILE");
+        assert_eq!(names(dir.path()), vec!["tile.abt", "view.abt"]);
+    }
+
+    #[test]
+    fn a_successful_rewrite_replaces_by_rename_and_leaves_hardlinks_alone() {
+        let fresh = tempfile::tempdir().unwrap();
+        convert(fresh.path(), 16, None).unwrap();
+        let expected = fs::read(fresh.path().join("tile.abt")).unwrap();
+        assert_eq!(expected.len(), 44 + 16 * 256);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tile = dir.path().join("tile.abt");
+        fs::write(&tile, b"OLD TILE").unwrap();
+        fs::hard_link(&tile, dir.path().join("view.abt")).unwrap();
+        convert(dir.path(), 16, None).unwrap();
+        assert_eq!(fs::read(&tile).unwrap(), expected, "the new tile, byte for byte");
+        // The view still holds the old inode: the tile was replaced, never
+        // truncated and rewritten in place.
+        assert_eq!(fs::read(dir.path().join("view.abt")).unwrap(), b"OLD TILE");
+        assert_eq!(names(dir.path()), vec!["tile.abt", "view.abt"]);
+    }
+
+    #[test]
+    fn the_temp_file_sits_beside_the_output_and_names_the_process() {
+        let p = TileFile::temp_path(Path::new("/x/out/tile_N47.00E8.00_10m.abt"));
+        assert_eq!(p, PathBuf::from(format!("/x/out/tile_N47.00E8.00_10m.abt.tmp-{}", std::process::id())));
+    }
 }
 
 /// Burn a `buildings_file` — one `.fgb`, or a directory of them — into *buffer*.

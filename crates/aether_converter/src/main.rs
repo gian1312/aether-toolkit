@@ -8,6 +8,7 @@ mod download;
 mod ingest;
 mod mvt;
 mod plan;
+mod probe;
 mod tiff_io;
 
 use clap::{Parser, Subcommand};
@@ -64,6 +65,21 @@ enum Commands {
         #[arg(long, required = true, value_delimiter = ',')]
         resolutions: Vec<u32>,
     },
+    /// Read the raw header facts of many GeoTIFFs without decoding pixels:
+    /// one JSON line per listed file on stdout (schema "aether-probe/1"), in
+    /// list order, then a `[Probe]` summary line on stderr. Header facts
+    /// only — no reprojection, no footprint.
+    Probe {
+        /// File listing one path per line (UTF-8).
+        #[arg(long, conflicts_with = "stdin", required_unless_present = "stdin")]
+        list: Option<PathBuf>,
+        /// Read the path list from stdin instead of --list.
+        #[arg(long)]
+        stdin: bool,
+        /// Parallel workers [default: min(64, 4 x CPUs)].
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,6 +99,12 @@ fn main() -> anyhow::Result<()> {
     builder.init();
 
     let args = Cli::parse();
+
+    // `[Rust] run: …` diagnostic line (CONTRACT changelog 31, not parsed):
+    // printed when this guard drops — at the very end of `main`, after the
+    // batch result, on every exit path. Ingest only; other subcommands' stdout
+    // is JSON or silent.
+    let _run_stats = matches!(args.command, Commands::Ingest { .. }).then(ingest::RunStats::start);
 
     match args.command {
         Commands::Convert { .. } => {
@@ -155,6 +177,8 @@ fn main() -> anyhow::Result<()> {
                 let usable = (available_ram as f64 * 0.8) as u64;
                 let usable = usable.saturating_sub(ingest::DEFAULT_CHUNK_CACHE_BYTES as u64);
                 let safe_threads = ((usable / per_job) as usize).clamp(1, available_cores);
+                // Reported by the `[Rust] run:` line at exit (changelog 31).
+                ingest::note_batch_threads(safe_threads);
 
                 println!("[Rust] Batch processing {} tiles...", jobs.len());
                 println!(
@@ -201,9 +225,25 @@ fn main() -> anyhow::Result<()> {
                             Some(dir) => pbf_sets.get(dir),
                             None => None,
                         };
+                        // The output's file name, for the per-tile line below
+                        // (the job moves into process_tile_opts).
+                        let tile_name = job
+                            .output_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| job.output_path.display().to_string());
+                        let mut tile_line = None;
                         match ingest::process_tile_opts(job, texture_cache.clone(), pbf, &opts) {
                             Ok(stats) => {
                                 covered.fetch_add(stats.covered_px, Ordering::Relaxed);
+                                // Parsed by the Waveshed plugin (CONTRACT §1.2,
+                                // changelog 33): per-tile coverage, so a tile
+                                // the sources never reached is known as void
+                                // without opening it.
+                                tile_line = Some(format!(
+                                    "[Tile] {} covered={}/{}",
+                                    tile_name, stats.covered_px, stats.total_px
+                                ));
                             }
                             Err(e) => {
                                 // `{:#}` prints the whole cause chain ("loading
@@ -216,10 +256,19 @@ fn main() -> anyhow::Result<()> {
                         }
 
                         let curr = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                        if curr % 10 == 0 || curr == total {
-                            println!("[Rust] Progress: {}/{}", curr, total);
+                        {
+                            // One stdout lock for the tile line and the progress
+                            // line, flushed together: the [Tile] line always
+                            // precedes the progress count that includes it.
                             use std::io::Write;
-                            let _ = std::io::stdout().flush();
+                            let mut out = std::io::stdout().lock();
+                            if let Some(line) = &tile_line {
+                                let _ = writeln!(out, "{}", line);
+                            }
+                            if curr % 10 == 0 || curr == total {
+                                let _ = writeln!(out, "[Rust] Progress: {}/{}", curr, total);
+                            }
+                            let _ = out.flush();
                         }
                     });
                 });
@@ -273,6 +322,7 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&plan)?);
             Ok(())
         },
+        Commands::Probe { list, stdin: _, jobs } => probe::run(list.as_deref(), jobs),
     }
 }
 

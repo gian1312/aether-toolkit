@@ -1,6 +1,6 @@
 [package]
 name = "aether_converter"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 license.workspace = true
 
@@ -63,6 +63,18 @@ tiff = { version = "0.11", features = ["webp", "zstd"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+
+# The `[Rust] run:` diagnostic line (CPU time, page faults): getrusage on
+# Unix, GetProcessTimes / GetProcessMemoryInfo on Windows. Both crates are
+# already in the tree.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

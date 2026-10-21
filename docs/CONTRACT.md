@@ -384,6 +384,99 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    format is unchanged; a parser that accepts any `<pct>` (the Waveshed
 >    plugin's does) sees more updates and nothing else. Job JSON, `.abt`
 >    bytes and every other line are unchanged.
+> 30. **CLI `download`: fetch only what the outputs sample, RAM-budgeted
+>    strips, a fixed connection pool, a 20 s tile deadline (§1.2, §9b;
+>    `aether_converter` 0.2.7; 2026-10-21).** No job-JSON change; `.abt`
+>    bytes are identical for every tile a run writes (tested against the
+>    whole-rectangle fetch and across 32-, 3- and 1-row strips). Motivation:
+>    a 2 169-output-tile z15 pass (~265 k source tiles, 250 Mbit/s, 16 CPUs,
+>    ~4 GB free) collapsed to a crawl. (a) **Fetch set.** Only source tiles
+>    that touch at least one requested output tile are fetched; the bounding
+>    rectangle still fixes the assembly grid. The 4th number of
+>    `[Download] z=<z> tiles=<nx>x<ny>=<n>` — the plugin's pass total — is
+>    now the tiles fetched (no longer always `nx × ny`); progress
+>    `<total>`, `[Stats] Tiles: <ok>/<total>` and the majority rule count
+>    the same tiles; new informational line `[Download] fetching <n> of the
+>    <nx·ny> source tiles …` when fewer. A consumer that skips output tiles
+>    it already has now also skips their download. (b) **Memory.** A strip
+>    used to be 32 tile-rows × the full width, decoded to f32 on arrival,
+>    with up to ~3 strips held (≈ 16 GB on that pass) and RAM read once.
+>    Now, before every strip launch: budget = min(available / 4, 2 GiB),
+>    ≥ 256 MiB; strip rows = clamp(budget / 2 / (nx × edge² × 4 B), 1, 32);
+>    launches are gated on the bytes of all launched, unassembled strips.
+>    `[Download] RAM: … prefetch depth: …` becomes `[Download] RAM budget:
+>    <mb> MB, strip rows: <r> (…)` (informational). (c) **Connections.**
+>    The AIMD window (27e) is replaced by `max_connections` concurrent
+>    requests (as before 27e), cut 25 %/s only by ≥ 3 HTTP 429/503 answers
+>    in a second (floor max(max/4, 16)), +10 % per clean second; timeouts,
+>    resets and slow bodies never move it; a cut gates new requests only.
+>    A tile holds its slot through retries and back-offs and releases it
+>    before the parent fill. `[Stats] Connection window:` keeps its format;
+>    the progress line gains a trailing `, window <w>` (prefix and earlier
+>    fields unchanged). (d) **`tile_deadline_s` default 20 s** (was 60 s):
+>    a tile still failing then is parent-filled (`[Degraded] …
+>    reason=timeout`) for the consumer's repair job to refetch; worst case
+>    per tile 50 s.
+> 31. **`ingest` diagnostic timing lines (§1.2; additive, NOT parsed;
+>    `aether_converter` 0.2.7; 2026-10-21).** Every tile prints on stdout
+>    `[Rust] tile <name>: <n> sources, header <s>s (open <ms> ms, read <ms>
+>    ms avg), decode <s>s (<files> files, <MB> MB read), sample <s>s, bands
+>    <n>`, and an `ingest` process prints at exit, after the batch result
+>    (also on failure), `[Rust] run: wall <s>s, cpu user <s>s sys <s>s,
+>    page faults <n>, threads <n>` (`threads` = the batch's worker-pool
+>    size, omitted for a single job). They locate where a slow batch spends its
+>    time (header opens, decode I/O, sampling, memory pressure); their
+>    wording may change and no consumer may parse them. Exit codes, `.abt`
+>    bytes and every parsed line are unchanged.
+> 32. **`probe` subcommand (§1.2a, additive; `aether_converter` 0.2.7;
+>    2026-10-21).** `aether_converter probe --list <file>` (or `--stdin`;
+>    `--jobs N`, default `min(64, 4 × CPUs)`) prints one JSON line per listed
+>    file, in list order (schema `aether-probe/1`,
+>    `schemas/probe_output.schema.json`): `size`, `mtime`/`mtime_ns` (Python
+>    `os.stat`-exact), `width`, `height`, `bands`, `dtype`, `compression`
+>    `{code, name}`, `predictor`, `tiled`/`tile_w`/`tile_h`, `epsg` (or the
+>    reserved `proj`), `geotransform` (GDAL order), `rotated`,
+>    `pixel_is_point`, `nodata`, `scale`/`offset`, `overviews`,
+>    `ifd_offset` — raw header facts from a few positioned reads, no pixels,
+>    no reprojection; each equals GDAL's value (`tools/probe_vs_gdal.py`).
+>    Files it cannot vouch for (not TIFF, multi-band, sub-byte, palette,
+>    user-defined CRS, GCPs, …) are `ok: false` with a `reason`, for the
+>    caller to send to GDAL. Final stderr line
+>    `[Probe] <n> files, <ok> ok, <s>s, open <ms> ms avg, read <ms> ms avg`.
+>    Nothing else changes.
+> 33. **`ingest` batch prints a `[Tile]` line per tile (§1.2; additive,
+>    parsed; `aether_converter` 0.2.7; 2026-10-21).** After each written
+>    tile, stdout gets `[Tile] <output file name> covered=<covered_px>/<total_px>`
+>    (coverage counted before `void_fill_m`), flushed with the
+>    `[Rust] Progress:` line. The Waveshed plugin parses it; with an older
+>    converter (no `[Tile]` lines) a consumer must treat per-tile coverage as
+>    unknown. Single-job ingest, exit codes and `.abt` bytes are unchanged.
+> 34. **`ingest` replaces tiles atomically (§1.2, §6; `aether_converter`
+>    0.2.7; 2026-10-21).** A tile is written to `<output_path>.tmp-<pid>`
+>    beside the output, flushed and `sync_data`'d, then renamed over
+>    `output_path`; on any error the temp file is removed and the tile
+>    fails. Before, the output was truncated and rewritten in place, and the
+>    final buffered flush ran in a destructor that discarded its error — a
+>    full disk could leave a **truncated tile with exit 0**, and rewriting an
+>    existing tile changed the bytes under every hardlink to it. Now a
+>    reader sees the old complete tile or the new complete one, and a
+>    replaced tile is a new inode. `.abt` bytes are identical (verified on
+>    24 swissALTI3D 2 m tiles of 5556² px against the previous converter).
+>    A killed converter can leave `*.abt.tmp-<pid>` files; consumers that
+>    scan output directories should ignore them.
+> 35. **`probe` reports where the pixel data ends (§1.2a; additive;
+>    `aether_converter` 0.2.7; 2026-10-21).** Every `ok: true` line gains
+>    `last_chunk_end` (int | null): offset + byte count of the image's LAST
+>    strip/tile — the bottom-right block GDAL's truncation test reads — from
+>    one positioned read of that entry of TileOffsets/TileByteCounts (else
+>    StripOffsets/StripByteCounts) of the first IFD; `0` when that block is
+>    sparse (byte count 0); `null` when those arrays cannot be read. A value
+>    greater than `size` means the file is cut off behind an intact header
+>    (before, such a COMPRESSED file was indistinguishable from a whole one
+>    and only `ingest` failed on it). Equal to GDAL's `BLOCK_OFFSET_x_y` +
+>    `BLOCK_SIZE_x_y` of that block (`tools/probe_vs_gdal.py`). Lines of a
+>    converter built before this item lack the field: a consumer must then
+>    not take the pixel data as complete. Nothing else changes.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -523,15 +616,81 @@ aether_core --fingerprint         # print this machine's node-lock fingerprint, 
 aether_converter ingest   --job-file <json>      # -j
 aether_converter download  --job-file <json>     # -j
 aether_converter plan --south S --north N --west W --east E --resolutions 30,90
+aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2.7
 ```
 
-* Sub-commands: `ingest`, `download`, `plan` (and a deprecated `convert` that
-  just prints a deprecation line). `ingest`/`download` take `--job-file <path>`
-  (short `-j`).
+* Sub-commands: `ingest`, `download`, `plan`, `probe` (§1.2a) (and a deprecated
+  `convert` that just prints a deprecation line). `ingest`/`download` take
+  `--job-file <path>` (short `-j`).
 * stdout/stderr here use a **different, `[Rust]`/`[Download]`/`[Stats]`-prefixed
   style** — *not* the `[P:]/[S:]/[E:]/[D:]` markers of §1.1.
 * **Ingest progress** (stdout): `[Rust] Progress: <n>/<total>` (emitted every 10
   tiles and once at completion) — `println!("[Rust] Progress: {}/{}", curr, total)`.
+* **Ingest diagnostic lines** (stdout; `aether_converter` ≥ 0.2.7, changelog
+  31; **diagnostic, not parsed** — for people reading a log, wording may
+  change, consumers must not match them). Every tile, single job or batch,
+  prints when its terrain is sampled:
+
+  ```
+  [Rust] tile <name>: <n> sources, header <s>s (open <ms> ms, read <ms> ms avg), decode <s>s (<files> files, <MB> MB read), sample <s>s, bands <n>
+  ```
+
+  `header` is the wall time of resolving the tile's source headers (open and
+  read-and-parse averaged over the headers this tile actually read — 0 when
+  all came from the batch's header cache), `decode` the window loads (files
+  read from disk and bytes read; windows served from the chunk cache cost no
+  file), `sample` the resampling, `bands` the row bands. An `ingest` process
+  prints at exit — after the batch result, also when the run fails:
+
+  ```
+  [Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>
+  ```
+
+  (`getrusage` on Unix: minor + major faults; `GetProcessTimes` /
+  `GetProcessMemoryInfo` `PageFaultCount` on Windows). `threads` is the
+  batch's worker-pool size (the `[Rust] Rayon Pool:` count); the field and
+  its comma are omitted when no batch ran (a single-job file). Neither line
+  contains `Progress:` or starts with `[Tile]`.
+* **Per-tile coverage line** (stdout, batch ingest only; `aether_converter`
+  ≥ 0.2.7, changelog 33). After each tile that was written:
+
+  ```
+  [Tile] <output file name> covered=<covered_px>/<total_px>
+  ```
+
+  `<output file name>` is the last component of the job's `output_path`
+  (lossy UTF-8; it may contain spaces — split on the **last** ` covered=`),
+  `<covered_px>` the output pixels a source supplied **before** `void_fill_m`
+  is applied, `<total_px>` = `size_px²`. `covered=0/…` is an all-void tile
+  (or an all-`void_fill_m` one); `covered=<t>/<t>` a full one. Lines come in
+  completion order (tiles run in parallel), each written and flushed together
+  with the `[Rust] Progress:` line it precedes, so every tile counted by a
+  progress line has had its `[Tile]` line. A tile that failed prints its
+  `[Error] Failed to process tile:` line instead and no `[Tile]` line. The
+  single-job form (a JSON object) prints none.
+
+  > **Parsed interface (frozen).** The Waveshed QGIS plugin reads `[Tile]`
+  > lines to learn per-tile coverage without opening the tiles. Treat the
+  > prefix, the `covered=` key and the `<n>/<m>` integers like the
+  > `[Rust] Progress:` line: changing them is a breaking change. A converter
+  > older than 0.2.7 prints no `[Tile]` lines — a consumer must then treat
+  > every tile's coverage as **unknown** (not as void, not as full), and
+  > likewise for any tile whose line it did not see.
+* **Tile files are replaced atomically (`aether_converter` ≥ 0.2.7,
+  changelog 34).** `ingest` writes each `.abt` to `<output_path>.tmp-<pid>`
+  in the same directory (`<pid>` = the converter's process id), then
+  `flush`, `sync_data`, close, and renames it over `output_path`. Any failure
+  on the way — a full disk, an I/O error, a failed final flush — removes the
+  temp file and fails the tile (`[Error] Failed to process tile: …`); it
+  never leaves a truncated file under the final name. An existing tile is
+  **replaced by a new inode, never truncated and rewritten in place**, so
+  other names hardlinked to the old tile (e.g. views of a tile pool) keep
+  the old bytes. Consumers that scan output directories should ignore (and
+  may delete, once no converter runs) `*.abt.tmp-*` files left by a killed
+  converter. The `.abt` bytes are unchanged (§6). Note for Windows callers:
+  a tile another process holds open without delete sharing makes the rename
+  fail, which fails the tile and keeps the old file — previously the
+  truncate-in-place failed the same way.
 * **Ingest failure modes (v2.0, fail-loudly).** A job file that parses as
   neither a single job nor a job array now **fails with the parse error**
   (it used to exit 0 having done nothing). A listed terrain source that cannot
@@ -578,10 +737,28 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   resolution list, and requests over 2,000,000 tiles (`bbox too large`) all
   fail with a non-zero exit.
 * **Download progress** (stderr):
-  `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight`,
+  `[Download] <pct>% (<done>/<total>) — <MB/s>, <errors> errors, <in-flight> in-flight, window <w>`,
   printed whenever `<pct>` (= `done * 100 / total`, rounded down) reaches a
   new whole percent, and once more at `done == total` (changelog item 29;
   it used to be every 10 %). Parse any `<pct>`, never a fixed step.
+  `, window <w>` — the connection window at that moment — is a **trailing
+  field** added by changelog 30 (CLI `download`; the in-memory downloader's
+  line still ends at `in-flight`): parse the prefix
+  `[Download] <pct>% (<done>/<total>)` and treat the later fields as
+  optional, as the Waveshed plugin does.
+
+  `<total>` is the number of source tiles the run **fetches**, announced
+  once before any request as the 4th number of the pass header
+  `[Download] z=<z> tiles=<nx>x<ny>=<total> (~<mb>MB) connections=<c>`.
+  Since changelog 30 that is the tiles that touch at least one requested
+  output tile (`tiles[]`, §9b) — no longer always `<nx> × <ny>`, the
+  bounding rectangle, which still fixes the assembly grid. `[Stats] Tiles:`
+  `<total>` and the majority rule below count the same tiles. When fewer
+  than `<nx> × <ny>` are fetched, an informational line follows the header:
+  `[Download] fetching <total> of the <nx·ny> source tiles in the bounding
+  rectangle; the other <m> touch no requested output tile` (one line). A
+  skipped tile is one no output pixel samples, so `.abt` bytes are
+  identical to fetching the whole rectangle.
 
   > **Parsed interface (frozen).** The `download` subcommand's stdout/stderr
   > progress lines — the `[Download] …` progress format above and the
@@ -632,12 +809,15 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   bounded by one 30 s deadline (all ancestor zooms requested concurrently), so
   a silent server costs a tile at most `6 × 15 s + 23 s + 30 s` = 143 s.
   Since changelog item 28 the CLI `download` also caps each source tile at
-  **60 s across all attempts, back-offs and `Retry-After` waits** (job field
-  `tile_deadline_s`, §9b): a tile still unfinished then — silent, or trickling
-  with gaps under 15 s, which had no limit before — stops as a `timeout`
-  failure and goes to the parent fill, so its worst case is 60 + 30 = 90 s.
-  Each ancestor tile is fetched at most once per run and shared by every
-  descendant that needs it.
+  one deadline **across all attempts, back-offs and `Retry-After` waits** —
+  **20 s** since changelog 30 (60 s before; job field `tile_deadline_s`,
+  §9b): a tile still unfinished then — silent, trickling with gaps under
+  15 s, or still answering 429/503 — stops as a `timeout` failure and goes
+  to the parent fill (a `[Degraded] … reason=timeout` tile when an ancestor
+  fills it, which a consumer's repair job refetches), so its worst case is
+  20 + 30 = 50 s. A tile keeps its connection slot through its retries and
+  back-offs and hands it back before the parent fill. Each ancestor tile is
+  fetched at most once per run and shared by every descendant that needs it.
 
   Additive lines (CLI `download`, changelog item 27; not frozen in wording —
   match the prefix):
@@ -657,6 +837,39 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   replace the undocumented `[Download] SLOW tile …` line (wall time > 5 s),
   which flagged nearly every tile on any link where the connections outnumber
   the bandwidth and is no longer printed.
+
+  The connection window since changelog 30 (the line's format is unchanged):
+  `<max>` = `max_connections` (default 256) concurrent requests; the window
+  is cut by 25 % in a second only when **≥ 3 responses in that second were
+  HTTP 429 or 503**, never below `<lo>` = max(`<max>`/4, 16) (at most
+  `<max>`), and grows by 10 % per second without such a burst back to
+  `<max>`. Timeouts, connection resets and slow bodies never move it. A cut
+  only gates new requests — nothing in flight is withdrawn or "owed" — and
+  `<k>` counts the cuts. (The AIMD window of changelog 27e halved on any
+  timeout/reset/429/503 burst or a slow median body and collapsed a
+  250 Mbit/s link to a trickle.)
+
+  Additive lines (CLI `download`, changelog 30; informational, match the
+  prefix):
+
+  ```
+  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available; re-evaluated before every strip)
+  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available)
+  ```
+
+  The first replaces `[Download] RAM: <a> GB available, ~<m> MB/strip,
+  prefetch depth: <d>`; the second appears whenever a re-evaluation changes
+  the strip rows. Decoded source tiles (`edge² × 4` bytes each) are held from
+  arrival until their strip is assembled, so the run budgets them: before
+  every strip launch, budget = min(available RAM / 4, 2 GiB), at least
+  256 MiB; strip rows = clamp(budget / 2 / (`<nx>` × edge² × 4 B), 1, 32),
+  so two strips fit (edge = 512 until the first tile decodes); a strip
+  starts only when its bytes plus those of every launched, not yet
+  assembled strip fit the budget (or none is outstanding), and only once
+  the strips in flight have fewer unstarted tiles than the connection
+  window. Each output row samples exactly one tile-row, so strip size never
+  changes a byte. `[Download] <s> strips, <r> tile-rows/strip, …` reports
+  the initial plan; `[Strip i/n]` lines count against the current estimate.
 * **Disk-space failure — `[MPT-critical]` / QGIS-critical.** When the estimated
   `.abt` output exceeds free space, `download` **fails** (`anyhow::bail!`, non-zero
   exit). The exact and only emitted string (`crates/aether_converter/src/download.rs`,
@@ -817,6 +1030,90 @@ aether_converter plan --south S --north N --west W --east E --resolutions 30,90
   > correct where it was previously fooled by a full-size sea-level tile.
   > Nothing changes for a run that exits 0.
 
+### 1.2a `aether_converter probe` (raw GeoTIFF header facts, `aether-probe/1`)
+
+Additive, `aether_converter` ≥ 0.2.7 (changelog 32, `last_chunk_end` 35; gate on `--version`,
+§1.5 — older builds reject the sub-command with clap's exit `2`).
+
+```
+aether_converter probe --list <file> [--jobs N]     # one path per line, UTF-8
+aether_converter probe --stdin [--jobs N]           # the same list on stdin
+```
+
+Reads the **header** of every listed file — the first IFD, and the IFD chain
+for the overview count — with a few positioned 16 KB reads through the
+ingest block reader; pixel data is never read and of the strip/tile offset
+tables only the last block's entry (`last_chunk_end`, changelog 35); nothing
+is decoded, reprojected or footprinted (the caller does its own CRS work). Files are probed in parallel by `--jobs` workers (default
+`min(64, 4 × CPUs)`; each opens, reads and closes its file).
+
+* **Input.** One path per line; `\n` or `\r\n`; blank lines skipped; a
+  leading UTF-8 BOM dropped; nothing else trimmed. A list that is not UTF-8
+  or cannot be read fails the run (non-zero exit, nothing on stdout).
+* **stdout:** exactly one JSON object per listed path, one per line (JSON
+  Lines), **in list order**: a line is written once every earlier line is
+  out, and stdout is flushed whenever no further result is ready, so a
+  reader sees lines progressively. Schema `schemas/probe_output.schema.json`;
+  fixture `fixtures/outputs/probe_output.jsonl`.
+* **stderr:** one final line,
+  `[Probe] <n> files, <ok> ok, <s.ss>s, open <ms> ms avg, read <ms> ms avg`
+  (`open` = the open call, `read` = stat + header reads, both averaged over
+  all `n` files, two decimals). Diagnostic, not frozen.
+* **Exit code** 0 whenever the list was read and stdout written, whatever
+  the files were: an unreadable or non-TIFF file is an `ok: false` line,
+  never an error.
+
+Every line carries `schema: "aether-probe/1"`, `path` (the list line as
+given), `ok`, and `size` / `mtime` / `mtime_ns` (`null` when the file cannot
+be stat'ed). `mtime` is exactly Python's `int(os.stat(p).st_mtime)` and
+`mtime_ns` exactly `os.stat(p).st_mtime_ns`, so either fingerprint the
+Waveshed plugin keeps (`size:mtime`, `size:mtime_ns`) can be compared without
+a second stat. An `ok: false` line adds only `reason` and carries **no**
+header fields. An `ok: true` line carries all of:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `width`, `height` | int | ImageWidth / ImageLength. |
+| `bands` | int | SamplesPerPixel — always `1` on an `ok: true` line. |
+| `dtype` | string | `u8 i8 u16 i16 u32 i32 u64 i64 f32 f64` (SampleFormat × BitsPerSample; `i8` = GDAL < 3.7's Byte + `PIXELTYPE=SIGNEDBYTE`). |
+| `compression` | `{code, name}` | Compression tag (`1` when absent) and GDAL's name for it (`NONE LZW DEFLATE PACKBITS JPEG ZSTD WEBP LERC LZMA JXL …`, `UNKNOWN` otherwise; `LERC` whatever GDAL's `LERC_DEFLATE`/`LERC_ZSTD`). Not a promise that `ingest` decodes it (§9a). |
+| `predictor` | int | Predictor tag; `1` when absent. |
+| `tiled`, `tile_w`, `tile_h` | bool, int, int | TileWidth/TileLength; for a stripped file `tiled: false`, `tile_w` = width, `tile_h` = RowsPerStrip clamped to the height. |
+| `epsg` | int \| null | Horizontal EPSG code from the GeoKeys — ProjectedCSTypeGeoKey, else GeographicTypeGeoKey (the rule `ingest` uses, §9a; a vertical code is ignored). `null` = the file carries no CRS (no GeoKeyDirectory, or one naming no coordinate system). |
+| `proj` | string \| null | Reserved for a CRS the GeoKeys define without an EPSG code; always `null` in `aether-probe/1` (such files are `ok: false`). Accept a string here. |
+| `geotransform` | 6 numbers | GDAL order `[x0, dx, rx, y0, ry, dy]`: ModelPixelScale (both steps non-zero) + the first ModelTiepoint, as GDAL prefers, else ModelTransformation; a negative ScaleY is read north-up (GDAL's default); a `RasterPixelIsPoint` origin is shifted to the pixel corner exactly as GDAL does (`x0 -= (dx+rx)/2`, `y0 -= (ry+dy)/2`). |
+| `rotated` | bool | `rx != 0` or `ry != 0` (`ingest` refuses such sources). |
+| `pixel_is_point` | bool | GTRasterTypeGeoKey = RasterPixelIsPoint (GDAL `AREA_OR_POINT=Point`). |
+| `nodata` | number \| null \| `"nan"` \| `"inf"` \| `"-inf"` | GDAL_NODATA as GDAL parses it; the strings stand for the values JSON numbers cannot carry. |
+| `scale`, `offset` | number \| null | Band-1 SCALE / OFFSET items of GDAL_METADATA (what `ingest` applies); `null` when absent (= 1 / 0). |
+| `overviews` | int | Later IFDs flagged reduced-resolution (NewSubfileType bit 0) and not mask (bit 2), with the image's sample count — GDAL's `GetOverviewCount()` without external `.ovr`. |
+| `ifd_offset` | int | Offset of the first IFD (GDAL band metadata `IFD_OFFSET`, domain `TIFF`). |
+| `last_chunk_end` | int \| null | Additive (changelog 35). Where the pixel data ends: offset + byte count of the image's **last** strip/tile (index block count − 1 of TileOffsets/TileByteCounts, else StripOffsets/StripByteCounts — the bottom-right block, the one GDAL's truncation test reads; GDAL band metadata `BLOCK_OFFSET_x_y` + `BLOCK_SIZE_x_y`, domain `TIFF`). `0` when that block is sparse (byte count 0, which GDAL reads as empty). **Greater than `size` = cut off behind an intact header**: GDAL opens the file but cannot read that block. `null` = the arrays cannot be read (absent, shorter than the block count, not unsigned integers, past the end of the file) — GDAL cannot read the block either. Absent from converters built before changelog 35: then do not take the pixel data as complete. |
+
+**`ok: true` means GDAL-equal.** Every field above equals what GDAL reports
+for the same file — `tools/probe_vs_gdal.py` checks it field by field over a
+GDAL-written matrix (10 dtypes × NONE/LZW/DEFLATE/PACKBITS/ZSTD × predictors
+× strips/tiles × byte orders, COG and `gdaladdo` overviews, internal masks,
+BigTIFF, PixelIsPoint, rotation, scale/offset, NaN nodata, compound and
+geographic CRSs, LERC, JPEG, LZMA, an IFD rewritten at the end of the file).
+Two documented differences: `tile_h` of a **single uncompressed strip** is
+the file's RowsPerStrip, where GDAL shows libtiff's ~8 KB virtual strips;
+and `scale`/`offset` are `null` where GDAL reports an explicit `1`/`0` for
+a file with a vertical CRS. Sidecars (`.aux.xml`, `.ovr`, `.prj`) are not
+read: a value GDAL takes from one is the caller's concern.
+
+**`ok: false` → ask GDAL.** `reason` is human-readable and starts with one
+of: `cannot open`, `cannot stat`, `not a regular file`, `not a TIFF file`
+(an `.abt` says so), `corrupt TIFF`, `corrupt BigTIFF header`, `truncated
+TIFF`, `read error`, `multi-band` (SamplesPerPixel > 1, alpha included),
+`palette`, `sub-byte samples`, `complex samples`, `unsupported sample type`
+(e.g. 12-bit or Float16), `photometric interpretation` (anything but
+BlackIsZero), `no geotransform`, `GCP georeferencing`, `non-finite
+geotransform`, `user-defined CRS` (ProjectedCSType/GeographicType 32767 or
+0, or CRS parameter keys without a code), `GDAL_NODATA` / `GDAL_METADATA`
+(an unparseable value). The caller falls back to GDAL for exactly those
+files; the list of prefixes may grow (additively).
+
 ### 1.3 `aether_export`
 
 ```
@@ -896,6 +1193,9 @@ Known capability gates consumers rely on:
 | `aether_core` coverage at resolutions outside `{2, 5, 10, 30}` m on the GPU backend (the hardcoded list was removed; the CPU/WASM paths never had it) | `aether_core 0.4.3` |
 | `aether_core --fingerprint` | `aether_core 0.4.2` |
 | `download` job fields `repair_source_tiles` and `tile_deadline_s` (§9b; older builds ignore both silently — a repair job would run as a full download over the existing files) | `aether_converter 0.2.6` |
+| `probe` subcommand (§1.2a; older builds exit `2`, unknown sub-command) | `aether_converter 0.2.7` |
+| `[Tile] <name> covered=<c>/<t>` lines in batch `ingest` (§1.2; absent before → coverage unknown) | `aether_converter 0.2.7` |
+| Atomic tile replacement in `ingest` (temp file + rename; §1.2, §6) | `aether_converter 0.2.7` |
 
 ---
 
@@ -1375,6 +1675,14 @@ and rounded once at the end. Two rules qualify it:
 > that cache tiles keyed on converter behaviour must invalidate (the Waveshed
 > plugin bumps its pool cache schema for this).
 
+**How `ingest` writes a tile (≥ 0.2.7, changelog 34).** Bytes go to
+`<output_path>.tmp-<pid>` beside the output, are flushed and `sync_data`'d,
+and the file is renamed over `output_path` only then. A reader therefore
+sees either the previous complete tile or the new complete one — never a
+partial file under the final name — and a replaced tile is a **new inode**
+(hardlinks to the old tile keep the old bytes). The byte layout above is
+unchanged. (`download` writes its `.abt` files as before.)
+
 **Row stride details.**
 * `row_stride` is a stored `u16`, so it caps the maximum tile width at
   **≈ 32 000 px** (`row_stride ≤ 65535` bytes ⇒ ≤ ~32 640 px at 2 bytes/px).
@@ -1720,11 +2028,11 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `encoding` | string | **required** | `"terrarium"` or `"mapbox"` (case-insensitive). Any other value fails: `Unknown encoding '<x>'`. |
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
-| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` starts at this value and treats it as the ceiling of an adaptive (AIMD) window: once a second it halves (floor `min(16, max_connections)`) after ≥ 3 timeouts/resets/HTTP 429/503 in that second or a median body-chunk gap over 5 s, and grows by 8 after a clean second. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` (§1.2). |
+| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
-| `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **60**. At expiry the tile stops as a `timeout` failure (counted by the adaptive window as a congestion event) and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
+| `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **20** (changelog 30; was 60). At expiry the tile stops as a `timeout` failure and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
 | `repair_source_tiles` | array of `[z, x, y]`? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6 (gate on `--version`, §1.5: older builds ignore the field and download the whole job). Fetch **only** these source tiles and patch them into the job's **existing** `.abt` files — see *Repair jobs* below. |
 
 `SubTileSpec`:
@@ -2064,6 +2372,8 @@ Every release from the first signed engine release on also publishes
 | license-blob length check (must accept 84 **and** 116) | QGIS `…/api_key.py`; pipeline GUI `inspect_key` |
 | WASM backend selection | `AETHER/rust/aether_core_wasm/src/lib.rs` |
 | `.abt` writer, disk-space string, download job | `crates/aether_converter/src/{download.rs,ingest.rs}` |
+| `probe` (`aether-probe/1`), its GDAL cross-check | `crates/aether_converter/src/probe.rs`, `tools/probe_vs_gdal.py`, `schemas/probe_output.schema.json` |
+| `[Tile]` line, atomic tile replacement | `crates/aether_converter/src/{main.rs,ingest.rs}` (`TileFile`) |
 | ATIL reader, GeoTIFF export | `crates/aether_export/src/main.rs` |
 | `.vix` writer, ATIL reader, COG output | `crates/aether_aggregate/src/{aggregate.rs,reader.rs,writer.rs}` |
 | `.vix` reader (consumer) | `MPT_SIGMA/…/core/vix_reader.py` |

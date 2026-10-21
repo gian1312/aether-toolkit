@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waveshed.io/schemas/aether/probe_output.schema.json",
+  "title": "aether_converter probe output line",
+  "description": "ONE line of `aether_converter probe --list <file>` (or `--stdin`) stdout: a JSON object per listed file, in list order (JSON Lines). Raw GeoTIFF header facts read from the IFDs with a few positioned reads (plus the last block's offset/byte count) — no pixels, no reprojection, no footprint. Every fact on an ok:true line equals what GDAL reports for the file (tools/probe_vs_gdal.py), except tile_h of a single uncompressed strip (the file's RowsPerStrip; GDAL shows libtiff's ~8 KB virtual strips) and scale/offset null where GDAL says 1/0 for a vertical CRS. A file the reader cannot vouch for is ok:false with a reason; the caller falls back to GDAL for it. Authoritative source: crates/aether_converter/src/probe.rs; contract: docs/CONTRACT.md §1.2 'probe'. Additive since aether_converter 0.2.7.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema", "path", "ok", "size", "mtime", "mtime_ns"],
+  "properties": {
+    "schema": { "const": "aether-probe/1", "description": "Line format discriminator." },
+    "path": { "type": "string", "description": "The list line exactly as given (not normalized)." },
+    "ok": { "type": "boolean", "description": "true: every header field below is present and GDAL-equal. false: only schema/path/ok/reason/size/mtime/mtime_ns." },
+    "reason": { "type": "string", "description": "Present only when ok is false. Human-readable; starts with one of: 'cannot open', 'cannot stat', 'not a regular file', 'not a TIFF file', 'corrupt TIFF', 'corrupt BigTIFF header', 'truncated TIFF', 'read error', 'multi-band', 'palette', 'sub-byte samples', 'complex samples', 'unsupported sample type', 'photometric interpretation', 'no geotransform', 'GCP georeferencing', 'non-finite geotransform', 'user-defined CRS', 'GDAL_NODATA', 'GDAL_METADATA'." },
+    "size": { "type": ["integer", "null"], "minimum": 0, "description": "File size in bytes (os.stat st_size); null when the file cannot be stat'ed." },
+    "mtime": { "type": ["integer", "null"], "description": "Modification time in whole seconds, exactly Python's int(os.stat(p).st_mtime) (the plugin's size:mtime fingerprint)." },
+    "mtime_ns": { "type": ["integer", "null"], "description": "Modification time in nanoseconds, exactly Python's os.stat(p).st_mtime_ns (the plugin's terrain-index fingerprint)." },
+    "width": { "type": "integer", "minimum": 1 },
+    "height": { "type": "integer", "minimum": 1 },
+    "bands": { "const": 1, "description": "Samples per pixel; anything else is ok:false 'multi-band'." },
+    "dtype": { "enum": ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"], "description": "GDAL data type (i8 = GDAL Byte with PIXELTYPE=SIGNEDBYTE before GDAL 3.7)." },
+    "compression": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["code", "name"],
+      "properties": {
+        "code": { "type": "integer", "minimum": 0, "maximum": 65535, "description": "TIFF Compression tag (259); 1 when absent." },
+        "name": { "type": "string", "description": "GDAL's COMPRESSION name (NONE, LZW, DEFLATE, PACKBITS, JPEG, ZSTD, WEBP, LERC, LZMA, JXL, CCITT*, …; UNKNOWN otherwise). LERC whatever its inner codec (GDAL: LERC_DEFLATE/LERC_ZSTD). Says nothing about whether ingest decodes it." }
+      }
+    },
+    "predictor": { "type": "integer", "minimum": 1, "description": "TIFF Predictor (317); 1 when absent." },
+    "tiled": { "type": "boolean" },
+    "tile_w": { "type": "integer", "minimum": 1, "description": "TileWidth, or the image width for a stripped file." },
+    "tile_h": { "type": "integer", "minimum": 1, "description": "TileLength, or RowsPerStrip (clamped to the height) for a stripped file." },
+    "epsg": { "type": ["integer", "null"], "description": "Horizontal EPSG code from the GeoKeys: ProjectedCSTypeGeoKey, else GeographicTypeGeoKey (a vertical code is ignored). null: the file carries no CRS at all (no GeoKeyDirectory, or one naming no coordinate system). Keys describing a CRS without an EPSG code are ok:false 'user-defined CRS'." },
+    "proj": { "type": ["string", "null"], "description": "Reserved for a CRS the GeoKeys define without an EPSG code. Always null in aether-probe/1 (such files are ok:false); consumers must accept a string here." },
+    "geotransform": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 6,
+      "maxItems": 6,
+      "description": "GDAL order [x0, dx, rx, y0, ry, dy], from ModelPixelScale + the first ModelTiepoint (preferred, as GDAL), else ModelTransformation; a RasterPixelIsPoint origin already shifted to the pixel corner as GDAL does."
+    },
+    "rotated": { "type": "boolean", "description": "geotransform[2] != 0 or geotransform[4] != 0 (ingest refuses such sources)." },
+    "pixel_is_point": { "type": "boolean", "description": "GTRasterTypeGeoKey = RasterPixelIsPoint (GDAL AREA_OR_POINT=Point)." },
+    "nodata": {
+      "oneOf": [
+        { "type": "number" },
+        { "type": "null" },
+        { "enum": ["nan", "inf", "-inf"] }
+      ],
+      "description": "GDAL_NODATA (42113) as GDAL parses it; null when absent; the strings for values JSON numbers cannot carry."
+    },
+    "scale": { "type": ["number", "null"], "description": "Band-1 SCALE item of GDAL_METADATA (42112); null when absent (= 1)." },
+    "offset": { "type": ["number", "null"], "description": "Band-1 OFFSET item of GDAL_METADATA (42112); null when absent (= 0)." },
+    "overviews": { "type": "integer", "minimum": 0, "description": "Internal overviews: later IFDs with NewSubfileType bit 0 (reduced resolution) and not bit 2 (mask), with the image's sample count — GDAL's GetOverviewCount() without external .ovr files." },
+    "ifd_offset": { "type": "integer", "minimum": 8, "description": "Byte offset of the first IFD (GDAL band metadata IFD_OFFSET, domain TIFF)." },
+    "last_chunk_end": { "type": ["integer", "null"], "minimum": 0, "description": "Additive (CONTRACT changelog 35). Where the pixel data ends: offset + byte count of the image's LAST strip/tile (block count - 1 of the first IFD's TileOffsets/TileByteCounts, else StripOffsets/StripByteCounts) — the bottom-right block GDAL's truncation test reads; 0 when that block is sparse (byte count 0, read by GDAL as empty). Greater than size: the file is cut off behind an intact header (GDAL cannot read that block). null: those arrays cannot be read (absent, shorter than the block count, not unsigned integers, or past the end of the file) — GDAL cannot read the block either. Absent only from converters built before changelog 35: a consumer must then not take the pixel data as complete." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ok": { "const": true } } },
+      "then": {
+        "required": ["width", "height", "bands", "dtype", "compression", "predictor", "tiled", "tile_w", "tile_h",
+                     "epsg", "proj", "geotransform", "rotated", "pixel_is_point", "nodata", "scale", "offset",
+                     "overviews", "ifd_offset", "last_chunk_end"],
+        "not": { "required": ["reason"] }
+      },
+      "else": { "required": ["reason"] }
+    }
+  ]
+}

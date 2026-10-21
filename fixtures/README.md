@@ -35,6 +35,8 @@ fixtures/
 │   ├── tiny_16x16.abt       # .abt terrain tile, v1 R16SINT, 16x16 px (§6)
 │   ├── tiny_los.bit         # ATIL container, 1 tile, 1BIT_LOS, 512x512 (§7)
 │   └── tiny_los.json        # sidecar matching tiny_los.bit (§5a)
+├── outputs/                 # CLI stdout examples
+│   └── probe_output.jsonl   # aether_converter probe lines, ok:true and ok:false (§1.2a)
 └── keys/                     # license-key structural goldens (generated) — see keys/README.md
     ├── README.md            # byte layout + worked example + why no real key
     ├── v1_unsigned.blob     # decoded v1 key blob, 84 B, zero signature (§10)
@@ -65,3 +67,15 @@ fixtures/
 
 Both scripts are stdlib-only (no third-party dependencies) and are not yet wired
 into CI.
+
+* **Check `probe` against GDAL** (needs GDAL's Python bindings + numpy; writes
+  a GDAL matrix under `target/probe_vs_gdal`, removed afterwards):
+
+  ```sh
+  python3 tools/probe_vs_gdal.py --bin target/release/aether_converter
+  ```
+
+  `outputs/probe_output.jsonl` is a real `probe` run (a swissALTI3D tile, a
+  COG with overviews and NaN nodata, a scaled Int16 UTM grid, a swissALTI3D
+  tile cut off behind its header — `last_chunk_end` > `size` —, an RGB scan,
+  a custom-CRS grid, a vanished path), with the paths made relative.

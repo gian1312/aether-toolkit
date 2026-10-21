@@ -23,7 +23,7 @@ dependencies = [
 
 [[package]]
 name = "aether_converter"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -54,6 +54,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "weezl",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 

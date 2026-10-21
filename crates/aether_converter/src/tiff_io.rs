@@ -44,6 +44,19 @@ fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     f.read(buf)
 }
 
+thread_local! {
+    /// Bytes [`read_full_at`] has read on this thread (diagnostics only).
+    static BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes read from source files on this thread so far — every positioned
+/// read of the ingest path goes through [`read_full_at`]. A caller takes the
+/// difference around a call that stays on one thread (the per-tile
+/// `[Rust] tile …` diagnostic line).
+pub(crate) fn thread_bytes_read() -> u64 {
+    BYTES_READ.with(|c| c.get())
+}
+
 /// Fill `buf` from `offset` with positioned reads; returns the bytes read,
 /// fewer than `buf.len()` only at end of file.
 pub(crate) fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
@@ -56,6 +69,7 @@ pub(crate) fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Resu
             Err(e) => return Err(e),
         }
     }
+    BYTES_READ.with(|c| c.set(c.get() + done as u64));
     Ok(done)
 }
 

@@ -12,6 +12,8 @@ Stdlib only — no ``jsonschema`` dependency. Two kinds of checks:
       (length discriminator, payload offsets, all-zero-fingerprint rule) per
       §10. The Ed25519 signature is deliberately NOT verified — that needs the
       vendor private key, which is out of scope for public fixtures by design.
+  (d) Line-by-line checks of the CLI output fixtures in ``fixtures/outputs/``
+      (``aether_converter probe`` JSON Lines, §1.2 / schemas/probe_output.schema.json).
 
 Exit code 0 means every check passed. Any mismatch is reported loudly and the
 script exits 1. Nothing here is wired into CI yet.
@@ -27,6 +29,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOBS_DIR = os.path.join(REPO_ROOT, "fixtures", "jobs")
 FORMATS_DIR = os.path.join(REPO_ROOT, "fixtures", "formats")
 KEYS_DIR = os.path.join(REPO_ROOT, "fixtures", "keys")
+OUTPUTS_DIR = os.path.join(REPO_ROOT, "fixtures", "outputs")
 
 ERRORS = []
 
@@ -405,6 +408,93 @@ def validate_key_fixtures():
         print(f"  checked {name}")
 
 
+# ── (d) CLI output fixtures ──────────────────────────────────────────────────
+
+PROBE_DTYPES = {"u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"}
+PROBE_OK_FIELDS = ("width", "height", "bands", "dtype", "compression", "predictor", "tiled",
+                   "tile_w", "tile_h", "epsg", "proj", "geotransform", "rotated", "pixel_is_point",
+                   "nodata", "scale", "offset", "overviews", "ifd_offset", "last_chunk_end")
+PROBE_REASONS = ("cannot open", "cannot stat", "not a regular file", "not a TIFF file", "corrupt TIFF",
+                 "corrupt BigTIFF header", "truncated TIFF", "read error", "multi-band", "palette",
+                 "sub-byte samples", "complex samples", "unsupported sample type",
+                 "photometric interpretation", "no geotransform", "GCP georeferencing",
+                 "non-finite geotransform", "user-defined CRS", "GDAL_NODATA", "GDAL_METADATA")
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def validate_probe_line(o, ctx):
+    """One `aether_converter probe` line (aether-probe/1, §1.2)."""
+    if not check(isinstance(o, dict), f"{ctx}: a probe line must be an object"):
+        return
+    check(o.get("schema") == "aether-probe/1", f"{ctx}: schema {o.get('schema')!r} != 'aether-probe/1'")
+    for k in ("path", "ok", "size", "mtime", "mtime_ns"):
+        _req(o, k, ctx)
+    check(isinstance(o.get("path"), str), f"{ctx}: path must be a string")
+    check(isinstance(o.get("ok"), bool), f"{ctx}: ok must be a boolean")
+    for k in ("size", "mtime", "mtime_ns"):
+        check(o.get(k) is None or _is_int(o.get(k)), f"{ctx}: {k} must be an integer or null")
+    if isinstance(o.get("mtime"), int) and isinstance(o.get("mtime_ns"), int):
+        check(abs(o["mtime_ns"] // 10**9 - o["mtime"]) <= 1, f"{ctx}: mtime and mtime_ns disagree")
+    if o.get("ok") is False:
+        r = o.get("reason")
+        check(isinstance(r, str) and r.startswith(PROBE_REASONS), f"{ctx}: reason {r!r} has no documented prefix")
+        check(not any(k in o for k in PROBE_OK_FIELDS), f"{ctx}: an ok:false line carries no header facts")
+        return
+    check("reason" not in o, f"{ctx}: an ok:true line has no reason")
+    for k in PROBE_OK_FIELDS:
+        _req(o, k, ctx)
+    for k in ("width", "height", "tile_w", "tile_h", "predictor"):
+        check(_is_int(o.get(k)) and o.get(k) >= 1, f"{ctx}: {k} must be a positive integer")
+    check(o.get("bands") == 1, f"{ctx}: bands must be 1 on an ok:true line")
+    _enum(o, "dtype", PROBE_DTYPES, ctx)
+    c = o.get("compression")
+    check(isinstance(c, dict) and _is_int(c.get("code")) and isinstance(c.get("name"), str),
+          f"{ctx}: compression must be {{code: int, name: str}}")
+    for k in ("tiled", "rotated", "pixel_is_point"):
+        check(isinstance(o.get(k), bool), f"{ctx}: {k} must be a boolean")
+    check(o.get("epsg") is None or _is_int(o.get("epsg")), f"{ctx}: epsg must be an integer or null")
+    check(o.get("proj") is None or isinstance(o.get("proj"), str), f"{ctx}: proj must be a string or null")
+    gt = o.get("geotransform")
+    if check(isinstance(gt, list) and len(gt) == 6 and all(_is_num(v) for v in gt),
+             f"{ctx}: geotransform must be 6 numbers"):
+        check(o.get("rotated") == (gt[2] != 0 or gt[4] != 0), f"{ctx}: rotated disagrees with geotransform")
+    nd = o.get("nodata")
+    check(nd is None or _is_num(nd) or nd in ("nan", "inf", "-inf"),
+          f"{ctx}: nodata must be a number, null, 'nan', 'inf' or '-inf'")
+    for k in ("scale", "offset"):
+        check(o.get(k) is None or _is_num(o.get(k)), f"{ctx}: {k} must be a number or null")
+    check(_is_int(o.get("overviews")) and o.get("overviews") >= 0, f"{ctx}: overviews must be a count")
+    check(_is_int(o.get("ifd_offset")) and o.get("ifd_offset") >= 8, f"{ctx}: ifd_offset must be >= 8")
+    # Changelog 35: where the pixel data ends (> size = cut off behind the header).
+    end = o.get("last_chunk_end")
+    check(end is None or (_is_int(end) and end >= 0),
+          f"{ctx}: last_chunk_end must be a non-negative integer or null")
+    if o.get("tiled") is False:
+        check(o.get("tile_w") == o.get("width"), f"{ctx}: a stripped file's tile_w is its width")
+
+
+def validate_probe_output(path, ctx):
+    if not check(os.path.exists(path), f"missing fixture {ctx}"):
+        return
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    check(len(lines) > 0, f"{ctx}: empty")
+    seen_ok = set()
+    for i, line in enumerate(lines, 1):
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError as ex:
+            check(False, f"{ctx}:{i}: invalid JSON: {ex}")
+            continue
+        validate_probe_line(o, f"{ctx}:{i}")
+        if isinstance(o, dict):
+            seen_ok.add(o.get("ok"))
+    check(seen_ok == {True, False}, f"{ctx}: the fixture must show both ok:true and ok:false lines")
+
+
 # ── Driver ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -446,6 +536,10 @@ def main():
 
     print("== (c) license-key structural fixtures ==")
     validate_key_fixtures()
+
+    print("== (d) CLI output fixtures ==")
+    validate_probe_output(os.path.join(OUTPUTS_DIR, "probe_output.jsonl"), "probe_output.jsonl")
+    print("  checked probe_output.jsonl")
 
     print()
     if ERRORS:

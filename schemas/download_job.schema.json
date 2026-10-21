@@ -40,7 +40,7 @@
         "null"
       ],
       "minimum": 1,
-      "description": "Concurrent HTTP connections. Defaults to 256 when absent. The CLI download starts here and uses it as the ceiling of an adaptive (AIMD) window that shrinks only on congestion (CONTRACT 9b, changelog 27)."
+      "description": "Concurrent HTTP connections. Defaults to 256 when absent. The CLI download runs a fixed pool of this many requests; its window is cut 25 % per second only on >= 3 HTTP 429/503 answers in that second (floor max(max_connections / 4, 16)) and grows 10 % per clean second back to this value; timeouts, resets and slow bodies never move it (CONTRACT 9b, changelog 30)."
     },
     "buildings_pbf_dir": {
       "type": [
@@ -91,7 +91,7 @@
       ],
       "exclusiveMinimum": 0,
       "maximum": 86400,
-      "description": "Per-source-tile wall-clock cap in seconds across all attempts, back-offs and Retry-After waits; absent = 60. At expiry the tile is a `timeout` failure and goes to the parent fill. CLI download only. Additive, aether_converter >= 0.2.6 (CONTRACT 9b, changelog 28)."
+      "description": "Per-source-tile wall-clock cap in seconds across all attempts, back-offs and Retry-After waits; absent = 20 (changelog 30; was 60). At expiry the tile is a `timeout` failure and goes to the parent fill. CLI download only. Additive, aether_converter >= 0.2.6 (CONTRACT 9b, changelog 28)."
     },
     "repair_source_tiles": {
       "type": [

@@ -82,7 +82,7 @@ pub struct DownloadJob {
     pub repair_source_tiles: Option<Vec<[u32; 3]>>,
     /// Per-source-tile wall-clock cap in seconds across all attempts,
     /// back-offs and `Retry-After` waits (additive, changelog 28). Absent →
-    /// [`TILE_DEADLINE`] (60 s). CLI `download` only.
+    /// [`TILE_DEADLINE`] (20 s since changelog 30). CLI `download` only.
     #[serde(default)]
     pub tile_deadline_s: Option<f64>,
 }
@@ -461,10 +461,10 @@ async fn fetch_decode_raw(
 /// deadline, retries plus `(zoom - NODATA_FILL_MIN_ZOOM) × 30 s` (8 × 30 s =
 /// 240 s at z14, which is how one stalled tile held a strip for ~5 minutes).
 ///
-/// Native `download_strip` has no total per-request timeout (see
+/// Native `download_tiles` has no total per-request timeout (see
 /// [`READ_IDLE_TIMEOUT`]) but a per-tile cap over all attempts
-/// ([`TILE_DEADLINE`], 60 s), so a silent or trickling server costs a tile
-/// 60 + 30 = 90 s at most (it was 6 × 15 + 23 + 30 = 143 s for a silent one
+/// ([`TILE_DEADLINE`], 20 s), so a silent or trickling server costs a tile
+/// 20 + 30 = 50 s at most (it was 6 × 15 + 23 + 30 = 143 s for a silent one
 /// and unbounded for a trickle), while a slow but steadily arriving body is
 /// allowed to finish inside the cap.
 ///
@@ -1346,7 +1346,7 @@ impl std::error::Error for HttpStatus {}
 
 /// The per-tile cap ([`TILE_DEADLINE`]) ran out — across attempts, back-offs
 /// and `Retry-After` waits. Classed `timeout` ([`FetchFailure::of`]), never
-/// retried, and reported to the adaptive window like a timeout.
+/// retried; like every timeout it never moves the connection window.
 #[derive(Debug)]
 struct TileDeadlineExpired;
 
@@ -1361,14 +1361,16 @@ impl std::error::Error for TileDeadlineExpired {}
 /// Wall-clock cap for one source tile across ALL its attempts, back-off
 /// sleeps and `Retry-After` waits (CLI `download`; changelog 28). When it
 /// runs out the tile stops, is classed `timeout`, and goes to the parent fill
-/// like any other failure ([`PARENT_FILL_DEADLINE`] on top: 90 s worst case).
+/// like any other failure ([`PARENT_FILL_DEADLINE`] on top: 50 s worst case).
 ///
 /// The read-idle timeout alone left two holes: a silent server cost
 /// 6 × 15 s attempts + 23 s back-off before the fill (113 s), and a trickle
-/// whose gaps stay under 15 s had no limit at all. 60 s still lets a large
-/// tile finish on a slow shared link (it gets four 15 s idle windows), and a
-/// job may set its own via `tile_deadline_s`.
-pub const TILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// whose gaps stay under 15 s had no limit at all. 20 s since changelog 30
+/// (60 s before): a tile still failing then is filled from a coarser zoom
+/// and reported `[Degraded]`, which the consumer's repair job refetches —
+/// holding a connection longer for one tile cost the whole pass more than
+/// that refetch does. A job may set its own via `tile_deadline_s`.
+pub const TILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn parse_retry_after(v: Option<&reqwest::header::HeaderValue>) -> Option<std::time::Duration> {
     let secs: u64 = v?.to_str().ok()?.trim().parse().ok()?;
@@ -1497,98 +1499,132 @@ async fn fetch_tile_body_until(
     }
 }
 
-// -- Adaptive concurrency (AIMD) ----------------------------------------------
+// -- Connection limiter -------------------------------------------------------
 
-/// Floor of the adaptive connection window.
+/// HTTP 429/503 answers within one second that cut the window.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-const AIMD_MIN_WINDOW: usize = 16;
-/// Window growth per clean second.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-const AIMD_STEP: usize = 8;
-/// Congestion events (timeouts, resets/connect failures, HTTP 429/503) within
-/// one second that halve the window.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-const AIMD_EVENTS_TO_HALVE: usize = 3;
-/// Fewest completed requests in a second for their median chunk gap to count.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-const AIMD_MIN_GAP_SAMPLES: usize = 5;
+const THROTTLE_EVENTS_TO_CUT: usize = 3;
 
-/// One AIMD decision, made once per second.
+/// The lowest the connection window goes: a quarter of the configured
+/// connections, at least 16 — and never above the configured value.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
+fn throttle_floor(max: usize) -> usize {
+    (max / 4).max(16).min(max)
+}
+
+/// One per-second window decision (CLI `download`, CONTRACT changelog 30).
 ///
-/// * `events >= 3`, or a median body-chunk gap over [`STALL_THRESHOLD`] —
-///   halve (down to `min`): the network or the server is saturated;
-/// * no event and no stall — grow by [`AIMD_STEP`] (up to `max`);
-/// * 1–2 events — hold: a lone reset is noise, not congestion.
+/// * `throttled >= 3` (that many responses in the second were HTTP 429 or
+///   503) — cut by 25 %, not below `floor`: the server asked us to slow down;
+/// * no such response — grow by 10 % (at least 1), not above `max`;
+/// * 1–2 — hold: a lone 503 is the server's business, not a trend.
+///
+/// Nothing else moves it: timeouts, connection resets and slow bodies are
+/// the network's weather, and shrinking the window on them is what collapsed
+/// a 250 Mbit/s link to a trickle (the old AIMD halved on any of them).
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-fn aimd_step(
-    window: usize, min: usize, max: usize, events: usize, gap_median: Option<f64>,
-) -> usize {
-    let stalled = gap_median.is_some_and(|g| g > STALL_THRESHOLD.as_secs_f64());
-    if events >= AIMD_EVENTS_TO_HALVE || stalled {
-        (window / 2).max(min)
-    } else if events == 0 {
-        (window + AIMD_STEP).min(max)
+fn throttle_step(window: usize, floor: usize, max: usize, throttled: usize) -> usize {
+    if throttled >= THROTTLE_EVENTS_TO_CUT {
+        (window - window / 4).max(floor)
+    } else if throttled == 0 {
+        (window + (window / 10).max(1)).min(max)
     } else {
         window
     }
 }
 
-/// The connection gate of one download run: a semaphore whose permit count
-/// follows an AIMD window between `min` and `max` (the job's
-/// `max_connections`, default 256). It starts AT `max`, so a clean link runs
-/// exactly as it always did; it only shrinks when the network says so, and
-/// grows back once it is clean again.
+/// The connection gate of one CLI `download` run: at most `max` (the job's
+/// `max_connections`, default 256) source-tile requests at once — a fixed
+/// semaphore, as the fast 0.2.x builds had — with one throttle on top: a
+/// window that a burst of HTTP 429/503 answers cuts by 25 % a second (floor
+/// [`throttle_floor`]) and clean seconds grow back by 10 %.
+///
+/// A cut applies to NEW acquisitions only: nothing is withdrawn from
+/// requests in flight and nothing is owed — a slot is admitted whenever fewer
+/// than `window` are active, so the moment a cut is lifted (or the window
+/// grows) waiting tiles start at once. A tile keeps its slot through its
+/// retries and back-offs (that is the implicit throttle of a failing server)
+/// and hands it back before the parent fill.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-struct Aimd {
+struct ConnGate {
+    /// `max` permits, never resized: the FIFO queue of waiting tiles.
     sem: Semaphore,
-    min: usize,
     max: usize,
+    floor: usize,
     window: AtomicUsize,
-    /// Permits still to be withdrawn: a shrink takes what is free at once and
-    /// the rest as in-flight requests hand theirs back.
-    owed: AtomicUsize,
-    events: AtomicUsize,
-    gaps: std::sync::Mutex<Vec<f64>>,
+    /// Slots admitted and not yet handed back.
+    active: AtomicUsize,
+    /// Wakes a tile waiting for admission (a slot came back, the window grew).
+    admit: tokio::sync::Notify,
+    /// HTTP 429/503 answers in the current second.
+    throttled: AtomicUsize,
     /// `Retry-After` gate: no new request before this, in ms since `t0`.
     not_before_ms: AtomicU64,
     t0: Instant,
     min_seen: AtomicUsize,
-    backoffs: AtomicUsize,
+    cuts: AtomicUsize,
+}
+
+/// One admitted request slot of a [`ConnGate`]; handed back on drop.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
+struct Slot<'a> {
+    _permit: tokio::sync::SemaphorePermit<'a>,
+    gate: &'a ConnGate,
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        self.gate.active.fetch_sub(1, Ordering::AcqRel);
+        self.gate.admit.notify_one();
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
-impl Aimd {
+impl ConnGate {
     fn new(max: usize) -> Self {
         let max = max.max(1);
         Self {
             sem: Semaphore::new(max),
-            min: AIMD_MIN_WINDOW.min(max),
             max,
+            floor: throttle_floor(max),
             window: AtomicUsize::new(max),
-            owed: AtomicUsize::new(0),
-            events: AtomicUsize::new(0),
-            gaps: std::sync::Mutex::new(Vec::new()),
+            active: AtomicUsize::new(0),
+            admit: tokio::sync::Notify::new(),
+            throttled: AtomicUsize::new(0),
             not_before_ms: AtomicU64::new(0),
             t0: Instant::now(),
             min_seen: AtomicUsize::new(max),
-            backoffs: AtomicUsize::new(0),
+            cuts: AtomicUsize::new(0),
         }
     }
 
     fn window(&self) -> usize { self.window.load(Ordering::Relaxed) }
 
-    /// Wait out any `Retry-After`, then take a connection slot.
-    async fn acquire(&self) -> tokio::sync::SemaphorePermit<'_> {
-        self.wait_retry_after().await;
-        self.sem.acquire().await.expect("download gate never closes")
-    }
+    /// Slots currently admitted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn active(&self) -> usize { self.active.load(Ordering::Relaxed) }
 
-    /// Hand a slot back — or retire it, while a shrink is still owed.
-    fn release(&self, permit: tokio::sync::SemaphorePermit<'_>) {
-        let paid = self.owed
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |o| o.checked_sub(1))
-            .is_ok();
-        if paid { permit.forget(); } else { drop(permit); }
+    /// Wait out any `Retry-After`, queue for a slot (FIFO), then wait until
+    /// fewer than `window` slots are active.
+    async fn acquire(&self) -> Slot<'_> {
+        self.wait_retry_after().await;
+        let permit = self.sem.acquire().await.expect("download gate never closes");
+        loop {
+            // Registered before the check: a slot handed back in between
+            // leaves a stored wake-up instead of being missed.
+            let woken = self.admit.notified();
+            let a = self.active.load(Ordering::Acquire);
+            if a < self.window.load(Ordering::Acquire) {
+                if self.active
+                    .compare_exchange(a, a + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return Slot { _permit: permit, gate: self };
+                }
+                continue;
+            }
+            woken.await;
+        }
     }
 
     async fn wait_retry_after(&self) {
@@ -1599,18 +1635,11 @@ impl Aimd {
         }
     }
 
-    /// Record one finished attempt: its failure (if any) and its timing.
-    fn observe(&self, failure: Option<FetchFailure>, timing: &FetchTiming,
-               retry_after: Option<std::time::Duration>) {
-        match failure {
-            None => {
-                if let Ok(mut g) = self.gaps.lock() { g.push(timing.max_gap.as_secs_f64()); }
-            }
-            Some(FetchFailure::Timeout | FetchFailure::Connect
-                 | FetchFailure::Http(429) | FetchFailure::Http(503)) => {
-                self.events.fetch_add(1, Ordering::Relaxed);
-            }
-            Some(_) => {}
+    /// Record one finished attempt: only HTTP 429/503 count toward a cut;
+    /// a `Retry-After` also holds back every new request until it passes.
+    fn observe(&self, failure: Option<FetchFailure>, retry_after: Option<std::time::Duration>) {
+        if matches!(failure, Some(FetchFailure::Http(429 | 503))) {
+            self.throttled.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(d) = retry_after {
             let until = (self.t0.elapsed() + d).as_millis() as u64;
@@ -1618,41 +1647,24 @@ impl Aimd {
         }
     }
 
-    /// The once-a-second decision ([`aimd_step`]) applied to the semaphore.
+    /// The once-a-second decision ([`throttle_step`]).
     fn tick(&self) {
-        let events = self.events.swap(0, Ordering::Relaxed);
-        let gaps = self.gaps.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
-        let median = (gaps.len() >= AIMD_MIN_GAP_SAMPLES).then(|| {
-            let mut g = gaps;
-            g.sort_by(|a, b| a.total_cmp(b));
-            g[g.len() / 2]
-        });
+        let throttled = self.throttled.swap(0, Ordering::Relaxed);
         let old = self.window();
-        let new = aimd_step(old, self.min, self.max, events, median);
-        self.resize(old, new);
-    }
-
-    fn resize(&self, old: usize, new: usize) {
-        if new < old {
-            let cut = old - new;
-            let now = self.sem.forget_permits(cut);
-            self.owed.fetch_add(cut - now, Ordering::AcqRel);
-            self.backoffs.fetch_add(1, Ordering::Relaxed);
-            self.min_seen.fetch_min(new, Ordering::Relaxed);
-        } else if new > old {
-            let mut add = new - old;
-            // Cancel outstanding debt before minting new permits.
-            while add > 0 {
-                let o = self.owed.load(Ordering::Acquire);
-                if o == 0 { break; }
-                let take = o.min(add);
-                if self.owed.compare_exchange(o, o - take, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                    add -= take;
-                }
-            }
-            if add > 0 { self.sem.add_permits(add); }
+        let new = throttle_step(old, self.floor, self.max, throttled);
+        if new == old {
+            return;
         }
-        self.window.store(new, Ordering::Relaxed);
+        self.window.store(new, Ordering::Release);
+        if new < old {
+            self.cuts.fetch_add(1, Ordering::Relaxed);
+            self.min_seen.fetch_min(new, Ordering::Relaxed);
+        } else {
+            // Admit up to the growth at once — no debt to pay off first.
+            for _ in 0..new - old {
+                self.admit.notify_one();
+            }
+        }
     }
 
     /// The `[Stats] Connection window:` line (additive, CONTRACT §1.2).
@@ -1660,7 +1672,7 @@ impl Aimd {
         format!(
             "[Stats] Connection window: start {}, min {}, final {} (adaptive {}..={}, {} back-off(s))",
             self.max, self.min_seen.load(Ordering::Relaxed), self.window(),
-            self.min, self.max, self.backoffs.load(Ordering::Relaxed)
+            self.floor, self.max, self.cuts.load(Ordering::Relaxed)
         )
     }
 }
@@ -1679,24 +1691,16 @@ struct FetchCtx<'a> {
     total: usize,
     stats: &'a DownloadStats,
     start_time: Instant,
-    gate: &'a Aimd,
+    gate: &'a ConnGate,
+    /// Tiles handed to [`download_tiles`] that have not been admitted by the
+    /// gate yet; each admission takes one off. The strip launcher reads it to
+    /// start the next strip before the pool runs dry (`None`: not tracked).
+    unstarted: Option<&'a AtomicUsize>,
     /// Shared ancestor fetches for the parent fill (one per run).
     ancestors: &'a Arc<AncestorCache>,
     /// Per-tile cap over all attempts ([`TILE_DEADLINE`] unless the job sets
     /// `tile_deadline_s`).
     tile_deadline: std::time::Duration,
-}
-
-/// One strip of the tile rectangle: tile-rows `strip_y0..=strip_y1`,
-/// columns `x0..=x1`.
-#[cfg(feature = "native")]
-async fn download_strip(
-    ctx: &FetchCtx<'_>, x0: u32, x1: u32, strip_y0: u32, strip_y1: u32,
-) -> Vec<(u32, u32, Result<(Vec<f32>, usize)>)> {
-    let coords: Vec<_> = (strip_y0..=strip_y1)
-        .flat_map(|ty| (x0..=x1).map(move |tx| (tx, ty)))
-        .collect();
-    download_tiles(ctx, coords).await
 }
 
 /// Fetch, retry, parent-fill, classify and report each tile in `coords`.
@@ -1706,7 +1710,7 @@ async fn download_tiles(
 ) -> Vec<(u32, u32, Result<(Vec<f32>, usize)>)> {
     let FetchCtx {
         client, url_template, zoom, dec, concurrency, progress, total, stats,
-        start_time, gate, ancestors, tile_deadline,
+        start_time, gate, unstarted, ancestors, tile_deadline,
     } = *ctx;
     let on_progress: Option<&(dyn Fn(usize, usize) + Send + Sync)> = None;
 
@@ -1722,9 +1726,13 @@ async fn download_tiles(
             let gate = gate;
             let on_progress = on_progress;
             async move {
-                // Adaptive global connection gate (AIMD) — also prevents the
-                // PREFETCH_DEPTH × conns explosion.
-                let permit = gate.acquire().await;
+                // The run's connection gate (fixed `max_connections`, cut
+                // only by 429/503 bursts) — also what keeps several strips
+                // in flight from multiplying the connections.
+                let slot = gate.acquire().await;
+                if let Some(u) = unstarted {
+                    u.fetch_sub(1, Ordering::Relaxed);
+                }
                 let t0 = Instant::now();
                 // The tile's whole budget: attempts, back-offs, Retry-After.
                 let deadline = tokio::time::Instant::now() + tile_deadline;
@@ -1748,10 +1756,10 @@ async fn download_tiles(
                 // All of it runs inside the tile's TILE_DEADLINE: an attempt
                 // still in flight at the deadline is abandoned, and a back-off
                 // or Retry-After that would end past it is not slept — either
-                // way the tile stops as a `timeout` failure (TileDeadlineExpired),
-                // which the window counts as a saturation event, and goes to
-                // the parent fill. That bounds the silent server (was up to
-                // 113 s before the fill) and the trickle (was unbounded).
+                // way the tile stops as a `timeout` failure (TileDeadlineExpired)
+                // and goes to the parent fill. That bounds the silent server
+                // and the trickle. The slot is HELD through every back-off: a
+                // failing server sees fewer requests without any window cut.
                 for attempt in 0..=MAX_RETRIES {
                     if attempt > 0 {
                         let backoff = std::time::Duration::from_millis(
@@ -1759,14 +1767,12 @@ async fn download_tiles(
                         let wait = backoff.max(retry_after.unwrap_or_default());
                         if tokio::time::Instant::now() + wait >= deadline {
                             result = Err(TileDeadlineExpired.into());
-                            gate.observe(Some(FetchFailure::Timeout), &FetchTiming::default(), None);
                             break;
                         }
                         stats.retries.fetch_add(1, Ordering::Relaxed);
                         tokio::time::sleep(wait).await;
                         if tokio::time::timeout_at(deadline, gate.wait_retry_after()).await.is_err() {
                             result = Err(TileDeadlineExpired.into());
-                            gate.observe(Some(FetchFailure::Timeout), &FetchTiming::default(), None);
                             break;
                         }
                     }
@@ -1782,13 +1788,20 @@ async fn download_tiles(
                     retry_after = result.as_ref().err()
                         .and_then(|e| e.downcast_ref::<HttpStatus>())
                         .and_then(|h| h.retry_after);
-                    gate.observe(result.as_ref().err().map(FetchFailure::of), &timing, retry_after);
+                    gate.observe(result.as_ref().err().map(FetchFailure::of), retry_after);
                     match &result {
                         Ok(_) => break,
                         Err(e) if !is_retryable(e) => break,
                         Err(_) => {}
                     }
                 }
+
+                // The request part is over: hand the slot back before the
+                // parent fill, whose ancestor fetches are shared per run and
+                // capped by their own deadline — a slot held idle through
+                // them (up to 30 s) is a connection no tile can use.
+                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+                drop(slot);
 
                 // Terrarium NODATA voids: if this tile came back with blank
                 // pixels, backfill only those from real (upsampled) data in the
@@ -1819,8 +1832,6 @@ async fn download_tiles(
                     }
                 }
 
-                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-                gate.release(permit);
                 let tile_us = t0.elapsed().as_micros() as u64;
                 stats.tile_us_sum.fetch_add(tile_us, Ordering::Relaxed);
                 stats.tile_us_max.fetch_max(tile_us, Ordering::Relaxed);
@@ -1893,9 +1904,11 @@ async fn download_tiles(
                     let tp = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
                     let errs = stats.total_errors();
                     let in_fl = stats.in_flight.load(Ordering::Relaxed);
+                    // `window` is a trailing field (changelog 30): the plugin
+                    // matches the prefix `[Download] <pct>% (<done>/<total>)`.
                     eprintln!(
-                        "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight",
-                        pct, done, total, tp, errs, in_fl
+                        "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight, window {}",
+                        pct, done, total, tp, errs, in_fl, gate.window()
                     );
                 }
 
@@ -2529,8 +2542,39 @@ fn job_tile_deadline(job: &DownloadJob) -> Result<std::time::Duration> {
     }
 }
 
+/// Knobs of [`run_download_tuned`] for tests and diagnosis. The output bytes
+/// never depend on them; `Default` is exactly what the CLI runs.
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DownloadTuning {
+    /// Upper bound on tile-rows per strip; the RAM budget may choose fewer.
+    pub max_strip_rows: Option<u32>,
+    /// Fetch every source tile of the job's bounding rectangle, as builds
+    /// before changelog 30 did, instead of only the tiles that touch a
+    /// requested output tile (comparison runs).
+    pub fetch_whole_rect: bool,
+}
+
+/// What a [`run_download_tuned`] run did (tests and diagnosis).
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DownloadReport {
+    /// Source tiles fetched (the `[Download] z=…` header's total).
+    pub tiles_fetched: usize,
+    /// Strips launched (0 for a repair job).
+    pub strips: usize,
+    /// The most tile-rows any strip had.
+    pub max_strip_rows: u32,
+}
+
 #[cfg(feature = "native")]
 pub fn run_download(job_file: &Path) -> Result<()> {
+    run_download_tuned(job_file, DownloadTuning::default()).map(|_| ())
+}
+
+/// [`run_download`] with explicit [`DownloadTuning`].
+#[cfg(feature = "native")]
+pub fn run_download_tuned(job_file: &Path, tuning: DownloadTuning) -> Result<DownloadReport> {
     let content = fs::read_to_string(job_file)?;
     let job: DownloadJob = serde_json::from_str(&content)?;
 
@@ -2552,8 +2596,8 @@ pub fn run_download(job_file: &Path) -> Result<()> {
         .build()?;
 
     match job.repair_source_tiles.clone() {
-        Some(list) => rt.block_on(run_repair_async(job, list)),
-        None => rt.block_on(run_download_async(job)),
+        Some(list) => rt.block_on(run_repair_async(job, list)).map(|_| DownloadReport::default()),
+        None => rt.block_on(run_download_async(job, tuning)),
     }
 }
 
@@ -2601,6 +2645,68 @@ fn tile_touches_spec(x: u32, y: u32, zoom: u32, spec: &SubTileSpec) -> bool {
     let (w, e) = (tx2lon(x, zoom), tx2lon(x + 1, zoom));
     let (n, s) = (ty2lat(y, zoom), ty2lat(y + 1, zoom));
     w < spec.ul_lon + span && e > spec.ul_lon && s < spec.ul_lat && n > spec.ul_lat - span
+}
+
+/// The source tiles of the rectangle `x0..=x1 × y0..=y1` that touch at least
+/// one of `specs` ([`tile_touches_spec`]), per tile-row (`[ty - y0]`), each
+/// row's columns ascending (changelog 30).
+///
+/// Exactly the tiles any output pixel can sample: a pixel averages the source
+/// samples whose centres fall in its footprint (or the one containing its
+/// centre), and its row samples the tile-row holding its centre — all inside
+/// its spec's ground, at least half a sample clear of any tile edge the
+/// predicate compares against. Each spec scans only its own tile range (plus
+/// one tile of slack per side for the floor rounding of `lon2tx`/`lat2ty`);
+/// the predicate decides.
+#[cfg(feature = "native")]
+fn tiles_to_fetch(
+    specs: &[SubTileSpec], zoom: u32, (x0, x1, y0, y1): (u32, u32, u32, u32),
+) -> Vec<Vec<u32>> {
+    let nx = (x1 - x0 + 1) as usize;
+    let ny = (y1 - y0 + 1) as usize;
+    let mut want = vec![false; nx * ny];
+    for spec in specs {
+        let span = spec.size_px as f64 * (spec.resolution_m / 111_111.0);
+        let cx0 = lon2tx(spec.ul_lon, zoom).saturating_sub(1).max(x0);
+        let cx1 = lon2tx(spec.ul_lon + span, zoom).saturating_add(1).min(x1);
+        let cy0 = lat2ty(spec.ul_lat, zoom).saturating_sub(1).max(y0);
+        let cy1 = lat2ty(spec.ul_lat - span, zoom).saturating_add(1).min(y1);
+        for ty in cy0..=cy1 {
+            for tx in cx0..=cx1 {
+                let i = (ty - y0) as usize * nx + (tx - x0) as usize;
+                if !want[i] && tile_touches_spec(tx, ty, zoom, spec) {
+                    want[i] = true;
+                }
+            }
+        }
+    }
+    (0..ny)
+        .map(|r| {
+            (0..nx)
+                .filter(|&c| want[r * nx + c])
+                .map(|c| x0 + c as u32)
+                .collect()
+        })
+        .collect()
+}
+
+/// The download's RAM budget from the RAM available now (changelog 30):
+/// a quarter of it, at most 2 GiB, at least 256 MiB.
+#[cfg(feature = "native")]
+fn download_ram_budget(available: u64) -> usize {
+    const CAP: u64 = 2 << 30;
+    const FLOOR: u64 = 256 << 20;
+    (available / 4).min(CAP).max(FLOOR) as usize
+}
+
+/// Tile-rows per strip: as many as let two strips of `nx` tiles of `edge`²
+/// f32 samples fit in `budget` (one strip finishing or being assembled, the
+/// next downloading), clamped to 1..=32 and to `cap` when given.
+#[cfg(feature = "native")]
+fn strip_rows_for(budget: usize, nx: usize, edge: usize, cap: Option<u32>) -> u32 {
+    let row = (nx * edge * edge * 4).max(1);
+    let rows = (budget / 2 / row).clamp(1, 32) as u32;
+    cap.map_or(rows, |c| rows.min(c.max(1)))
 }
 
 /// `download` with `repair_source_tiles` (CONTRACT §9b, changelog 28): fetch
@@ -2676,7 +2782,7 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
     let client = tile_client(conns)?;
     let progress = AtomicUsize::new(0);
     let stats = DownloadStats::new();
-    let gate = Arc::new(Aimd::new(conns));
+    let gate = Arc::new(ConnGate::new(conns));
     let ticker = {
         let g = gate.clone();
         tokio::spawn(async move {
@@ -2689,7 +2795,7 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
     let ctx = FetchCtx {
         client: &client, url_template: &job.url_template, zoom, dec, concurrency: conns,
         progress: &progress, total, stats: &stats, start_time: start, gate: &gate,
-        ancestors: &ancestors, tile_deadline,
+        unstarted: None, ancestors: &ancestors, tile_deadline,
     };
     let results = download_tiles(&ctx, want.iter().copied().collect()).await;
     ticker.abort();
@@ -2924,7 +3030,7 @@ impl Drop for AbtCleanup {
 }
 
 #[cfg(feature = "native")]
-async fn run_download_async(job: DownloadJob) -> Result<()> {
+async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<DownloadReport> {
     let start = Instant::now();
     let conns = job.max_connections.unwrap_or(256);
 
@@ -2945,12 +3051,24 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         bb_e = bb_e.max(t.ul_lon + sp);
     }
 
-    // 2. Tile range.
+    // 2. Tile range. The bounding rectangle fixes the assembly grid (origin
+    //    and sample pitch) exactly as before; only the source tiles that
+    //    touch a requested output tile are FETCHED (changelog 30). Every
+    //    sample an output pixel reads lies in such a tile, so skipping the
+    //    rest — a plugin re-running an area it mostly has, two far corners of
+    //    one bbox — cannot change a byte; it used to fetch the whole rectangle.
     let (x0, x1) = (lon2tx(bb_w, job.zoom), lon2tx(bb_e, job.zoom));
     let (y0, y1) = (lat2ty(bb_n, job.zoom), lat2ty(bb_s, job.zoom));
     let nx = (x1 - x0 + 1) as usize;
     let ny = (y1 - y0 + 1) as usize;
-    let total = nx * ny;
+    let row_tiles: Vec<Vec<u32>> = if tuning.fetch_whole_rect {
+        (y0..=y1).map(|_| (x0..=x1).collect()).collect()
+    } else {
+        tiles_to_fetch(&job.tiles, job.zoom, (x0, x1, y0, y1))
+    };
+    // The tiles this run fetches: the `[Download] z=…` header's total, the
+    // progress denominator and `[Stats] Tiles:`'s `<total>`.
+    let total: usize = row_tiles.iter().map(Vec::len).sum();
     let gul_lon = tx2lon(x0, job.zoom);
     let gul_lat = ty2lat(y0, job.zoom);
     let glr_lon = tx2lon(x1 + 1, job.zoom);
@@ -2966,6 +3084,11 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     let est_mb = total * tile_size_kb / 1024;
     eprintln!("[Download] z={} tiles={}x{}={} (~{}MB) connections={}",
         job.zoom, nx, ny, total, est_mb, conns);
+    if total < nx * ny {
+        eprintln!("[Download] fetching {} of the {} source tiles in the bounding rectangle; \
+                   the other {} touch no requested output tile",
+            total, nx * ny, nx * ny - total);
+    }
 
     // 2b. Resource checks — fail early with clear errors.
     let total_abt_bytes = estimate_abt_bytes(&job.tiles);
@@ -3024,57 +3147,50 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
             .build()?,
     );
 
-    // 5. Process in strips with deep prefetch pipeline.
-    //    Keep prefetch_depth strips downloading ahead while processing.
-    let strip_rows: u32 = 32;
+    // 5. Process in strips sized from a RAM budget (changelog 30). A strip's
+    //    tiles are held decoded (f32) from arrival until the strip has been
+    //    assembled, so a strip costs `tiles × edge² × 4 B` — proportional to
+    //    the area's WIDTH: at 32 tile-rows × full width a wide z15 pass held
+    //    several GB per strip, three strips at once. Before every launch the
+    //    budget is re-read from the RAM available NOW (`download_ram_budget`:
+    //    min(available / 4, 2 GiB), at least 256 MiB) and the strip gets the
+    //    rows two strips fit in (`strip_rows_for`, 1..=32): one finishing its
+    //    last tiles or being assembled, the next downloading. A strip launches
+    //    only when its bytes and those of every launched, not yet assembled
+    //    strip fit the budget (or nothing is outstanding), and only once the
+    //    strips in flight have fewer unstarted tiles than the connection
+    //    window — so the pool is kept fed without strips piling up in memory.
+    //    Each output row samples exactly one tile-row, so strip boundaries
+    //    never change a byte.
     const MAX_PREFETCH: usize = 5;
-
-    // Build strip ranges.
-    let mut strips: Vec<(u32, u32)> = Vec::new();
-    let mut cur = y0;
-    while cur <= y1 {
-        let end = (cur + strip_rows - 1).min(y1);
-        strips.push((cur, end));
-        cur = end + 1;
-    }
-
-    // Dynamic prefetch depth: keep total buffered tile data within RAM budget.
-    // It depends on the source's tile edge, which is unknown until a tile has
-    // decoded: the run starts sized for the largest edge a service may serve
-    // (guessing 256 for a 512 px source would under-budget fourfold) and is
-    // re-sized from the real edge as soon as the first tile arrives — 256 px
-    // AWS Terrarium tiles get four times the depth the 512 px guess allowed.
-    let actual_strip_rows = (strip_rows as usize).min(ny);
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let available_ram = sys.available_memory() as usize;
-    let ram_budget = available_ram / 2; // use at most 50% for download buffers
-    let depth_for = |edge: usize| -> (usize, usize) {
-        let bytes_per_tile_data = edge * edge * 4; // f32 per tile pixel
-        let strip_mem = nx * actual_strip_rows * bytes_per_tile_data;
-        let mini_grid_mem = nx * edge * edge * 4;
-        let depth = if strip_mem + mini_grid_mem > 0 {
-            (ram_budget / (strip_mem + mini_grid_mem)).clamp(1, MAX_PREFETCH)
-        } else {
-            MAX_PREFETCH
-        };
-        (depth, strip_mem)
-    };
-    let (prefetch_depth, strip_mem) = depth_for(MAX_TILE_PX);
-
     const MAX_CONCURRENT_ASM: usize = 1;
-    eprintln!("[Download] RAM: {:.1} GB available, ~{:.0} MB/strip, prefetch depth: {}",
-        available_ram as f64 / 1e9, strip_mem as f64 / 1e6, prefetch_depth);
+    let mut sys = System::new();
+    let mut ram_now = move || -> (u64, usize) {
+        sys.refresh_memory();
+        let avail = sys.available_memory();
+        (avail, download_ram_budget(avail))
+    };
+    let (avail0, budget0) = ram_now();
+    // Sized for the largest edge a service may serve until a tile has
+    // decoded; re-sized from the real edge for every later launch.
+    let rows0 = strip_rows_for(budget0, nx, MAX_TILE_PX, tuning.max_strip_rows);
+    eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available; \
+               re-evaluated before every strip)",
+        budget0 >> 20, rows0, avail0 as f64 / 1e9);
     eprintln!("[Download] {} strips, {} tile-rows/strip, assembly {}/{} threads (max {} concurrent)",
-        strips.len(), strip_rows, asm_threads, num_cpus, MAX_CONCURRENT_ASM);
+        (ny as u32).div_ceil(rows0), rows0, asm_threads, num_cpus, MAX_CONCURRENT_ASM);
 
     let zoom = job.zoom;
     let url_tpl = Arc::new(job.url_template.clone());
     let progress = Arc::new(AtomicUsize::new(0));
     let stats = Arc::new(DownloadStats::new());
-    let gate = Arc::new(Aimd::new(conns));
+    let gate = Arc::new(ConnGate::new(conns));
     let asm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_ASM));
-    // AIMD: one decision per second (see `aimd_step`).
+    // Tiles of launched strips the gate has not admitted yet.
+    let unstarted = Arc::new(AtomicUsize::new(0));
+    // Bytes of launched strips not yet assembled (in flight, queued, assembling).
+    let held = Arc::new(AtomicUsize::new(0));
+    // One window decision per second (see `throttle_step`).
     let ticker = {
         let g = gate.clone();
         tokio::spawn(async move {
@@ -3092,82 +3208,116 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     let ancestors = AncestorCache::new(client.clone(), &job.url_template, dec);
     let tile_deadline = job_tile_deadline(&job)?;
 
-    let spawn_strip = |sy0: u32, sy1: u32, cl: reqwest::Client, ut: Arc<String>,
-                       pr: Arc<AtomicUsize>, st: Arc<DownloadStats>,
-                       sem: Arc<Aimd>| -> StripHandle {
+    let spawn_strip = |coords: Vec<(u32, u32)>| -> StripHandle {
+        let (cl, ut, pr, st) = (client.clone(), url_tpl.clone(), progress.clone(), stats.clone());
+        let (g, un, anc) = (gate.clone(), unstarted.clone(), ancestors.clone());
         let start_time = start;
-        let anc = ancestors.clone();
         tokio::spawn(async move {
             let ctx = FetchCtx {
                 client: &cl, url_template: &ut, zoom, dec, concurrency: conns,
-                progress: &pr, total, stats: &st, start_time, gate: &sem,
-                ancestors: &anc, tile_deadline,
+                progress: &pr, total, stats: &st, start_time, gate: &g,
+                unstarted: Some(&un), ancestors: &anc, tile_deadline,
             };
-            download_strip(&ctx, x0, x1, sy0, sy1).await
+            download_tiles(&ctx, coords).await
         })
     };
 
-    // Sliding window: up to `depth` strips download at once and they are
-    // assembled in COMPLETION order, so one straggler strip no longer idles
-    // the strips queued behind it. Strips cover disjoint tile-rows and every
-    // output row is written at its own offset, so the order does not change
-    // a byte of the output.
+    // Strips download concurrently and are assembled in COMPLETION order, so
+    // one straggler strip does not idle the strips behind it. Strips cover
+    // disjoint tile-rows and every output row is written at its own offset,
+    // so neither the order nor the strip boundaries change a byte.
     let mut pipeline = futures::stream::FuturesUnordered::new();
-    let launch = |idx: usize| {
-        let (sy0, sy1) = strips[idx];
-        let h: StripHandle = spawn_strip(
-            sy0, sy1, client.clone(), url_tpl.clone(), progress.clone(), stats.clone(),
-            gate.clone(),
-        );
-        async move { (idx, h.await) }
-    };
-    let mut depth = prefetch_depth;
-    let mut edge_known = false;
-    let mut next_to_launch = 0usize;
-    while next_to_launch < depth.min(strips.len()) {
-        pipeline.push(launch(next_to_launch));
-        next_to_launch += 1;
-    }
-
-    // Assembly tasks run concurrently (gated by asm_semaphore, each opens own file handles).
-    // Back-pressure: don't let more than depth+1 assemblies queue up,
-    // otherwise strip data accumulates in memory faster than it can be written.
     let mut assembly_handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+    let mut next_row = y0; // first tile-row not launched yet
+    let mut launched = 0usize;
     let mut expected_next = 0usize;
+    let mut shown_rows = rows0;
+    let mut max_rows = 0u32;
+    let mut edge_known = false;
 
-    for _ in 0..strips.len() {
-        // Wait for whichever strip finishes first; wake periodically to
-        // deepen the window once the real tile edge is known.
-        let (strip_idx, joined) = loop {
-            if !edge_known {
-                let edge = stats.tile_edge.load(Ordering::Relaxed);
-                if edge != 0 {
-                    edge_known = true;
-                    let (d, _) = depth_for(edge);
-                    if d != depth {
-                        eprintln!("[Download] source tiles are {edge} px: prefetch depth {d}");
-                        depth = d;
-                    }
-                }
+    loop {
+        // A failed assembly stops the run as soon as it ends.
+        let mut i = 0;
+        while i < assembly_handles.len() {
+            if assembly_handles[i].is_finished() {
+                assembly_handles.swap_remove(i).await??;
+            } else {
+                i += 1;
             }
-            while pipeline.len() < depth && next_to_launch < strips.len() {
-                pipeline.push(launch(next_to_launch));
-                next_to_launch += 1;
+        }
+
+        // Launch while the budget, the depth and the pool's appetite allow.
+        loop {
+            // Rows no requested output tile touches: nothing to fetch, and
+            // no output row samples them.
+            while next_row <= y1 && row_tiles[(next_row - y0) as usize].is_empty() {
+                next_row += 1;
             }
-            match tokio::time::timeout(std::time::Duration::from_millis(200), pipeline.next()).await {
-                Ok(Some(done)) => break done,
-                Ok(None) => anyhow::bail!("strip pipeline emptied early"),
-                Err(_) => continue,
+            if next_row > y1 {
+                break;
             }
-        };
+            let known = stats.tile_edge.load(Ordering::Relaxed);
+            let edge = if known == 0 { MAX_TILE_PX } else { known };
+            let (avail, budget) = ram_now();
+            let rows = strip_rows_for(budget, nx, edge, tuning.max_strip_rows);
+            let (sy0, sy1) = (next_row, (next_row + (rows - 1)).min(y1));
+            let n_tiles: usize =
+                (sy0..=sy1).map(|ty| row_tiles[(ty - y0) as usize].len()).sum();
+            let bytes = n_tiles * edge * edge * 4;
+            let depth = (budget / bytes.max(1)).clamp(1, MAX_PREFETCH);
+            if known != 0 && !edge_known {
+                edge_known = true;
+                eprintln!("[Download] source tiles are {known} px: prefetch depth {depth}");
+            }
+            let outstanding = held.load(Ordering::Acquire);
+            let fits = outstanding == 0 || outstanding + bytes <= budget;
+            let hungry = pipeline.is_empty()
+                || (pipeline.len() < depth && unstarted.load(Ordering::Relaxed) < gate.window());
+            if !(fits && hungry) {
+                break;
+            }
+            if rows != shown_rows {
+                shown_rows = rows;
+                eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available)",
+                    budget >> 20, rows, avail as f64 / 1e9);
+            }
+            let coords: Vec<(u32, u32)> = (sy0..=sy1)
+                .flat_map(|ty| row_tiles[(ty - y0) as usize].iter().map(move |&tx| (tx, ty)))
+                .collect();
+            // Strips this run will have if the rows stay as they are now.
+            let of = launched + 1 + ((y1 - sy1) as usize).div_ceil(rows as usize);
+            held.fetch_add(bytes, Ordering::AcqRel);
+            unstarted.fetch_add(n_tiles, Ordering::Relaxed);
+            let h = spawn_strip(coords);
+            let meta = (launched, of, sy0, sy1, bytes);
+            pipeline.push(async move { (meta, h.await) });
+            launched += 1;
+            max_rows = max_rows.max(sy1 - sy0 + 1);
+            next_row = sy1 + 1;
+        }
+
+        if pipeline.is_empty() {
+            if next_row > y1 {
+                break; // every strip launched and collected
+            }
+            // Nothing in flight and the next strip does not fit yet: queued
+            // assemblies still hold the budget. Let them finish.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            continue;
+        }
+        // Wake at least every 50 ms to re-check the launch conditions (the
+        // strips in flight running low on unstarted tiles, RAM freed).
+        let ((strip_idx, of, sy0, sy1, bytes), joined) =
+            match tokio::time::timeout(std::time::Duration::from_millis(50), pipeline.next()).await {
+                Ok(Some(done)) => done,
+                Ok(None) | Err(_) => continue,
+            };
         if strip_idx != expected_next {
             #[cfg(test)]
             OUT_OF_ORDER_STRIPS.fetch_add(1, Ordering::Relaxed);
         }
         expected_next = strip_idx + 1;
-        let (sy0, sy1) = strips[strip_idx];
         let results = joined?;
-        let max_queued_asm = depth + 1;
 
         // Fix (or re-check) the tile edge this run assembles for, and derive
         // the grid from it. A source that mixes sizes, or that served a tile
@@ -3182,31 +3332,21 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
         let strip_err = strip_total - strip_ok;
         if strip_err > 0 {
             eprintln!("[Strip {}/{}] {} tiles: {} ok, {} FAILED",
-                strip_idx + 1, strips.len(), strip_total, strip_ok, strip_err);
+                strip_idx + 1, of, strip_total, strip_ok, strip_err);
         }
 
-        // Keep the window full.
-        while pipeline.len() < depth && next_to_launch < strips.len() {
-            pipeline.push(launch(next_to_launch));
-            next_to_launch += 1;
-        }
-
-        // Back-pressure: drain completed assemblies to free strip data from memory.
-        while assembly_handles.len() >= max_queued_asm {
-            let h = assembly_handles.remove(0);
-            h.await??;
-        }
-
-        // Spawn assembly — process one tile-row at a time (36 MB grid fits in L3).
+        // Spawn assembly — process one tile-row at a time. Its bytes leave
+        // the budget when it ends, success or not.
         assembly_handles.push(tokio::spawn({
             let specs = abt_specs.clone();
             let pool = asm_pool.clone();
             let asm_sem = asm_semaphore.clone();
+            let held = held.clone();
             let si = strip_idx + 1;
-            let ns = strips.len();
+            let ns = of;
             async move {
                 let _permit = asm_sem.acquire().await.unwrap();
-                tokio::task::spawn_blocking(move || -> Result<()> {
+                let done = tokio::task::spawn_blocking(move || -> Result<()> {
                     let asm_start = Instant::now();
                     let sny = (sy1 - sy0 + 1) as usize;
 
@@ -3322,7 +3462,9 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
                         total_px as f64 / 1e6, out_mb, asm_start.elapsed().as_secs_f64(),
                     );
                     Ok(())
-                }).await?
+                }).await;
+                held.fetch_sub(bytes, Ordering::AcqRel);
+                done?
             }
         }));
     }
@@ -3418,7 +3560,7 @@ async fn run_download_async(job: DownloadJob) -> Result<()> {
     stats.log_summary(elapsed, Retries::Counted(STRIP_MAX_RETRIES));
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     cleanup.keep();
-    Ok(())
+    Ok(DownloadReport { tiles_fetched: total, strips: launched, max_strip_rows: max_rows })
 }
 
 /// Fuse vector-tile buildings onto the `.abt` tiles the downloader just wrote.
@@ -4655,7 +4797,7 @@ mod tests {
         assert!(lines[1].starts_with(&format!("[Stats] DEGRADED: {} of ", DEGRADED_LIST_CAP + 2)));
     }
 
-    // ── Transport: retry classification, idle timeout, AIMD ─────────────
+    // ── Transport: retry classification, idle timeout, connection gate ──
 
     /// What [`transport_server`] does with one request.
     #[derive(Clone)]
@@ -4803,47 +4945,101 @@ mod tests {
     }
 
     #[test]
-    fn the_aimd_step_halves_on_congestion_and_grows_when_clean() {
-        assert_eq!(aimd_step(256, 16, 256, 3, None), 128, "3 events halve");
-        assert_eq!(aimd_step(256, 16, 256, 2, None), 256, "1-2 events hold");
-        assert_eq!(aimd_step(256, 16, 256, 0, None), 256, "never above max");
-        assert_eq!(aimd_step(128, 16, 256, 0, None), 136, "+8 per clean second");
-        assert_eq!(aimd_step(128, 16, 256, 0, Some(6.0)), 64, "stalled bodies halve");
-        assert_eq!(aimd_step(128, 16, 256, 0, Some(4.0)), 136);
-        assert_eq!(aimd_step(20, 16, 256, 9, None), 16, "floor");
+    fn the_window_is_cut_only_by_throttle_bursts_and_grows_back_by_ten_percent() {
+        // Floor: a quarter of the connections, at least 16, never above them.
+        assert_eq!(throttle_floor(256), 64);
+        assert_eq!(throttle_floor(32), 16);
+        assert_eq!(throttle_floor(8), 8);
+        // >= 3 throttled answers in a second cut 25 % — once per second.
+        assert_eq!(throttle_step(256, 64, 256, 3), 192);
+        assert_eq!(throttle_step(256, 64, 256, 500), 192);
+        // 1-2 hold.
+        assert_eq!(throttle_step(192, 64, 256, 2), 192);
+        assert_eq!(throttle_step(192, 64, 256, 1), 192);
+        // Never below the floor.
+        assert_eq!(throttle_step(70, 64, 256, 9), 64);
+        assert_eq!(throttle_step(64, 64, 256, 9), 64);
+        // A clean second grows 10 % (at least 1), never above the configured value.
+        assert_eq!(throttle_step(64, 64, 256, 0), 70);
+        assert_eq!(throttle_step(5, 5, 8, 0), 6);
+        assert_eq!(throttle_step(250, 64, 256, 0), 256);
+        assert_eq!(throttle_step(256, 64, 256, 0), 256);
     }
 
     #[test]
-    fn the_gate_follows_the_window_down_and_back_up() {
-        let rt = rt();
-        rt.block_on(async {
-            let gate = Aimd::new(64);
-            assert_eq!(gate.min, 16);
-            // 40 requests in flight when congestion hits.
+    fn only_429_and_503_move_the_gate_never_timeouts_resets_or_other_errors() {
+        let gate = ConnGate::new(256);
+        for f in [
+            FetchFailure::Timeout, FetchFailure::Connect, FetchFailure::Http(500),
+            FetchFailure::Http(502), FetchFailure::Http(404), FetchFailure::Decode,
+            FetchFailure::Other,
+        ] {
+            for _ in 0..50 { gate.observe(Some(f), None); }
+            gate.tick();
+            assert_eq!(gate.window(), 256, "{f:?} must not move the window");
+        }
+        for _ in 0..3 { gate.observe(Some(FetchFailure::Http(503)), None); }
+        gate.tick();
+        assert_eq!(gate.window(), 192, "a 503 burst cuts 25 %");
+        for _ in 0..3 { gate.observe(Some(FetchFailure::Http(429)), None); }
+        gate.tick();
+        assert_eq!(gate.window(), 144, "a 429 burst cuts 25 %");
+        for _ in 0..20 {
+            for _ in 0..3 { gate.observe(Some(FetchFailure::Http(503)), None); }
+            gate.tick();
+        }
+        assert_eq!(gate.window(), 64, "floor = max(256 / 4, 16)");
+        let mut seen = Vec::new();
+        for _ in 0..20 { gate.tick(); seen.push(gate.window()); }
+        assert_eq!(&seen[..4], &[70, 77, 84, 92], "+10 % per clean second");
+        assert_eq!(seen[14], 256, "back at the configured value after 15 clean seconds");
+        assert_eq!(gate.summary_line(), "[Stats] Connection window: start 256, min 64, final 256 \
+                                         (adaptive 64..=256, 5 back-off(s))");
+    }
+
+    #[test]
+    fn a_cut_applies_to_new_acquisitions_only_and_nothing_is_owed() {
+        let ms = std::time::Duration::from_millis;
+        rt().block_on(async {
+            let gate = ConnGate::new(64);
+            assert_eq!(gate.floor, 16);
+            // 40 requests in flight when a 503 burst cuts the window to 48.
             let mut held = Vec::new();
             for _ in 0..40 { held.push(gate.acquire().await); }
-            for _ in 0..3 {
-                gate.observe(Some(FetchFailure::Timeout), &FetchTiming::default(), None);
-            }
+            for _ in 0..3 { gate.observe(Some(FetchFailure::Http(503)), None); }
             gate.tick();
-            assert_eq!(gate.window(), 32);
-            assert_eq!(gate.sem.available_permits(), 0, "the 24 free permits were withdrawn");
-            // 8 more are owed: the first 8 returned are retired, then reusable.
-            for p in held.drain(..20) { gate.release(p); }
-            assert_eq!(gate.sem.available_permits(), 12);
-            for p in held.drain(..) { gate.release(p); }
-            assert_eq!(gate.sem.available_permits(), 32, "window 32 = 32 usable slots");
-            // A 429 storm halves again; clean seconds recover by 8 up to max.
-            for _ in 0..3 {
-                gate.observe(Some(FetchFailure::Http(429)), &FetchTiming::default(), None);
+            assert_eq!(gate.window(), 48);
+            // Nothing in flight was withdrawn or owed: 8 more start at once
+            // (the old AIMD retired permits here and admitted nobody).
+            for _ in 0..8 {
+                held.push(tokio::time::timeout(ms(500), gate.acquire()).await
+                    .expect("40 < 48: admitted at once"));
             }
+            assert_eq!(gate.active(), 48);
+            // The window is full: the next one waits ...
+            let waiter = gate.acquire();
+            tokio::pin!(waiter);
+            assert!(tokio::time::timeout(ms(50), &mut waiter).await.is_err(), "48 of 48 active");
+            // ... and the first slot handed back admits it — not retired.
+            held.pop();
+            held.push(tokio::time::timeout(ms(500), &mut waiter).await
+                .expect("admitted on the first release"));
+            assert_eq!(gate.active(), 48);
+            // A cut below what is in flight (48 -> 36) stops no request; the
+            // gate admits again as soon as fewer than 36 are active.
+            for _ in 0..3 { gate.observe(Some(FetchFailure::Http(429)), None); }
             gate.tick();
-            assert_eq!((gate.window(), gate.sem.available_permits()), (16, 16));
-            for _ in 0..10 { gate.tick(); }
-            assert_eq!((gate.window(), gate.sem.available_permits()), (64, 64));
-            let line = gate.summary_line();
-            assert_eq!(line, "[Stats] Connection window: start 64, min 16, final 64 \
-                              (adaptive 16..=64, 2 back-off(s))");
+            assert_eq!(gate.window(), 36);
+            held.truncate(35);
+            held.push(tokio::time::timeout(ms(500), gate.acquire()).await.expect("35 < 36"));
+            // Growth admits a waiter at once: there is no debt to pay off.
+            let waiter = gate.acquire();
+            tokio::pin!(waiter);
+            assert!(tokio::time::timeout(ms(50), &mut waiter).await.is_err(), "36 of 36 active");
+            gate.tick();
+            assert_eq!(gate.window(), 39);
+            held.push(tokio::time::timeout(ms(500), &mut waiter).await.expect("growth admits"));
+            assert_eq!(gate.active(), 37);
         });
     }
 
@@ -4851,39 +5047,97 @@ mod tests {
     fn retry_after_holds_back_new_requests() {
         let rt = rt();
         rt.block_on(async {
-            let gate = Aimd::new(8);
-            gate.observe(Some(FetchFailure::Http(429)), &FetchTiming::default(),
-                         Some(std::time::Duration::from_millis(600)));
+            let gate = ConnGate::new(8);
+            gate.observe(Some(FetchFailure::Http(429)), Some(std::time::Duration::from_millis(600)));
             let t0 = std::time::Instant::now();
-            let p = gate.acquire().await;
+            let slot = gate.acquire().await;
             assert!(t0.elapsed() >= std::time::Duration::from_millis(550));
-            gate.release(p);
+            drop(slot);
         });
     }
 
     #[test]
-    fn the_gate_backs_off_under_a_live_429_storm_and_recovers() {
-        // The first 30 requests answer 429; then the server is clean.
-        let port = transport_server(|n| if n < 30 { Act::Status(429, None) } else {
+    fn the_gate_cuts_under_a_live_503_storm_and_recovers() {
+        // The first 30 requests answer 503 with no Retry-After (S3 SlowDown);
+        // then the server is clean.
+        let port = transport_server(|n| if n < 30 { Act::Status(503, None) } else {
             Act::Body { len: 512, chunk: 512, every_ms: 0, pause_after: 0, pause_ms: 0 } });
         let client = tile_client(8).unwrap();
         let url = format!("http://127.0.0.1:{port}/14/1/1.png");
         let rt = rt();
         rt.block_on(async {
-            let gate = Aimd::new(64);
+            let gate = ConnGate::new(64);
             let mut windows = Vec::new();
             for _second in 0..6 {
                 for _ in 0..10 {
-                    let p = gate.acquire().await;
-                    let (r, t) = fetch_tile_body(&client, &url).await;
-                    gate.observe(r.as_ref().err().map(FetchFailure::of), &t, None);
-                    gate.release(p);
+                    let slot = gate.acquire().await;
+                    let (r, _) = fetch_tile_body(&client, &url).await;
+                    gate.observe(r.as_ref().err().map(FetchFailure::of), None);
+                    drop(slot);
                 }
                 gate.tick();
                 windows.push(gate.window());
             }
-            assert_eq!(windows, vec![32, 16, 16, 24, 32, 40], "halve, halve, then +8 per clean second");
+            assert_eq!(windows, vec![48, 36, 27, 29, 31, 34], "-25 % three times, then +10 %");
         });
+    }
+
+    #[test]
+    fn the_ram_budget_is_a_quarter_of_available_between_256_mib_and_2_gib() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(download_ram_budget(4096 * MIB), (1024 * MIB) as usize);
+        assert_eq!(download_ram_budget(64 * 1024 * MIB), (2048 * MIB) as usize);
+        assert_eq!(download_ram_budget(512 * MIB), (256 * MIB) as usize);
+        assert_eq!(download_ram_budget(0), (256 * MIB) as usize);
+    }
+
+    #[test]
+    fn strip_rows_fit_two_strips_in_the_budget_and_stay_within_1_to_32() {
+        const MIB: usize = 1 << 20;
+        // 515 tiles of 256 px = 128.75 MiB per tile-row; 2 GiB fits 2 × 7 rows.
+        assert_eq!(strip_rows_for(2048 * MIB, 515, 256, None), 7);
+        assert_eq!(strip_rows_for(1024 * MIB, 515, 256, None), 3);
+        // A row larger than the budget still downloads, one row at a time.
+        assert_eq!(strip_rows_for(256 * MIB, 515, 512, None), 1);
+        // Narrow areas keep the old 32-row strips.
+        assert_eq!(strip_rows_for(2048 * MIB, 2, 256, None), 32);
+        // A cap (tests) only ever lowers it.
+        assert_eq!(strip_rows_for(2048 * MIB, 2, 256, Some(3)), 3);
+        assert_eq!(strip_rows_for(256 * MIB, 515, 512, Some(3)), 1);
+    }
+
+    #[test]
+    fn the_fetch_set_is_the_tiles_touching_a_spec() {
+        let z = 12;
+        let (tx, ty) = (lon2tx(8.0, z), lat2ty(47.0, z));
+        let spec_in = |x: u32, y: u32| {
+            // A 16 px spec a quarter of a tile wide, inset inside tile (x, y).
+            let (w, e) = (tx2lon(x, z), tx2lon(x + 1, z));
+            let (n, s) = (ty2lat(y, z), ty2lat(y + 1, z));
+            let pd = (e - w) * 0.25 / 16.0;
+            SubTileSpec {
+                filename: format!("{x}_{y}.abt"), ul_lat: n - (n - s) * 0.25,
+                ul_lon: w + (e - w) * 0.25, size_px: 16, resolution_m: pd * 111_111.0,
+            }
+        };
+        // Two far corners of a 5 × 4 rectangle.
+        let specs = vec![spec_in(tx, ty), spec_in(tx + 4, ty + 3)];
+        let rows = tiles_to_fetch(&specs, z, (tx, tx + 4, ty, ty + 3));
+        assert_eq!(rows, vec![vec![tx], vec![], vec![], vec![tx + 4]]);
+        // A spec spanning a tile edge needs both tiles; touching is strict.
+        let w = tx2lon(tx + 1, z);
+        let pd = (tx2lon(tx + 2, z) - w) / 64.0;
+        let straddle = SubTileSpec {
+            filename: "s.abt".into(), ul_lat: ty2lat(ty, z) - pd, ul_lon: w - 8.0 * pd,
+            size_px: 16, resolution_m: pd * 111_111.0,
+        };
+        assert_eq!(tiles_to_fetch(&[straddle], z, (tx, tx + 4, ty, ty + 3))[0], vec![tx, tx + 1]);
+        let flush = SubTileSpec {
+            filename: "f.abt".into(), ul_lat: ty2lat(ty, z) - pd, ul_lon: w,
+            size_px: 16, resolution_m: pd * 111_111.0,
+        };
+        assert_eq!(tiles_to_fetch(&[flush], z, (tx, tx + 4, ty, ty + 3))[0], vec![tx + 1],
+                   "a spec whose west edge IS the tile edge does not touch the tile west of it");
     }
 
     /// Loopback tile server for `fill_from_parents`: z13 never answers, z12
@@ -5094,7 +5348,7 @@ mod tests {
         assert_eq!(FetchFailure::of(&e).reason(), "timeout");
         assert!(!is_retryable(&e), "the budget is spent; no retry");
         assert!(!timing.stalled());
-        assert_eq!(TILE_DEADLINE, std::time::Duration::from_secs(60));
+        assert_eq!(TILE_DEADLINE, std::time::Duration::from_secs(20));
     }
 
     #[test]

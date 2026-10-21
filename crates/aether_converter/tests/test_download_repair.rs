@@ -284,9 +284,10 @@ fn a_trickling_tile_is_cut_at_the_job_deadline_and_reported_as_timeout() {
 
 #[test]
 fn the_default_deadline_frees_a_stalled_tile_within_a_minute_and_degrades_it() {
-    // Same trickle, no job field: the built-in 60 s cap applies. Its z11
-    // parent is live, so the tile is filled and reported DEGRADED with
-    // reason=timeout — not stuck, not silently OK.
+    // Same trickle, no job field: the built-in cap applies (20 s since
+    // changelog 30; 60 s before). Its z11 parent is live, so the tile is
+    // filled and reported DEGRADED with reason=timeout — not stuck, not
+    // silently OK.
     let dir = tempfile::tempdir().unwrap();
     let (tx0, ty0) = origin();
     let slow = (tx0 + 1, ty0);
@@ -299,7 +300,7 @@ fn the_default_deadline_frees_a_stalled_tile_within_a_minute_and_degrades_it() {
     let (job, _) = write_job(dir.path(), port, 4, 1, serde_json::json!({}));
     let (ok, err, secs) = run_cli(&job, Duration::from_secs(150));
     assert!(ok, "{err}");
-    assert!((55.0..80.0).contains(&secs), "want the 60 s cap (+ fill); took {secs:.1}s. stderr:\n{err}");
+    assert!((18.0..45.0).contains(&secs), "want the 20 s cap (+ fill); took {secs:.1}s. stderr:\n{err}");
     let line = format!("[Degraded] z={Z} x={} y={} reason=timeout filled_from=z11", slow.0, slow.1);
     assert!(err.lines().any(|l| l == line), "want `{line}`; stderr:\n{err}");
     assert!(err.lines().any(|l| l == "[Stats] Tiles: 3/4 OK (75.0% success)"), "{err}");

@@ -277,3 +277,92 @@ pub fn run_cli(dir: &Path, json: serde_json::Value) -> (bool, String) {
     let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     (out.status.success(), said)
 }
+
+// ── A loopback XYZ tile source (download tests) ────────────────────────────
+
+/// Requests seen per `(z, x, y)`.
+pub type TileCounts = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), usize>>>;
+
+/// Loopback tile server: `route(z, x, y)` returns the PNG to serve, or `None`
+/// for a 404; every request is counted. One request per connection
+/// (`Connection: close`), like the other download tests' servers.
+pub fn serve_tiles<F>(route: F) -> (u16, TileCounts)
+where
+    F: Fn(u32, u32, u32) -> Option<Vec<u8>> + Send + Sync + 'static,
+{
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let route = std::sync::Arc::new(route);
+    let counts: TileCounts = Default::default();
+    let c2 = counts.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let (route, counts) = (route.clone(), c2.clone());
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                if reader.read_line(&mut request).unwrap_or(0) == 0 { return; }
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" { line.clear(); }
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let zxy: Vec<u32> = path.trim_start_matches('/').trim_end_matches(".png")
+                    .split('/').filter_map(|p| p.parse().ok()).collect();
+                if zxy.len() != 3 { return; }
+                *counts.lock().unwrap().entry((zxy[0], zxy[1], zxy[2])).or_insert(0) += 1;
+                let (status, body) = match route(zxy[0], zxy[1], zxy[2]) {
+                    Some(png) => ("200 OK", png),
+                    None => ("404 Not Found", Vec::new()),
+                };
+                let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\
+                                        Connection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(&body);
+            });
+        }
+    });
+    (port, counts)
+}
+
+/// A 256 px Terrarium PNG whose sample `(px, py)` is `f(px, py)` metres
+/// (integers, so the encoding is exact).
+pub fn terrarium_png(f: impl Fn(usize, usize) -> i32) -> Vec<u8> {
+    let mut px = Vec::with_capacity(256 * 256 * 3);
+    for py in 0..256 {
+        for x in 0..256 {
+            let t = (f(x, py) + 32768) as u32;
+            px.extend_from_slice(&[(t >> 8) as u8, (t & 255) as u8, 0]);
+        }
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, 256, 256);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&px).unwrap();
+    }
+    out
+}
+
+/// Terrain for tile `(z, x, y)` that differs per tile and per sample, so a
+/// misplaced tile or sample changes the output bytes.
+pub fn tile_ground(z: u32, x: u32, y: u32) -> impl Fn(usize, usize) -> i32 {
+    let base = 200 + (z as i32) * 300 + ((x % 9) as i32) * 37 + ((y % 11) as i32) * 23;
+    move |px, py| base + (px as i32 * 3) % 97 + (py as i32 * 5) % 89
+}
+
+/// Every `.abt` in `dir`, by name, with its bytes.
+pub fn read_dir_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok())
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Run the real CLI `download` over *job_file*; `(exit ok, stderr)`.
+pub fn run_download_cli(job_file: &Path) -> (bool, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_aether_converter"))
+        .args(["download", "--job-file"]).arg(job_file).output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
