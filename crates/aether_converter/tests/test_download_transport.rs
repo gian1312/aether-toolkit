@@ -1,10 +1,12 @@
 //! How the CLI `download` moves bytes: retries decided by error type,
 //! read-idle (not total) timeouts, STALL reporting, the adaptive connection
-//! window, and strips assembled in completion order.
+//! window, strips assembled in completion order, the per-strip diagnostic
+//! lines' sink and the open-file limit.
 //!
 //! Contract surface: `docs/CONTRACT.md` §1.2 (`[Download] STALL`, `[Stats]
-//! STALL`, `[Stats] Connection window`), §9b (`max_connections`), changelog 27.
-//! The tile source is a loopback HTTP server, so these tests are hermetic.
+//! STALL`, `[Stats] Connection window`, `[Stats] Tile latency`), §9b
+//! (`max_connections`), changelog 27 and 36. The tile source is a loopback
+//! HTTP server, so these tests are hermetic.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -221,6 +223,14 @@ fn a_tile_waiting_past_five_seconds_is_a_stall_and_the_window_is_reported() {
     assert!(err.lines().any(|l| l.starts_with(&stall)), "want `{stall}…`; stderr:\n{err}");
     assert!(err.lines().any(|l| l.starts_with("[Stats] STALL: 1 of 4 tile(s) waited > 5 s")), "{err}");
     assert!(!err.contains("SLOW"), "{err}");
+    // Changelog 36: the 6 s that tile waited for its response head shows in
+    // the mean first-byte time of the run's 4 attempts (>= 6000 / 4 ms).
+    let lat = err.lines().find(|l| l.starts_with("[Stats] Tile latency: "))
+        .unwrap_or_else(|| panic!("no latency line; stderr:\n{err}"));
+    let fb: u64 = lat.split(" first-byte avg=").nth(1).and_then(|v| v.strip_suffix("ms"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("want `… first-byte avg=<n>ms`: {lat}"));
+    assert!(fb >= 1400, "{lat}");
     assert!(err.lines().any(|l| l.starts_with("[Stats] Connection window: start 16, min 16, final 16 ")),
             "a clean run never leaves its configured window; stderr:\n{err}");
 }
@@ -238,4 +248,61 @@ fn a_429_storm_shrinks_the_window_and_the_run_still_completes() {
         .unwrap_or_else(|| panic!("no window line; stderr:\n{err}"));
     let min: usize = line.split("min ").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
     assert!(min < 64, "the window must have backed off: {line}");
+}
+
+#[test]
+fn strip_lines_go_to_the_diag_file_and_the_parsed_lines_stay_on_stderr() {
+    // Changelog 36/37: the per-strip `[Strip k/n] …` lines are diagnostics —
+    // with AETHER_DIAG_FILE set they go to that file; the progress, `[Stats]`
+    // and one-per-run `[Download]` lines stay on stderr for their parsers.
+    let dir = tempfile::tempdir().unwrap();
+    let port = serve(|x, y, _| Reply::Png(tile(elev(x, y)), 0));
+    let (job, _, _, _) = stacked_job(dir.path(), port, 2, 2, 16);
+    let diag = dir.path().join("diag.log");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_aether_converter"))
+        .env("AETHER_DIAG_FILE", &diag)
+        .args(["download", "--job-file"]).arg(&job).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    let file = std::fs::read_to_string(&diag).unwrap_or_default();
+    assert!(file.lines().any(|l| l.starts_with("[Strip 1/1] setup=")), "diag file:\n{file}\nstderr:\n{err}");
+    assert!(!err.contains("[Strip "), "{err}");
+    assert!(err.lines().any(|l| l.starts_with("[Download] 100% (4/4) — ")), "{err}");
+    assert!(err.lines().any(|l| l == "[Stats] Tiles: 4/4 OK (100.0% success)"), "{err}");
+    assert!(err.lines().any(|l| l.starts_with("[Download] RAM budget: ")), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_low_open_file_limit_is_raised_or_the_connections_are_fitted_under_it() {
+    // 150 tiles, each answered after 300 ms, at 100 connections: about 100
+    // sockets open at once. (1) Soft limit 64, hard limit as it is: the
+    // converter raises its own soft limit and runs clean — no retries (each
+    // EMFILE would have been a failed connect, retried). (2) Hard limit 100
+    // as well, so nothing can be raised: it runs (100 - 64) / 2 = 18
+    // connections, says so, and still runs clean. (Kept small: this test's
+    // own server holds a socket per connection, and macOS starts a test
+    // process at a soft limit of 256.)
+    let dir = tempfile::tempdir().unwrap();
+    let (cols, rows) = (10u32, 15u32);
+    let (tx0, ty0) = (lon2tx(8.0, Z), lat2ty(47.0, Z));
+    for x in tx0..tx0 + cols { for y in ty0..ty0 + rows { tile(elev(x, y)); } }
+    let port = serve(|x, y, _| Reply::Png(tile(elev(x, y)), 300));
+    let (job, _, _, _) = stacked_job(dir.path(), port, cols, rows, 100);
+    let capped = "[Download] open-file limit 100: 2 connections instead of max_connections 100 \
+                  (296 descriptors would not fit)";
+    for (ulimit, want_cap) in [("-S -n 64", false), ("-n 100", true)] {
+        let out = std::process::Command::new("sh")
+            .arg("-c").arg(format!("ulimit {ulimit} && exec \"$0\" download --job-file \"$1\""))
+            .arg(env!("CARGO_BIN_EXE_aether_converter")).arg(&job)
+            .output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "ulimit {ulimit}: {err}");
+        assert!(err.lines().any(|l| l == "[Stats] Tiles: 150/150 OK (100.0% success)"), "ulimit {ulimit}: {err}");
+        assert!(err.lines().any(|l| l == "[Stats] Retries: 0 (up to 5 per failed tile)"), "ulimit {ulimit}: {err}");
+        assert_eq!(err.lines().any(|l| l == capped), want_cap, "ulimit {ulimit}: {err}");
+        let start = if want_cap { 2 } else { 100 };
+        assert!(err.lines().any(|l| l.starts_with(&format!("[Stats] Connection window: start {start}, "))),
+                "ulimit {ulimit}: {err}");
+    }
 }

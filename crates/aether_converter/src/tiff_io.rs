@@ -14,13 +14,18 @@
 //! the IFD. It mirrors `tiff` 0.11.3 step for step (codec configuration,
 //! byte-order fix, predictor arithmetic); anything it does not cover, and any
 //! chunk it cannot decode, goes back to the `tiff` decoder, so a file decodes
-//! to the same samples — or fails with the same error — either way.
+//! to the same samples — or fails with the same error — either way. LZW
+//! chunks go through an own decoder ([`lzw`], about three times weezl's
+//! speed) wherever it fills the chunk exactly as weezl would; it hands every
+//! other stream to the weezl decode `tiff` uses, whose verdict then stands.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use tiff::decoder::DecodingResult;
 use tiff::tags::ByteOrder;
+
+mod lzw;
 
 /// One positioned read: as many bytes of `buf` as a single call returns,
 /// starting at `offset`, without touching any shared file cursor.
@@ -341,14 +346,12 @@ impl DirectChunks {
         match self.codec {
             Codec::None => bytes.copy_from_slice(raw.get(..bytes.len())?),
             Codec::Lzw => {
-                // tiff 0.11.3 stream.rs (`LZWReader::new`), verbatim config.
-                let dec = lzw.get_or_insert_with(|| {
-                    weezl::decode::Configuration::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
-                        .with_yield_on_full_buffer(true)
-                        .build()
-                });
-                dec.reset();
-                lzw_fill(dec, raw, bytes)?;
+                // The fast decoder takes every chunk it can vouch for; weezl
+                // decides on the rest (truncated, corrupt or unusual streams)
+                // exactly as before.
+                if !self::lzw::fill(raw, bytes) {
+                    lzw_weezl(lzw, raw, bytes)?;
+                }
             }
             Codec::Deflate => {
                 // tiff's `DeflateReader` is `flate2::read::ZlibDecoder`.
@@ -362,6 +365,19 @@ impl DirectChunks {
         }
         Some(out)
     }
+}
+
+/// Fill *out* from the LZW stream *raw* with weezl, configured as tiff 0.11.3
+/// stream.rs configures it (`LZWReader::new`, verbatim) and built on first
+/// use into *lzw*; `None` unless *out* fills (see [`lzw_fill`]).
+fn lzw_weezl(lzw: &mut Option<weezl::decode::Decoder>, raw: &[u8], out: &mut [u8]) -> Option<()> {
+    let dec = lzw.get_or_insert_with(|| {
+        weezl::decode::Configuration::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+            .with_yield_on_full_buffer(true)
+            .build()
+    });
+    dec.reset();
+    lzw_fill(dec, raw, out)
 }
 
 /// Fill *out* from the LZW stream *raw*; `None` unless it fills completely
@@ -839,5 +855,225 @@ mod tests {
         r.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, data[data.len() - 3..]);
         assert!(r.seek(SeekFrom::Current(-(data.len() as i64) - 1)).is_err());
+    }
+
+    // ── LZW: the fast decoder (lzw.rs) on files from real encoders ──────────
+
+    /// Every chunk of the single-band LZW GeoTIFF at *path* through
+    /// `DirectChunks::decode`, against the `tiff` crate's whole-chunk read of
+    /// the same file; and through `lzw::fill` alone, against weezl, for the
+    /// data rows and (tiles) all stored rows — `fill` must take every chunk,
+    /// or the fast path would not be taken on such files. Returns the chunk
+    /// count and the bytes `decode` produced.
+    fn lzw_file_matches_the_tiff_crate(path: &std::path::Path) -> (usize, usize) {
+        let what = path.display().to_string();
+        let mut dec = Decoder::new(BlockReader::new(File::open(path).unwrap())).unwrap().with_limits(Limits::unlimited());
+        let tiled = matches!(dec.get_chunk_type(), ChunkType::Tile);
+        let (direct, _, h, _, ch, across) = header(&mut dec);
+        let direct = direct.unwrap_or_else(|| panic!("{what}: no direct decoder"));
+        assert_eq!(direct.codec, Codec::Lzw, "{what}");
+        let file = File::open(path).unwrap();
+        let (mut fallback, mut bytes) = (None, 0);
+        let n_chunks = across * h.div_ceil(ch);
+        for idx in 0..n_chunks {
+            let dh = ch.min(h - idx / across * ch) as usize;
+            let (off, len) = direct.extent(idx, dh);
+            let mut raw = vec![0u8; len as usize];
+            let got = read_full_at(&file, &mut raw, off).unwrap();
+            raw.truncate(got);
+            let mine = direct.decode(&raw, dh, &mut fallback).unwrap_or_else(|| panic!("{what}: chunk {idx} did not decode"));
+            let mine = bits_of(&mine);
+            let mut whole = DecodingResult::U8(Vec::new());
+            dec.read_chunk_to_buffer(&mut whole, idx, direct.row_bytes()).unwrap();
+            assert!(mine == bits_of(&whole)[..mine.len()], "{what}: chunk {idx} differs from tiff's whole-chunk read");
+            for rows in [dh, if tiled { ch as usize } else { dh }] {
+                let mut out = vec![0u8; direct.row_bytes() * rows];
+                assert!(lzw::fill(&raw, &mut out), "{what}: chunk {idx} ({rows} rows) left to weezl");
+                let mut reference = vec![0u8; out.len()];
+                lzw_weezl(&mut None, &raw, &mut reference).unwrap_or_else(|| panic!("{what}: weezl fails chunk {idx}"));
+                assert!(out == reference, "{what}: chunk {idx} ({rows} rows) differs from weezl");
+            }
+            bytes += direct.row_bytes() * dh;
+        }
+        assert!(fallback.is_none(), "{what}: decode needed weezl");
+        (n_chunks as usize, bytes)
+    }
+
+    /// The fixture whose padded edge tiles trip `tiff`'s own `read_chunk`
+    /// (tests/test_lzw_edge_tiles.rs), written by GDAL.
+    #[test]
+    fn the_lzw_edge_tile_fixture_decodes_like_the_tiff_crate() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/lzw_edge_tiles.tif");
+        assert_eq!(lzw_file_matches_the_tiff_crate(&path).0, 8 * 4);
+    }
+
+    /// Writes GDAL (libtiff) LZW files into `sys.argv[1]`: u8/i16/u16/f32 x
+    /// terrain/noise/NoData-block x every predictor x strips (default height
+    /// and 7 rows, short last strip; 333x211) and 128/256 tiles (padded edge
+    /// tiles; 500x500).
+    const GDAL_LZW_FILES: &str = r#"
+import sys
+import numpy as np
+from osgeo import gdal
+gdal.UseExceptions()
+out = sys.argv[1]
+rng = np.random.default_rng(1312)
+types = {'u8': (gdal.GDT_Byte, np.uint8), 'i16': (gdal.GDT_Int16, np.int16),
+         'u16': (gdal.GDT_UInt16, np.uint16), 'f32': (gdal.GDT_Float32, np.float32)}
+def data(kind, w, h, t):
+    y, x = np.mgrid[0:h, 0:w].astype(np.float64)
+    z = 800 + 300 * np.sin(x / 41.0) * np.cos(y / 67.0) + 0.4 * x - 0.2 * y + rng.normal(0, 0.3, (h, w))
+    if t == np.uint8:
+        z = z / 6
+    if kind == 'noise':
+        z = rng.uniform(-1e4, 1e4, (h, w)) if t == np.float32 else rng.integers(np.iinfo(t).min, np.iinfo(t).max, (h, w), endpoint=True)
+    if kind == 'nodata':
+        z[h // 4:3 * h // 4, w // 5:4 * w // 5] = 0 if t in (np.uint8, np.uint16) else -9999
+    if t == np.float32:
+        return np.round(z, 2).astype(np.float32)
+    return np.clip(np.round(z), np.iinfo(t).min, np.iinfo(t).max).astype(t)
+layouts = {'strips': [], 'strips7': ['BLOCKYSIZE=7'],
+           'tiles128': ['TILED=YES', 'BLOCKXSIZE=128', 'BLOCKYSIZE=128'],
+           'tiles256': ['TILED=YES', 'BLOCKXSIZE=256', 'BLOCKYSIZE=256']}
+for name, (gdt, t) in types.items():
+    for kind in ('terrain', 'noise', 'nodata'):
+        for pred in ((1, 2, 3) if t == np.float32 else (1, 2)):
+            for lay, opts in layouts.items():
+                w, h = (500, 500) if lay.startswith('tiles') else (333, 211)
+                ds = gdal.GetDriverByName('GTiff').Create(f'{out}/{name}_{kind}_p{pred}_{lay}.tif', w, h, 1, gdt,
+                                                          ['COMPRESS=LZW', f'PREDICTOR={pred}'] + opts)
+                ds.GetRasterBand(1).WriteArray(data(kind, w, h, t))
+                ds = None
+"#;
+
+    /// libtiff's LZW encoder is where real GeoTIFFs come from.
+    #[test]
+    #[ignore = "needs python3 with GDAL (osgeo) and numpy: cargo test -p aether_converter --lib gdal_lzw -- --ignored"]
+    fn gdal_lzw_files_decode_like_the_tiff_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(GDAL_LZW_FILES)
+            .arg(dir.path())
+            .status()
+            .expect("python3 runs");
+        assert!(status.success(), "the GDAL script failed");
+        let mut paths: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        assert_eq!(paths.len(), 108);
+        let (mut chunks, mut bytes) = (0, 0);
+        for path in &paths {
+            let (c, b) = lzw_file_matches_the_tiff_crate(path);
+            chunks += c;
+            bytes += b;
+        }
+        eprintln!("GDAL LZW: {} files, {chunks} chunks, {bytes} bytes decoded, all equal", paths.len());
+    }
+
+    /// Every chunk of every LZW GeoTIFF directly in *dir*, whole (all stored
+    /// rows), with its decoded size.
+    fn lzw_corpus(dir: &std::path::Path) -> Vec<(Vec<u8>, usize)> {
+        let mut paths: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        let mut chunks = Vec::new();
+        for path in paths.iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("tif"))) {
+            let mut dec = Decoder::new(BlockReader::new(File::open(path).unwrap())).unwrap().with_limits(Limits::unlimited());
+            let tiled = matches!(dec.get_chunk_type(), ChunkType::Tile);
+            let (Some(direct), _, h, _, ch, across) = header(&mut dec) else { continue };
+            if direct.codec != Codec::Lzw {
+                continue;
+            }
+            let file = File::open(path).unwrap();
+            for idx in 0..across * h.div_ceil(ch) {
+                let rows = if tiled { ch } else { ch.min(h - idx / across * ch) } as usize;
+                let (off, len) = direct.extent(idx, rows);
+                let mut raw = vec![0u8; len as usize];
+                let got = read_full_at(&file, &mut raw, off).unwrap();
+                raw.truncate(got);
+                chunks.push((raw, direct.row_bytes() * rows));
+            }
+        }
+        chunks
+    }
+
+    /// 1024 128x128 Float32 DEM tiles (terrain plus centimetre noise),
+    /// predictor 3, weezl-encoded: 64 MiB decoded.
+    fn synthetic_lzw_corpus() -> Vec<(Vec<u8>, usize)> {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 40) as f32 * 0.01
+        };
+        (0..1024u32)
+            .map(|t| {
+                let (tx, ty) = ((t % 32 * 128) as f32, (t / 32 * 128) as f32);
+                let mut raw = Vec::with_capacity(128 * 128 * 4);
+                for y in 0..128 {
+                    let mut row = Vec::with_capacity(128 * 4);
+                    for x in 0..128 {
+                        let (fx, fy) = (tx + x as f32, ty + y as f32);
+                        let z = 900.0 + 250.0 * (fx / 97.0).sin() * (fy / 151.0).cos() + 0.3 * fx + noise();
+                        row.extend_from_slice(&((z * 100.0).round() / 100.0).to_le_bytes());
+                    }
+                    predict_row(&mut row, Sample::F32, 3, false);
+                    raw.extend(row);
+                }
+                (compress(Codec::Lzw, &raw), raw.len())
+            })
+            .collect()
+    }
+
+    /// Speed of `lzw::fill` against weezl (`lzw_weezl`) on the same chunks,
+    /// best of 7 passes each, MB (10^6 bytes) of decoded output per second,
+    /// one thread. Corpus: the LZW GeoTIFFs in `AETHER_LZW_BENCH`, else
+    /// [`synthetic_lzw_corpus`]; at least 50 MB of chunks either way.
+    #[test]
+    #[ignore = "timing: AETHER_LZW_BENCH=<dir of LZW GeoTIFFs> cargo test --release -p aether_converter --lib lzw_speed -- --ignored --nocapture"]
+    fn lzw_speed_against_weezl() {
+        let (what, chunks) = match std::env::var_os("AETHER_LZW_BENCH") {
+            Some(dir) => (format!("{dir:?}"), lzw_corpus(std::path::Path::new(&dir))),
+            None => ("synthetic DEM tiles".to_string(), synthetic_lzw_corpus()),
+        };
+        let total: usize = chunks.iter().map(|c| c.1).sum();
+        assert!(total >= 50_000_000, "{what}: only {total} bytes of LZW chunks");
+        let mut buf = vec![0u8; chunks.iter().map(|c| c.1).max().unwrap()];
+        let mut reference = buf.clone();
+        let mut dec = None;
+        for (i, (raw, n)) in chunks.iter().enumerate() {
+            lzw_weezl(&mut dec, raw, &mut reference[..*n]).unwrap_or_else(|| panic!("{what}: weezl fails chunk {i}"));
+            assert!(lzw::fill(raw, &mut buf[..*n]), "{what}: chunk {i} left to weezl");
+            assert!(buf[..*n] == reference[..*n], "{what}: chunk {i} differs from weezl");
+        }
+        // Alternating passes, so both decoders see the same machine load.
+        let (mut t_weezl, mut t_fill) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            for (raw, n) in &chunks {
+                lzw_weezl(&mut dec, raw, &mut buf[..*n]).unwrap();
+            }
+            t_weezl = t_weezl.min(t.elapsed().as_secs_f64());
+            let t = std::time::Instant::now();
+            for (raw, n) in &chunks {
+                assert!(lzw::fill(raw, &mut buf[..*n]));
+            }
+            t_fill = t_fill.min(t.elapsed().as_secs_f64());
+        }
+        let mbs = |t: f64| total as f64 / t / 1e6;
+        eprintln!(
+            "{what}: {} chunks, {:.1} MB decoded; weezl {:.0} MB/s, lzw::fill {:.0} MB/s: {:.2}x",
+            chunks.len(),
+            total as f64 / 1e6,
+            mbs(t_weezl),
+            mbs(t_fill),
+            t_weezl / t_fill
+        );
+        // The target the decoder was written for (libtiff's lead over weezl).
+        if cfg!(debug_assertions) {
+            eprintln!("debug build: the 1.8x target is checked in --release only");
+        } else {
+            assert!(t_weezl / t_fill >= 1.8, "{what}: lzw::fill is only {:.2}x weezl", t_weezl / t_fill);
+        }
     }
 }

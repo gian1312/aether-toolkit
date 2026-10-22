@@ -4,12 +4,21 @@ mod buildings;
 // canopy subcommand, so the rest of the module is dead code in this binary.
 #[allow(dead_code)]
 mod canopy;
+mod diag;
 mod download;
 mod ingest;
 mod mvt;
 mod plan;
 mod probe;
 mod tiff_io;
+
+// The native Windows binary allocates through mimalloc (CONTRACT changelog
+// 37): the system heap returns large blocks to the OS on free, so a batch
+// paid fresh page faults for every tile buffer and window. Linux and macOS
+// keep their system allocators; the library and the wasm crate never set one.
+#[cfg(all(windows, not(target_arch = "wasm32"), feature = "native"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -80,6 +89,59 @@ enum Commands {
         #[arg(long)]
         jobs: Option<usize>,
     },
+}
+
+/// The batch's per-tile accounting: coverage, failures and the progress
+/// count, fed once per tile with its final result (on whichever thread
+/// finished it — a compute thread for a sampling error, a writer thread for
+/// a written or failed tile).
+struct BatchTally {
+    total: usize,
+    progress: AtomicUsize,
+    failures: AtomicUsize,
+    // Coverage is judged over the WHOLE batch, never per tile: the edge
+    // tiles of any area legitimately fall outside the sources, and failing
+    // on those would refuse every ordinary run.
+    covered: AtomicU64,
+}
+
+impl BatchTally {
+    fn tile_done(&self, tile_name: &str, result: anyhow::Result<ingest::TileStats>) {
+        let mut tile_line = None;
+        match result {
+            Ok(stats) => {
+                self.covered.fetch_add(stats.covered_px, Ordering::Relaxed);
+                // Parsed by the Waveshed plugin (CONTRACT §1.2, changelog 33):
+                // per-tile coverage, so a tile the sources never reached is
+                // known as void without opening it.
+                tile_line = Some(format!("[Tile] {} covered={}/{}", tile_name, stats.covered_px, stats.total_px));
+            }
+            Err(e) => {
+                // `{:#}` prints the whole cause chain ("loading source …:
+                // Opening …: No such file …"); `{}` printed only the outermost
+                // context, which named the file but never said what was wrong.
+                println!("[Error] Failed to process tile: {:#}", e);
+                self.failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        {
+            // One stdout lock for the tile line and the progress line, flushed
+            // together: the [Tile] line always precedes the progress count
+            // that includes it (the count is taken under the lock, so no
+            // other tile's progress line can overtake this tile's line).
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let curr = self.progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(line) = &tile_line {
+                let _ = writeln!(out, "{}", line);
+            }
+            if curr % 10 == 0 || curr == self.total {
+                let _ = writeln!(out, "[Rust] Progress: {}/{}", curr, self.total);
+            }
+            let _ = out.flush();
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -211,12 +273,20 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 let total = jobs.len();
-                let progress = AtomicUsize::new(0);
-                let failures = AtomicUsize::new(0);
-                // Coverage is judged over the WHOLE batch, never per tile: the
-                // edge tiles of any area legitimately fall outside the sources,
-                // and failing on those would refuse every ordinary run.
-                let covered = AtomicU64::new(0);
+                let tally = Arc::new(BatchTally {
+                    total,
+                    progress: AtomicUsize::new(0),
+                    failures: AtomicUsize::new(0),
+                    covered: AtomicU64::new(0),
+                });
+
+                // Finished tiles are written, synced and renamed on dedicated
+                // writer threads (CONTRACT changelog 37), so a compute thread
+                // starts its next tile instead of waiting on the file system.
+                // A tile is reported — `[Tile]`, `[Error]`, progress — once
+                // its file is committed (or its write failed). Written tiles'
+                // buffers are reused by the next tiles (one per thread).
+                let writer = ingest::TileWriter::new((safe_threads / 2).clamp(1, 4), safe_threads);
 
                 // Run all jobs in parallel using the constrained pool
                 pool.install(|| {
@@ -226,60 +296,39 @@ fn main() -> anyhow::Result<()> {
                             None => None,
                         };
                         // The output's file name, for the per-tile line below
-                        // (the job moves into process_tile_opts).
+                        // (the job moves into process_tile_batched).
                         let tile_name = job
                             .output_path
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_else(|| job.output_path.display().to_string());
-                        let mut tile_line = None;
-                        match ingest::process_tile_opts(job, texture_cache.clone(), pbf, &opts) {
-                            Ok(stats) => {
-                                covered.fetch_add(stats.covered_px, Ordering::Relaxed);
-                                // Parsed by the Waveshed plugin (CONTRACT §1.2,
-                                // changelog 33): per-tile coverage, so a tile
-                                // the sources never reached is known as void
-                                // without opening it.
-                                tile_line = Some(format!(
-                                    "[Tile] {} covered={}/{}",
-                                    tile_name, stats.covered_px, stats.total_px
-                                ));
-                            }
-                            Err(e) => {
-                                // `{:#}` prints the whole cause chain ("loading
-                                // source …: Opening …: No such file …"); `{}`
-                                // printed only the outermost context, which
-                                // named the file but never said what was wrong.
-                                println!("[Error] Failed to process tile: {:#}", e);
-                                failures.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-
-                        let curr = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                        {
-                            // One stdout lock for the tile line and the progress
-                            // line, flushed together: the [Tile] line always
-                            // precedes the progress count that includes it.
-                            use std::io::Write;
-                            let mut out = std::io::stdout().lock();
-                            if let Some(line) = &tile_line {
-                                let _ = writeln!(out, "{}", line);
-                            }
-                            if curr % 10 == 0 || curr == total {
-                                let _ = writeln!(out, "[Rust] Progress: {}/{}", curr, total);
-                            }
-                            let _ = out.flush();
-                        }
+                        let tally = tally.clone();
+                        ingest::process_tile_batched(
+                            job,
+                            texture_cache.clone(),
+                            pbf,
+                            &opts,
+                            &writer,
+                            Box::new(move |result| tally.tile_done(&tile_name, result)),
+                        );
                     });
                 });
+                // Every tile is reported before the batch result is decided.
+                writer.finish();
+                // The shared cache keeps up to a few hundred source files
+                // open (CONTRACT changelog 37). The process exits next, which
+                // closes them all at once; dropping the cache would close them
+                // one by one here — a file-system round trip each on a
+                // network share or a 9p mount.
+                std::mem::forget(opts);
 
                 // Fail loudly if any tile could not be produced, so callers
                 // don't treat a partial/terrain-less batch as success.
-                let n_failed = failures.load(Ordering::Relaxed);
+                let n_failed = tally.failures.load(Ordering::Relaxed);
                 if n_failed > 0 {
                     anyhow::bail!("{} of {} tiles failed to convert", n_failed, total);
                 }
-                if covered.load(Ordering::Relaxed) == 0 {
+                if tally.covered.load(Ordering::Relaxed) == 0 {
                     // The no-data contract (CONTRACT changelog item 18,
                     // 2026-08-31): an area the sources do not reach is
                     // no-data, not an error — the same ruling the download

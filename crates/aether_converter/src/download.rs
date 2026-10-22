@@ -39,6 +39,13 @@ impl Instant {
 use sysinfo::{Disks, System};
 use tokio::sync::Semaphore;
 
+// The raw source-tile cache of the CLI `download` (`cache_dir`, changelog
+// 38). Native only: the wasm build neither compiles nor needs it.
+#[cfg(feature = "native")]
+mod tile_cache;
+#[cfg(feature = "native")]
+use tile_cache::{Cached, TileCache};
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct DownloadJob {
     pub url_template: String,
@@ -85,6 +92,19 @@ pub struct DownloadJob {
     /// [`TILE_DEADLINE`] (20 s since changelog 30). CLI `download` only.
     #[serde(default)]
     pub tile_deadline_s: Option<f64>,
+    /// Directory of the raw source-tile cache (additive, CONTRACT §9b,
+    /// changelog 38; `aether_converter` 0.2.8). Absent, null or empty: no
+    /// cache, the run is exactly as before. Set: every source tile is looked
+    /// up in `<cache_dir>/<service_key>/z<zoom>/x<x>_y<y/256>.pack` before any
+    /// request, and every answer the run fetches that is worth keeping — an
+    /// HTTP 200 body that decoded, or a 404 — is written into it, so later
+    /// jobs (any zoom, any service) fetch only what it lacks. A directory
+    /// that cannot be used is a warning, never an error. CLI `download` only
+    /// (incl. repair jobs, which refetch their listed tiles and rewrite their
+    /// entries); the in-memory and browser downloaders ignore it. See
+    /// `download/tile_cache.rs`.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// Region of interest for [`DownloadJob::fetch_bounds`], in degrees.
@@ -439,17 +459,26 @@ fn recip(n: usize) -> f32 {
     if n < R.len() { R[n] } else { 1.0 / n as f32 }
 }
 
-/// One fetch + decode of a single tile (no retry) -> (grid, tile edge), or None.
+/// One fetch + decode of a single tile (no retry) -> (grid, tile edge), or
+/// None; with `keep`, also the answer the raw source-tile cache keeps of it
+/// (changelog 38): the body when it decoded, [`Cached::NoTile`] for a 404,
+/// nothing for any other outcome.
 #[cfg(feature = "native")]
 async fn fetch_decode_raw(
-    client: &reqwest::Client, url: &str, dec: fn(u8, u8, u8) -> f32,
-) -> Option<(Vec<f32>, usize)> {
-    let resp = client.get(url).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
+    client: &reqwest::Client, url: &str, dec: fn(u8, u8, u8) -> f32, keep: bool,
+) -> (Option<(Vec<f32>, usize)>, Option<Cached>) {
+    let Ok(resp) = client.get(url).send().await else { return (None, None) };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return (None, keep.then_some(Cached::NoTile));
     }
-    let body = resp.bytes().await.ok()?;
-    decode_tile(&body, dec).ok()
+    if !resp.status().is_success() {
+        return (None, None);
+    }
+    let Ok(body) = resp.bytes().await else { return (None, None) };
+    match decode_tile(&body, dec) {
+        Ok(grid) => (Some(grid), keep.then(|| Cached::Body(body.to_vec()))),
+        Err(_) => (None, None),
+    }
 }
 
 /// Wall-clock budget for one tile's whole parent backfill (all ancestor levels).
@@ -525,6 +554,9 @@ struct AncestorCache {
     dec: fn(u8, u8, u8) -> f32,
     budget: usize,
     state: std::sync::Mutex<AncestorState>,
+    /// The run's raw source-tile cache (changelog 38): an ancestor it holds
+    /// is not requested, and one that is fetched is written into it.
+    tile_cache: Option<Arc<TileCache>>,
 }
 
 #[cfg(feature = "native")]
@@ -536,13 +568,63 @@ impl AncestorCache {
     fn with_budget(
         client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32, budget: usize,
     ) -> Arc<Self> {
+        Self::build(client, url_template, dec, budget, None)
+    }
+
+    /// [`Self::new`] over the run's raw source-tile cache, if it has one.
+    fn with_tile_cache(
+        client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32,
+        tile_cache: Option<Arc<TileCache>>,
+    ) -> Arc<Self> {
+        Self::build(client, url_template, dec, ANCESTOR_CACHE_BUDGET, tile_cache)
+    }
+
+    fn build(
+        client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32, budget: usize,
+        tile_cache: Option<Arc<TileCache>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             client,
             url_template: url_template.to_owned(),
             dec,
             budget,
             state: std::sync::Mutex::new(AncestorState::default()),
+            tile_cache,
         })
+    }
+
+    /// One ancestor tile, decoded: from the raw source-tile cache when it
+    /// holds the tile (a cached 404 is `None` without a request; a cached
+    /// body that does not decode is fetched again), else one GET capped at
+    /// [`PARENT_FILL_DEADLINE`] whose 200-and-decoded or 404 answer is cached.
+    async fn fetch(&self, z: u32, x: u32, y: u32, url: &str) -> Option<(Vec<f32>, usize)> {
+        use tile_cache::Use;
+        let tc = self.tile_cache.as_deref();
+        if let Some(tc) = tc {
+            match tc.lookup(z, x, y) {
+                Some(Cached::NoTile) => {
+                    tc.count(Use::ParentHit);
+                    return None;
+                }
+                Some(Cached::Body(body)) => {
+                    if let Ok(grid) = decode_tile(&body, self.dec) {
+                        tc.count(Use::ParentHit);
+                        return Some(grid);
+                    }
+                }
+                None => {}
+            }
+            tc.count(Use::ParentFetched);
+        }
+        let (got, keep) = tokio::time::timeout(
+            PARENT_FILL_DEADLINE, fetch_decode_raw(&self.client, url, self.dec, tc.is_some()),
+        )
+        .await
+        .unwrap_or((None, None));
+        if let (Some(tc), Some(item)) = (tc, keep) {
+            tc.store(z, x, y, item, true).await;
+        }
+        got
     }
 
     /// Ancestor requests started so far.
@@ -566,13 +648,7 @@ impl AncestorCache {
             .replace("{x}", &x.to_string())
             .replace("{y}", &y.to_string());
         let task = tokio::spawn(async move {
-            let got = tokio::time::timeout(
-                PARENT_FILL_DEADLINE, fetch_decode_raw(&me.client, &url, me.dec),
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(Arc::new);
+            let got = me.fetch(z, x, y, &url).await.map(Arc::new);
             if let Some(g) = &got {
                 me.admit(key, g.0.len() * std::mem::size_of::<f32>());
             }
@@ -872,6 +948,11 @@ struct DownloadStats {
     tile_us_sum: AtomicU64,
     tile_us_max: AtomicU64,
     tile_us_min: AtomicU64,
+    /// Request attempts timed by [`Self::note_first_byte`], and the sum of
+    /// their waits for the response head (`[Stats] Tile latency:`'s
+    /// `first-byte avg`, changelog 36). The browser path times nothing.
+    first_byte_n: AtomicU64,
+    first_byte_us_sum: AtomicU64,
     /// Tiles with an attempt that stalled (see [`STALL_THRESHOLD`]).
     stalled: AtomicUsize,
     /// The source tile edge, from the first tile that decoded (0 = none yet).
@@ -884,6 +965,9 @@ struct DownloadStats {
     /// coarser zoom. A subset of `backfilled`; tallied in the error classes,
     /// never in `ok_count`, and excluded from [`Self::fatal_errors`].
     degraded: AtomicUsize,
+    /// The raw source-tile cache's `[Stats] Cache…` lines (changelog 38),
+    /// printed last in the block; empty when the run had no cache.
+    cache_lines: std::sync::Mutex<Vec<String>>,
 }
 
 impl DownloadStats {
@@ -905,11 +989,14 @@ impl DownloadStats {
             tile_us_sum: AtomicU64::new(0),
             tile_us_max: AtomicU64::new(0),
             tile_us_min: AtomicU64::new(u64::MAX),
+            first_byte_n: AtomicU64::new(0),
+            first_byte_us_sum: AtomicU64::new(0),
             stalled: AtomicUsize::new(0),
             tile_edge: AtomicUsize::new(0),
             window_line: std::sync::Mutex::new(None),
             backfilled: AtomicUsize::new(0),
             degraded: AtomicUsize::new(0),
+            cache_lines: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1014,6 +1101,15 @@ impl DownloadStats {
         }
     }
 
+    /// Account one request attempt's wait for its response head — connect,
+    /// TLS, the server's time; an attempt that failed before a head counts
+    /// the time until it failed.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // CLI `download` only
+    fn note_first_byte(&self, t: &FetchTiming) {
+        self.first_byte_us_sum.fetch_add(t.first_byte.as_micros() as u64, Ordering::Relaxed);
+        self.first_byte_n.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn total_tiles(&self) -> usize {
         self.ok_count.load(Ordering::Relaxed) + self.total_errors()
     }
@@ -1080,8 +1176,19 @@ impl DownloadStats {
             let max_ms = self.tile_us_max.load(Ordering::Relaxed) as f64 / 1000.0;
             let min_raw = self.tile_us_min.load(Ordering::Relaxed);
             let min_ms = if min_raw == u64::MAX { 0.0 } else { min_raw as f64 / 1000.0 };
-            eprintln!("[Stats] Tile latency: min={:.0}ms avg={:.0}ms max={:.0}ms",
-                min_ms, avg_ms, max_ms);
+            // ` first-byte avg=` is additive (changelog 36): the mean wait of
+            // a request attempt for its response head, against the whole
+            // tile's `avg` — a slow link shows in the gap between the two, a
+            // slow server or connection setup in the first.
+            let timed = self.first_byte_n.load(Ordering::Relaxed);
+            let first_byte = if timed > 0 {
+                format!(" first-byte avg={:.0}ms",
+                    self.first_byte_us_sum.load(Ordering::Relaxed) as f64 / timed as f64 / 1000.0)
+            } else {
+                String::new()
+            };
+            eprintln!("[Stats] Tile latency: min={:.0}ms avg={:.0}ms max={:.0}ms{}",
+                min_ms, avg_ms, max_ms, first_byte);
         }
         let stalled = self.stalled.load(Ordering::Relaxed);
         if stalled > 0 {
@@ -1127,6 +1234,12 @@ impl DownloadStats {
             if c > total / 10 {
                 eprintln!("[Stats] >>> >10% connection errors — too many connections for network/router.");
             }
+        }
+
+        // The raw source-tile cache (changelog 38; informational): last, so
+        // every earlier line keeps its place in the block.
+        for line in self.cache_lines.lock().map(|l| l.clone()).unwrap_or_default() {
+            eprintln!("{line}");
         }
     }
 }
@@ -1189,6 +1302,106 @@ fn available_disk_space(path: &Path) -> Option<u64> {
         }
     }
     Some(best.available_space())
+}
+
+/// Descriptors kept free beside the connections: the `.abt` files the (up
+/// to two concurrent) assemblies open, the job file, the runtime's own,
+/// stdio, and the raw source-tile cache (changelog 38): up to 16 kept pack
+/// readers (`tile_cache::OPEN_READERS`), one transient pack open per worker
+/// thread, and the cache writer's handle.
+#[cfg(feature = "native")]
+const FD_RESERVE: u64 = 96;
+
+/// Descriptors a CLI `download` with `conns` connections may hold at once:
+/// up to `conns` sockets in use, up to as many again idle in the client's
+/// pool (`pool_max_idle_per_host` is `conns`), resolver sockets while
+/// connections open, and [`FD_RESERVE`]. Measured on Linux at 256
+/// connections: peaks of 263 to 548 open descriptors.
+#[cfg(feature = "native")]
+fn fds_needed(conns: usize) -> u64 {
+    2 * conns as u64 + FD_RESERVE
+}
+
+/// The connections a run can hold under an open-file limit of `limit`
+/// descriptors (`None`: no such limit): `conns`, or as many as
+/// [`fds_needed`] fits when the limit is lower — at least 1.
+#[cfg(feature = "native")]
+fn connections_within(conns: usize, limit: Option<u64>) -> usize {
+    match limit {
+        Some(l) if fds_needed(conns) > l => {
+            ((l.saturating_sub(FD_RESERVE) / 2) as usize).clamp(1, conns.max(1))
+        }
+        _ => conns,
+    }
+}
+
+/// This process's open-file soft limit, first raised — best effort, never
+/// fatal — towards the hard limit when it is below `need` descriptors.
+/// `None` where there is no such limit: on Windows sockets and files are
+/// handles, not descriptors, and no per-process cap of this kind applies.
+///
+/// macOS starts every process at a soft limit of 256 and many Linux systems
+/// at 1 024; a run at the default 256 connections exceeds the first (see
+/// [`fds_needed`]), and at the limit `socket()` fails with EMFILE — and so
+/// does the assembly's `open()` of an output tile, which fails the run.
+/// macOS refuses (EINVAL) a soft limit above `kern.maxfilesperproc`, so the
+/// target is clamped to that there; a refused raise falls back to `need`.
+#[cfg(feature = "native")]
+fn open_file_limit(need: u64) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: getrlimit only writes the struct it is handed.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return None;
+        }
+        let soft = lim.rlim_cur;
+        let want = need as libc::rlim_t;
+        if soft >= want || soft >= lim.rlim_max {
+            return Some(soft as u64);
+        }
+        #[allow(unused_mut)]
+        let mut hard_target = lim.rlim_max;
+        #[cfg(target_vendor = "apple")]
+        {
+            hard_target = hard_target.min(max_files_per_proc());
+        }
+        for target in [hard_target, want.min(lim.rlim_max)] {
+            if target <= soft {
+                continue;
+            }
+            let raised = libc::rlimit { rlim_cur: target, rlim_max: lim.rlim_max };
+            // SAFETY: setrlimit only reads the struct it is handed.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+                return Some(target as u64);
+            }
+        }
+        Some(soft as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = need;
+        None
+    }
+}
+
+/// `kern.maxfilesperproc`, the highest soft open-file limit macOS accepts;
+/// 10 240 (`OPEN_MAX`) when it cannot be read.
+#[cfg(all(feature = "native", target_vendor = "apple"))]
+fn max_files_per_proc() -> libc::rlim_t {
+    let mut n: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a NUL-terminated name, and an output buffer of the size passed.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            b"kern.maxfilesperproc\0".as_ptr().cast(),
+            (&mut n as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && n > 0 { n as libc::rlim_t } else { 10_240 }
 }
 
 #[cfg(feature = "native")]
@@ -1307,19 +1520,27 @@ fn tile_client(conns: usize) -> reqwest::Result<reqwest::Client> {
     tile_client_with(conns, CONNECT_TIMEOUT, READ_IDLE_TIMEOUT)
 }
 
+/// How long a pooled keep-alive socket may sit idle before the client closes
+/// it (changelog 36; 5 s before). A run has idle gaps of a few seconds — a
+/// strip boundary, two strips waiting for the RAM budget — and at 5 s each
+/// such gap closed hundreds of warm sockets (measured ~700 at ≥ 512
+/// connections) that the next strip then had to reconnect, TLS and all.
+#[cfg(not(target_arch = "wasm32"))]
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// [`tile_client`] with explicit timeouts (tests shorten them).
 ///
 /// "connection closed before message completed" comes from hyper reusing a
-/// pooled keep-alive socket the server already closed, so idle sockets are
-/// dropped fast and TCP keepalive detects dead ones; the per-tile retry
-/// recovers the rare race that remains.
+/// pooled keep-alive socket the server already closed; TCP keepalive detects
+/// dead ones, and the per-tile retry (a reset is retried, changelog 27)
+/// recovers the race that remains.
 #[cfg(not(target_arch = "wasm32"))]
 fn tile_client_with(
     conns: usize, connect: std::time::Duration, idle: std::time::Duration,
 ) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .pool_max_idle_per_host(conns)
-        .pool_idle_timeout(std::time::Duration::from_secs(5))
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .tcp_keepalive(std::time::Duration::from_secs(15))
         .connect_timeout(connect)
         .read_timeout(idle)
@@ -1679,245 +1900,416 @@ impl ConnGate {
 
 // -- Async download -----------------------------------------------------------
 
-/// The per-run context [`download_tiles`] fetches through (CLI `download`).
+/// One source tile as [`download_tiles`] hands it back: `(x, y, samples and
+/// edge)`, or the failure when neither the tile nor an ancestor supplied it.
 #[cfg(feature = "native")]
-struct FetchCtx<'a> {
-    client: &'a reqwest::Client,
-    url_template: &'a str,
+type TileResult = (u32, u32, Result<(Vec<f32>, usize)>);
+
+/// How long a CLI `download` waits for its first source tile — the edge
+/// probe — before it sizes the first strip without it (changelog 36). A tile
+/// still out by then is a stall by [`STALL_THRESHOLD`]'s own measure; the
+/// first strip is then sized for [`MAX_TILE_PX`] tiles, as every strip before
+/// the first decode used to be, and takes the probe over when it lands.
+#[cfg(feature = "native")]
+const EDGE_PROBE_WAIT: std::time::Duration = STALL_THRESHOLD;
+
+/// The edge probe of a CLI `download` run: the first tile of the first
+/// strip, fetched alone before any strip is sized, then handed to that
+/// strip (never fetched again).
+#[cfg(feature = "native")]
+enum EdgeProbe {
+    /// Finished within [`EDGE_PROBE_WAIT`].
+    Done(Vec<TileResult>),
+    /// Still running; the first strip awaits it.
+    Running(tokio::task::JoinHandle<Vec<TileResult>>),
+}
+
+/// The per-run context [`download_tiles`] fetches through (CLI `download`).
+///
+/// Owned and cheap to clone (reference counts only): every tile runs as its
+/// own task (see [`download_tiles`]) and takes its own copy.
+#[cfg(feature = "native")]
+#[derive(Clone)]
+struct FetchCtx {
+    client: reqwest::Client,
+    url_template: Arc<str>,
     zoom: u32,
     dec: fn(u8, u8, u8) -> f32,
+    /// Tile tasks one [`download_tiles`] call keeps alive at once (what its
+    /// `buffer_unordered` allowed before changelog 36); the gate decides how
+    /// many of them request at once.
     concurrency: usize,
-    progress: &'a AtomicUsize,
+    progress: Arc<AtomicUsize>,
     total: usize,
-    stats: &'a DownloadStats,
+    stats: Arc<DownloadStats>,
     start_time: Instant,
-    gate: &'a ConnGate,
+    gate: Arc<ConnGate>,
     /// Tiles handed to [`download_tiles`] that have not been admitted by the
     /// gate yet; each admission takes one off. The strip launcher reads it to
     /// start the next strip before the pool runs dry (`None`: not tracked).
-    unstarted: Option<&'a AtomicUsize>,
+    unstarted: Option<Arc<AtomicUsize>>,
     /// Shared ancestor fetches for the parent fill (one per run).
-    ancestors: &'a Arc<AncestorCache>,
+    ancestors: Arc<AncestorCache>,
     /// Per-tile cap over all attempts ([`TILE_DEADLINE`] unless the job sets
     /// `tile_deadline_s`).
     tile_deadline: std::time::Duration,
+    /// The run's raw source-tile cache (`cache_dir`, changelog 38).
+    cache: Option<CacheUse>,
+    /// Called where each tile body is decoded (tests: proves that the tiles
+    /// of one call decode in parallel).
+    #[cfg(test)]
+    on_decode: Option<fn()>,
+}
+
+/// How one CLI `download` run uses its raw source-tile cache (changelog 38).
+#[cfg(feature = "native")]
+#[derive(Clone)]
+struct CacheUse {
+    cache: Arc<TileCache>,
+    /// The fetch set's index entries that can be hits, looked up once before
+    /// any request (`(x, y)` at the run's zoom).
+    index: Arc<std::collections::HashMap<(u32, u32), tile_cache::Entry>>,
+    /// Whether the run's own tiles are read from the cache. A repair job's
+    /// are not — it refetches its listed tiles on purpose — but their fresh
+    /// answers are still written, replacing the cached ones.
+    read: bool,
+}
+
+#[cfg(feature = "native")]
+impl CacheUse {
+    /// Tile `(x, y)` from the cache, if its entry is there and its body
+    /// still checks out: `Ok` the decoded tile, `Err` a cached HTTP 404. A
+    /// body that fails its CRC or its decode is no hit (`None`): the tile is
+    /// fetched and its entry rewritten.
+    fn hit(&self, zoom: u32, x: u32, y: u32, dec: fn(u8, u8, u8) -> f32) -> Option<Result<(Vec<f32>, usize)>> {
+        if !self.read {
+            return None;
+        }
+        let e = self.index.get(&(x, y))?;
+        match self.cache.read(zoom, x, y, e)? {
+            Cached::NoTile => Some(Err(HttpStatus { code: 404, retry_after: None }.into())),
+            Cached::Body(body) => decode_tile(&body, dec).ok().map(Ok),
+        }
+    }
+}
+
+/// Whether a final fetch error is the service's HTTP 404, "no tile here".
+#[cfg(feature = "native")]
+fn is_http_404(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<HttpStatus>().is_some_and(|h| h.code == 404)
+}
+
+/// Open the job's raw source-tile cache, if it names one (changelog 38). A
+/// directory that cannot be used costs one `[Warn]` line and the run goes on
+/// without a cache — never an error.
+#[cfg(feature = "native")]
+fn open_tile_cache(job: &DownloadJob) -> Option<Arc<TileCache>> {
+    let dir = job.cache_dir.as_deref().filter(|d| !d.as_os_str().is_empty())?;
+    match TileCache::open(dir, &job.url_template, &job.encoding) {
+        Ok(c) => Some(c),
+        Err(reason) => {
+            eprintln!("[Warn] cache_dir {} cannot be used ({reason}); downloading without cache",
+                      dir.display());
+            None
+        }
+    }
 }
 
 /// Fetch, retry, parent-fill, classify and report each tile in `coords`.
+///
+/// Each tile is its own tokio task (changelog 36), so the runtime spreads the
+/// TLS, body copies and decodes of one strip over all its worker threads.
+/// They used to be futures of one `buffer_unordered` stream inside the
+/// strip's single task — one thread at a time: at 256 connections that
+/// thread sat at ~100 % CPU while the run plateaued at ~230 tiles/s. At most
+/// `concurrency` tile tasks of one call are alive at once, as that stream
+/// allowed; the run's [`ConnGate`] still decides how many of them request at
+/// once, and each holds its decoded tile until the caller takes the results,
+/// as before. Results come back in completion order, as before.
 #[cfg(feature = "native")]
-async fn download_tiles(
-    ctx: &FetchCtx<'_>, coords: Vec<(u32, u32)>,
-) -> Vec<(u32, u32, Result<(Vec<f32>, usize)>)> {
-    let FetchCtx {
-        client, url_template, zoom, dec, concurrency, progress, total, stats,
-        start_time, gate, unstarted, ancestors, tile_deadline,
-    } = *ctx;
-    let on_progress: Option<&(dyn Fn(usize, usize) + Send + Sync)> = None;
+async fn download_tiles(ctx: &FetchCtx, coords: Vec<(u32, u32)>) -> Vec<TileResult> {
+    let cap = ctx.concurrency.max(1);
+    let mut todo = coords.into_iter();
+    let mut out = Vec::with_capacity(todo.len());
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < cap {
+            let Some((tx, ty)) = todo.next() else { break };
+            let ctx = ctx.clone();
+            tasks.spawn(async move { fetch_tile(&ctx, tx, ty).await });
+        }
+        match tasks.join_next().await {
+            Some(Ok(r)) => out.push(r),
+            // A tile that panics fails its strip, as it did when it ran
+            // inside the strip's task. Nothing cancels a tile task but the
+            // runtime shutting down, which takes this caller with it.
+            Some(Err(e)) => match e.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(e) => panic!("tile task cancelled: {e}"),
+            },
+            None => break,
+        }
+    }
+    out
+}
 
-    stream::iter(coords)
-        .map(|(tx, ty)| {
-            let client = client.clone();
-            let url = url_template
-                .replace("{x}", &tx.to_string())
-                .replace("{y}", &ty.to_string())
-                .replace("{z}", &zoom.to_string());
-            let progress = progress;
-            let stats = stats;
-            let gate = gate;
-            let on_progress = on_progress;
-            async move {
-                // The run's connection gate (fixed `max_connections`, cut
-                // only by 429/503 bursts) — also what keeps several strips
-                // in flight from multiplying the connections.
-                let slot = gate.acquire().await;
-                if let Some(u) = unstarted {
-                    u.fetch_sub(1, Ordering::Relaxed);
-                }
-                let t0 = Instant::now();
-                // The tile's whole budget: attempts, back-offs, Retry-After.
-                let deadline = tokio::time::Instant::now() + tile_deadline;
-                let cur_flight = stats.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-                stats.peak_in_flight.fetch_max(cur_flight, Ordering::Relaxed);
+/// The network half of [`fetch_tile`]: wait for a gate slot, fetch with
+/// retries and back-offs inside the tile deadline, decode, hand the slot
+/// back. Returns when the tile was admitted, its result, its first stalled
+/// attempt, and — when the run has a raw source-tile cache — the body that
+/// decoded.
+#[cfg(feature = "native")]
+async fn fetch_over_network(
+    ctx: &FetchCtx, tx: u32, ty: u32,
+) -> (Instant, Result<(Vec<f32>, usize)>, Option<FetchTiming>, Option<Vec<u8>>) {
+    let (zoom, dec, tile_deadline) = (ctx.zoom, ctx.dec, ctx.tile_deadline);
+    let (stats, gate) = (&*ctx.stats, &*ctx.gate);
+    let url = ctx.url_template
+        .replace("{x}", &tx.to_string())
+        .replace("{y}", &ty.to_string())
+        .replace("{z}", &zoom.to_string());
 
-                // Retry loop: up to STRIP_MAX_RETRIES retries, capped
-                // exponential backoff (1, 2, 4, 8, 8 s) or the server's
-                // Retry-After when it asks for longer. What retries is decided
-                // by the error's type ([`is_retryable`]): transport failures,
-                // 429 and 5xx do; other statuses and decode errors do not.
-                // The extra attempts target the largest tiles: their first try
-                // can fail under peak concurrency, but once the backoff elapses
-                // the strip has drained and a retry gets the bandwidth.
-                const MAX_RETRIES: u32 = STRIP_MAX_RETRIES;
-                let mut result: Result<(Vec<f32>, usize)> =
-                    Err(anyhow::anyhow!("not started"));
-                let mut stall: Option<FetchTiming> = None;
-                let mut retry_after: Option<std::time::Duration> = None;
+    // The run's connection gate (fixed `max_connections`, cut only by
+    // 429/503 bursts) — also what keeps several strips in flight from
+    // multiplying the connections.
+    let slot = gate.acquire().await;
+    if let Some(u) = &ctx.unstarted {
+        u.fetch_sub(1, Ordering::Relaxed);
+    }
+    let t0 = Instant::now();
+    // The tile's whole budget: attempts, back-offs, Retry-After.
+    let deadline = tokio::time::Instant::now() + tile_deadline;
+    let cur_flight = stats.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+    stats.peak_in_flight.fetch_max(cur_flight, Ordering::Relaxed);
 
-                // All of it runs inside the tile's TILE_DEADLINE: an attempt
-                // still in flight at the deadline is abandoned, and a back-off
-                // or Retry-After that would end past it is not slept — either
-                // way the tile stops as a `timeout` failure (TileDeadlineExpired)
-                // and goes to the parent fill. That bounds the silent server
-                // and the trickle. The slot is HELD through every back-off: a
-                // failing server sees fewer requests without any window cut.
-                for attempt in 0..=MAX_RETRIES {
-                    if attempt > 0 {
-                        let backoff = std::time::Duration::from_millis(
-                            (1000u64 << (attempt - 1)).min(8000));
-                        let wait = backoff.max(retry_after.unwrap_or_default());
-                        if tokio::time::Instant::now() + wait >= deadline {
-                            result = Err(TileDeadlineExpired.into());
-                            break;
-                        }
-                        stats.retries.fetch_add(1, Ordering::Relaxed);
-                        tokio::time::sleep(wait).await;
-                        if tokio::time::timeout_at(deadline, gate.wait_retry_after()).await.is_err() {
-                            result = Err(TileDeadlineExpired.into());
-                            break;
-                        }
-                    }
-                    let (body, timing) = fetch_tile_body_until(&client, &url, Some(deadline)).await;
-                    if stall.is_none() && timing.stalled() { stall = Some(timing); }
-                    result = match body {
-                        Ok(body) => {
-                            stats.bytes_downloaded.fetch_add(body.len() as u64, Ordering::Relaxed);
-                            decode_tile(&body, dec)
-                        }
-                        Err(e) => Err(e),
-                    };
-                    retry_after = result.as_ref().err()
-                        .and_then(|e| e.downcast_ref::<HttpStatus>())
-                        .and_then(|h| h.retry_after);
-                    gate.observe(result.as_ref().err().map(FetchFailure::of), retry_after);
-                    match &result {
-                        Ok(_) => break,
-                        Err(e) if !is_retryable(e) => break,
-                        Err(_) => {}
-                    }
-                }
+    // Retry loop: up to STRIP_MAX_RETRIES retries, capped exponential
+    // backoff (1, 2, 4, 8, 8 s) or the server's Retry-After when it asks for
+    // longer. What retries is decided by the error's type ([`is_retryable`]):
+    // transport failures, 429 and 5xx do; other statuses and decode errors do
+    // not. The extra attempts target the largest tiles: their first try can
+    // fail under peak concurrency, but once the backoff elapses the strip has
+    // drained and a retry gets the bandwidth.
+    const MAX_RETRIES: u32 = STRIP_MAX_RETRIES;
+    let mut result: Result<(Vec<f32>, usize)> = Err(anyhow::anyhow!("not started"));
+    let mut stall: Option<FetchTiming> = None;
+    let mut retry_after: Option<std::time::Duration> = None;
+    // The body that decoded, for the raw source-tile cache (`None` without one).
+    let mut kept: Option<Vec<u8>> = None;
 
-                // The request part is over: hand the slot back before the
-                // parent fill, whose ancestor fetches are shared per run and
-                // capped by their own deadline — a slot held idle through
-                // them (up to 30 s) is a connection no tile can use.
-                stats.in_flight.fetch_sub(1, Ordering::Relaxed);
-                drop(slot);
-
-                // Terrarium NODATA voids: if this tile came back with blank
-                // pixels, backfill only those from real (upsampled) data in the
-                // coarser parent tiles instead of leaving a -16 km pit / stripe.
-                // A tile that never arrived at all is the same hole at a
-                // larger scale, so it gets the same repair. `result` keeps the
-                // failure, so the classification below still sees it: the
-                // backfill supplies pixels, it does not un-fail the request.
-                // Bounded by PARENT_FILL_DEADLINE (see there for the worst case).
-                let mut repair: Option<ParentFill> = None;
-                // Ancestors come from the run's shared AncestorCache: each one
-                // is fetched once, however many descendants need it.
-                if result.is_err() {
-                    repair = fill_from_parents_cached(
-                        ancestors, zoom, tx, ty, None, PARENT_FILL_DEADLINE,
-                    ).await;
-                    if repair.is_some() {
-                        stats.backfilled.fetch_add(1, Ordering::Relaxed);
-                    }
-                } else if matches!(&result, Ok((g, _)) if g.iter().any(|&v| v <= NODATA_M)) {
-                    if let Ok((g, ts)) = result {
-                        result = fill_from_parents_cached(
-                            ancestors, zoom, tx, ty, Some((g, ts)), PARENT_FILL_DEADLINE,
-                        )
-                        .await
-                        .map(|f| (f.grid, f.edge))
-                        .ok_or_else(|| anyhow::anyhow!("unreachable: edge was known"));
-                    }
-                }
-
-                let tile_us = t0.elapsed().as_micros() as u64;
-                stats.tile_us_sum.fetch_add(tile_us, Ordering::Relaxed);
-                stats.tile_us_max.fetch_max(tile_us, Ordering::Relaxed);
-                stats.tile_us_min.fetch_min(tile_us, Ordering::Relaxed);
-                if let Ok((_, edge)) = &result {
-                    let _ = stats.tile_edge.compare_exchange(
-                        0, *edge, Ordering::Relaxed, Ordering::Relaxed);
-                }
-
-                // Classify final result (only after all retries exhausted).
-                //
-                // A 404 the parent backfill repaired is DATA — the service has
-                // no tile at this zoom and the coarser one is what exists — so
-                // it counts as OK, as before (CONTRACT changelog 16).
-                //
-                // Any other failure the backfill repaired is DEGRADED: the
-                // tile exists at this zoom and we failed to get it, so its
-                // pixels are a coarser stand-in. It is classified in the error
-                // tallies like an unrepaired failure and NOT counted as OK —
-                // reporting it as OK let a consumer cache 2 m near-field
-                // terrain that was silently z14-or-coarser. One `[Degraded]`
-                // line per tile names it; it stays out of the fatal majority
-                // (see `fatal_errors`), because its output is coarse, not void.
-                match (&result, &repair) {
-                    (Ok(_), _) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
-                    (Err(e), repair) => {
-                        let msg = format!("{:#}", e);
-                        let why = FetchFailure::of(e);
-                        match repair {
-                            Some(_) if why == FetchFailure::Http(404) => {
-                                stats.ok_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Some(fill) => {
-                                stats.record_failure(why, zoom, tx, ty, &msg);
-                                let from = fill.coarsest_zoom.unwrap_or(zoom.saturating_sub(1));
-                                if let Some(line) = stats.note_degraded(zoom, tx, ty, why, from) {
-                                    eprintln!("{line}");
-                                }
-                            }
-                            None => stats.record_failure(why, zoom, tx, ty, &msg),
-                        }
-                    }
-                }
-
-                // Warn about tiles that STALLED — waited past STALL_THRESHOLD
-                // for a first byte or between body chunks. Not wall time: under
-                // a shared link every tile is slow while moving at full speed.
-                if let Some(t) = &stall {
-                    stats.note_stall(zoom, tx, ty, t);
-                }
-
-                // Enhanced progress line with running throughput + error count.
-                let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                let pct = done * 100 / total;
-                let prev_pct = (done - 1) * 100 / total;
-
-                // Fire callback every 5%
-                if let Some(cb) = on_progress {
-                    if pct / 5 > prev_pct / 5 || done == total || done == 1 {
-                        cb(done, total);
-                    }
-                }
-
-                // Every whole percent (CONTRACT §1.2): a large job used to sit
-                // silent for minutes between 10 % lines.
-                if pct > prev_pct || done == total {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64
-                        / (1024.0 * 1024.0);
-                    let tp = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
-                    let errs = stats.total_errors();
-                    let in_fl = stats.in_flight.load(Ordering::Relaxed);
-                    // `window` is a trailing field (changelog 30): the plugin
-                    // matches the prefix `[Download] <pct>% (<done>/<total>)`.
-                    eprintln!(
-                        "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight, window {}",
-                        pct, done, total, tp, errs, in_fl, gate.window()
-                    );
-                }
-
-                (tx, ty, repair.map(|f| Ok((f.grid, f.edge))).unwrap_or(result))
+    // All of it runs inside the tile's TILE_DEADLINE: an attempt still in
+    // flight at the deadline is abandoned, and a back-off or Retry-After that
+    // would end past it is not slept — either way the tile stops as a
+    // `timeout` failure (TileDeadlineExpired) and goes to the parent fill.
+    // That bounds the silent server and the trickle. The slot is HELD through
+    // every back-off: a failing server sees fewer requests without any window
+    // cut.
+    for attempt in 0..=MAX_RETRIES {
+        if attempt > 0 {
+            let backoff = std::time::Duration::from_millis((1000u64 << (attempt - 1)).min(8000));
+            let wait = backoff.max(retry_after.unwrap_or_default());
+            if tokio::time::Instant::now() + wait >= deadline {
+                result = Err(TileDeadlineExpired.into());
+                break;
             }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await
+            stats.retries.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(wait).await;
+            if tokio::time::timeout_at(deadline, gate.wait_retry_after()).await.is_err() {
+                result = Err(TileDeadlineExpired.into());
+                break;
+            }
+        }
+        let (body, timing) = fetch_tile_body_until(&ctx.client, &url, Some(deadline)).await;
+        stats.note_first_byte(&timing);
+        if stall.is_none() && timing.stalled() { stall = Some(timing); }
+        result = match body {
+            Ok(body) => {
+                stats.bytes_downloaded.fetch_add(body.len() as u64, Ordering::Relaxed);
+                // Decoded inline, on the tile's worker (1.6 ms mean, 3.4 ms
+                // max per 256 px tile, measured): `spawn_blocking` spread it
+                // over ~90 more threads and ran 20–30 % fewer tiles/s once the
+                // CPUs were the limit (changelog 36).
+                #[cfg(test)]
+                if let Some(hook) = ctx.on_decode { hook(); }
+                let decoded = decode_tile(&body, dec);
+                if decoded.is_ok() && ctx.cache.is_some() {
+                    kept = Some(body);
+                }
+                decoded
+            }
+            Err(e) => Err(e),
+        };
+        retry_after = result.as_ref().err()
+            .and_then(|e| e.downcast_ref::<HttpStatus>())
+            .and_then(|h| h.retry_after);
+        gate.observe(result.as_ref().err().map(FetchFailure::of), retry_after);
+        match &result {
+            Ok(_) => break,
+            Err(e) if !is_retryable(e) => break,
+            Err(_) => {}
+        }
+    }
+
+    // The request part is over: hand the slot back before the parent fill,
+    // whose ancestor fetches are shared per run and capped by their own
+    // deadline — a slot held idle through them (up to 30 s) is a connection
+    // no tile can use.
+    stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+    drop(slot);
+    (t0, result, stall, kept)
+}
+
+/// One source tile's whole life in a CLI `download` run: answered from the
+/// raw source-tile cache when it holds the tile (no slot, no request), else
+/// fetched ([`fetch_over_network`]) and its answer cached; then, for both
+/// alike, parent-fill, classify, report.
+#[cfg(feature = "native")]
+async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
+    let (zoom, dec, total) = (ctx.zoom, ctx.dec, ctx.total);
+    let (stats, gate, progress) = (&*ctx.stats, &*ctx.gate, &*ctx.progress);
+
+    // The raw source-tile cache (changelog 38). A hit takes no connection
+    // slot and makes no request: it counts as started at once (`unstarted`,
+    // which the strip launcher watches) and is decoded from the cached
+    // bytes. From the parent fill on, a hit and a fetched tile are the same
+    // tile — same pixels, same counts, same progress line. A cached 404 is
+    // the 404 the service gave, and goes to the parent fill as one.
+    let t_hit = Instant::now();
+    let hit = ctx.cache.as_ref().and_then(|c| c.hit(zoom, tx, ty, dec));
+    let (t0, mut result, stall) = match hit {
+        Some(r) => {
+            if let Some(c) = &ctx.cache {
+                c.cache.count(tile_cache::Use::Hit);
+            }
+            if let Some(u) = &ctx.unstarted {
+                u.fetch_sub(1, Ordering::Relaxed);
+            }
+            (t_hit, r, None)
+        }
+        None => {
+            let (t0, result, stall, body) = fetch_over_network(ctx, tx, ty).await;
+            if let Some(c) = &ctx.cache {
+                c.cache.count(tile_cache::Use::Fetched);
+                // Worth keeping: a body that decoded, and a 404. Never a
+                // failure, a timeout or an undecodable body — nor anything
+                // the parent fill below makes of the tile.
+                let keep = match (&result, body) {
+                    (Ok(_), Some(body)) => Some(Cached::Body(body)),
+                    (Err(e), _) if is_http_404(e) => Some(Cached::NoTile),
+                    _ => None,
+                };
+                if let Some(item) = keep {
+                    c.cache.store(zoom, tx, ty, item, false).await;
+                }
+            }
+            (t0, result, stall)
+        }
+    };
+
+    // Terrarium NODATA voids: if this tile came back with blank pixels,
+    // backfill only those from real (upsampled) data in the coarser parent
+    // tiles instead of leaving a -16 km pit / stripe. A tile that never
+    // arrived at all is the same hole at a larger scale, so it gets the same
+    // repair. `result` keeps the failure, so the classification below still
+    // sees it: the backfill supplies pixels, it does not un-fail the request.
+    // Bounded by PARENT_FILL_DEADLINE (see there for the worst case).
+    let mut repair: Option<ParentFill> = None;
+    // Ancestors come from the run's shared AncestorCache: each one is fetched
+    // once, however many descendants need it.
+    if result.is_err() {
+        repair = fill_from_parents_cached(
+            &ctx.ancestors, zoom, tx, ty, None, PARENT_FILL_DEADLINE,
+        ).await;
+        if repair.is_some() {
+            stats.backfilled.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if matches!(&result, Ok((g, _)) if g.iter().any(|&v| v <= NODATA_M)) {
+        if let Ok((g, ts)) = result {
+            result = fill_from_parents_cached(
+                &ctx.ancestors, zoom, tx, ty, Some((g, ts)), PARENT_FILL_DEADLINE,
+            )
+            .await
+            .map(|f| (f.grid, f.edge))
+            .ok_or_else(|| anyhow::anyhow!("unreachable: edge was known"));
+        }
+    }
+
+    let tile_us = t0.elapsed().as_micros() as u64;
+    stats.tile_us_sum.fetch_add(tile_us, Ordering::Relaxed);
+    stats.tile_us_max.fetch_max(tile_us, Ordering::Relaxed);
+    stats.tile_us_min.fetch_min(tile_us, Ordering::Relaxed);
+    if let Ok((_, edge)) = &result {
+        let _ = stats.tile_edge.compare_exchange(0, *edge, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    // Classify final result (only after all retries exhausted).
+    //
+    // A 404 the parent backfill repaired is DATA — the service has no tile at
+    // this zoom and the coarser one is what exists — so it counts as OK, as
+    // before (CONTRACT changelog 16).
+    //
+    // Any other failure the backfill repaired is DEGRADED: the tile exists at
+    // this zoom and we failed to get it, so its pixels are a coarser
+    // stand-in. It is classified in the error tallies like an unrepaired
+    // failure and NOT counted as OK — reporting it as OK let a consumer cache
+    // 2 m near-field terrain that was silently z14-or-coarser. One
+    // `[Degraded]` line per tile names it; it stays out of the fatal majority
+    // (see `fatal_errors`), because its output is coarse, not void.
+    match (&result, &repair) {
+        (Ok(_), _) => { stats.ok_count.fetch_add(1, Ordering::Relaxed); }
+        (Err(e), repair) => {
+            let msg = format!("{:#}", e);
+            let why = FetchFailure::of(e);
+            match repair {
+                Some(_) if why == FetchFailure::Http(404) => {
+                    stats.ok_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(fill) => {
+                    stats.record_failure(why, zoom, tx, ty, &msg);
+                    let from = fill.coarsest_zoom.unwrap_or(zoom.saturating_sub(1));
+                    if let Some(line) = stats.note_degraded(zoom, tx, ty, why, from) {
+                        eprintln!("{line}");
+                    }
+                }
+                None => stats.record_failure(why, zoom, tx, ty, &msg),
+            }
+        }
+    }
+
+    // Warn about tiles that STALLED — waited past STALL_THRESHOLD for a first
+    // byte or between body chunks. Not wall time: under a shared link every
+    // tile is slow while moving at full speed.
+    if let Some(t) = &stall {
+        stats.note_stall(zoom, tx, ty, t);
+    }
+
+    // Progress line with running throughput + error count, every whole
+    // percent (CONTRACT §1.2): a large job used to sit silent for minutes
+    // between 10 % lines. Tiles finish on several threads at once now, so
+    // the count is taken and its line written under stderr's lock: the lines
+    // reach the stream in count order, as they did when one thread ran a
+    // strip. (No await below: the lock never travels with the task.)
+    {
+        let _in_order = std::io::stderr().lock();
+        let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
+        let pct = done * 100 / total;
+        let prev_pct = (done - 1) * 100 / total;
+        if pct > prev_pct || done == total {
+            let elapsed = ctx.start_time.elapsed().as_secs_f64();
+            let mb = stats.bytes_downloaded.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+            let tp = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
+            let errs = stats.total_errors();
+            let in_fl = stats.in_flight.load(Ordering::Relaxed);
+            // `window` is a trailing field (changelog 30): the plugin matches
+            // the prefix `[Download] <pct>% (<done>/<total>)`. `eprintln!`
+            // re-takes the (reentrant) lock this thread already holds.
+            eprintln!(
+                "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight, window {}",
+                pct, done, total, tp, errs, in_fl, gate.window()
+            );
+        }
+    }
+
+    (tx, ty, repair.map(|f| Ok((f.grid, f.edge))).unwrap_or(result))
 }
 
 // -- Raw-bytes download (no decode) for WASM single-threaded mode -------------
@@ -2553,6 +2945,9 @@ pub struct DownloadTuning {
     /// before changelog 30 did, instead of only the tiles that touch a
     /// requested output tile (comparison runs).
     pub fetch_whole_rect: bool,
+    /// A fixed RAM budget in bytes instead of min(available / 4, 2 GiB)
+    /// (tests: strip sizing that does not depend on the machine's RAM).
+    pub ram_budget: Option<usize>,
 }
 
 /// What a [`run_download_tuned`] run did (tests and diagnosis).
@@ -2565,6 +2960,9 @@ pub struct DownloadReport {
     pub strips: usize,
     /// The most tile-rows any strip had.
     pub max_strip_rows: u32,
+    /// Tile-rows of the first strip — sized from the probed tile edge, or
+    /// for 512 px tiles when the probe failed or was slow (changelog 36).
+    pub first_strip_rows: u32,
 }
 
 #[cfg(feature = "native")]
@@ -2576,7 +2974,22 @@ pub fn run_download(job_file: &Path) -> Result<()> {
 #[cfg(feature = "native")]
 pub fn run_download_tuned(job_file: &Path, tuning: DownloadTuning) -> Result<DownloadReport> {
     let content = fs::read_to_string(job_file)?;
-    let job: DownloadJob = serde_json::from_str(&content)?;
+    let mut job: DownloadJob = serde_json::from_str(&content)?;
+
+    // Make room for the connections under the open-file limit (unix: raise
+    // the soft limit, best effort); where even the raised limit cannot hold
+    // them, run fewer connections rather than fail on EMFILE (changelog 36).
+    let want = job.max_connections.unwrap_or(256);
+    let limit = open_file_limit(fds_needed(want));
+    let conns = connections_within(want, limit);
+    if conns < want {
+        eprintln!(
+            "[Download] open-file limit {}: {} connections instead of max_connections {} \
+             ({} descriptors would not fit)",
+            limit.unwrap_or(0), conns, want, fds_needed(want)
+        );
+        job.max_connections = Some(conns);
+    }
 
     // The file-based path seek-writes sparse .abt files ("file grows as
     // strips write data"), so rows a fetch ROI skipped would read back as
@@ -2778,10 +3191,17 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
         "[Download] repair: z={} {} source tile(s) into {} existing output tile(s) connections={}",
         zoom, total, files.len(), conns
     );
+    // The raw source-tile cache (changelog 38): a repair refetches its listed
+    // tiles on purpose, so it reads none of them from the cache, and writes
+    // their fresh answers over the cached ones. The parent fill uses the
+    // cache as in a full run.
+    let tile_cache = open_tile_cache(&job);
+    if tile_cache.is_some() {
+        eprintln!("[Download] cache: 0 of {total} source tiles from cache (a repair refetches every listed tile)");
+    }
 
     let client = tile_client(conns)?;
-    let progress = AtomicUsize::new(0);
-    let stats = DownloadStats::new();
+    let stats = Arc::new(DownloadStats::new());
     let gate = Arc::new(ConnGate::new(conns));
     let ticker = {
         let g = gate.clone();
@@ -2791,15 +3211,22 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
             loop { every.tick().await; g.tick(); }
         })
     };
-    let ancestors = AncestorCache::new(client.clone(), &job.url_template, dec);
+    let ancestors = AncestorCache::with_tile_cache(client.clone(), &job.url_template, dec, tile_cache.clone());
     let ctx = FetchCtx {
-        client: &client, url_template: &job.url_template, zoom, dec, concurrency: conns,
-        progress: &progress, total, stats: &stats, start_time: start, gate: &gate,
-        unstarted: None, ancestors: &ancestors, tile_deadline,
+        client, url_template: job.url_template.as_str().into(), zoom, dec, concurrency: conns,
+        progress: Arc::new(AtomicUsize::new(0)), total, stats: stats.clone(), start_time: start,
+        gate: gate.clone(), unstarted: None, ancestors, tile_deadline,
+        cache: tile_cache.as_ref().map(|c| CacheUse { cache: c.clone(), index: Arc::default(), read: false }),
+        #[cfg(test)]
+        on_decode: None,
     };
     let results = download_tiles(&ctx, want.iter().copied().collect()).await;
     ticker.abort();
     if let Ok(mut w) = stats.window_line.lock() { *w = Some(gate.summary_line()); }
+    if let Some(c) = &tile_cache {
+        let lines = c.finish().lines(c.dir());
+        if let Ok(mut l) = stats.cache_lines.lock() { *l = lines; }
+    }
 
     let mut tile_size = TileSize::default();
     let ts = tile_size.adopt(&results)?;
@@ -3111,6 +3538,20 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
         }
     }
 
+    // 2c. The raw source-tile cache (`cache_dir`, changelog 38): every tile of
+    //     the fetch set is looked up before any request — one index read per
+    //     pack — and a hit is decoded from the cached bytes when its turn
+    //     comes, without a connection slot (`fetch_tile`). `<hits>` counts
+    //     the entries found; one whose bytes then fail their CRC or decode is
+    //     fetched after all, which `[Stats] Cache:` reports.
+    let tile_cache = open_tile_cache(&job);
+    let cache_use = tile_cache.as_ref().map(|c| {
+        let tiles = row_tiles.iter().zip(y0..).flat_map(|(cols, ty)| cols.iter().map(move |&tx| (tx, ty)));
+        let index = c.index(job.zoom, tiles);
+        eprintln!("[Download] cache: {} of {} source tiles from cache", index.len(), total);
+        CacheUse { cache: c.clone(), index: Arc::new(index), read: true }
+    });
+
     // 3. Single HTTP client — reqwest handles connection pooling internally.
     //    10 s connect timeout, 15 s read-idle timeout, no total timeout: see
     //    `tile_client` / READ_IDLE_TIMEOUT.
@@ -3135,12 +3576,15 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
         specs
     };
 
-    // 4b. Assembly thread pool — small pool; assembly is memory-bound (<1% CPU).
-    //     Keep most cores free for Tokio (TLS + PNG decode = 78% of CPU).
+    // 4b. Assembly thread pool. One strip at a time on a quarter of the CPUs
+    //     assembled ~450 tiles/s on 16 CPUs — the limit once the download
+    //     itself got faster (changelog 36) — so two strips assemble at once
+    //     (MAX_CONCURRENT_ASM below) on half the CPUs; the other half stays
+    //     with the tokio workers that run the tile tasks.
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let asm_threads = (num_cpus / 4).max(2);
+    let asm_threads = (num_cpus / 2).max(2);
     let asm_pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(asm_threads)
@@ -3161,28 +3605,21 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     //    strips in flight have fewer unstarted tiles than the connection
     //    window — so the pool is kept fed without strips piling up in memory.
     //    Each output row samples exactly one tile-row, so strip boundaries
-    //    never change a byte.
+    //    never change a byte. Two strips may assemble at once
+    //    (MAX_CONCURRENT_ASM, changelog 36) inside the same budget: a strip's
+    //    bytes stay in `held` until its assembly ends, so the launch gate
+    //    already counts both; each assembly adds its one tile-row of grid
+    //    (`nx × edge² × 4 B`) on top, as the single one did.
     const MAX_PREFETCH: usize = 5;
-    const MAX_CONCURRENT_ASM: usize = 1;
+    const MAX_CONCURRENT_ASM: usize = 2;
     let mut sys = System::new();
     let mut ram_now = move || -> (u64, usize) {
         sys.refresh_memory();
         let avail = sys.available_memory();
-        (avail, download_ram_budget(avail))
+        (avail, tuning.ram_budget.unwrap_or_else(|| download_ram_budget(avail)))
     };
-    let (avail0, budget0) = ram_now();
-    // Sized for the largest edge a service may serve until a tile has
-    // decoded; re-sized from the real edge for every later launch.
-    let rows0 = strip_rows_for(budget0, nx, MAX_TILE_PX, tuning.max_strip_rows);
-    eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available; \
-               re-evaluated before every strip)",
-        budget0 >> 20, rows0, avail0 as f64 / 1e9);
-    eprintln!("[Download] {} strips, {} tile-rows/strip, assembly {}/{} threads (max {} concurrent)",
-        (ny as u32).div_ceil(rows0), rows0, asm_threads, num_cpus, MAX_CONCURRENT_ASM);
 
     let zoom = job.zoom;
-    let url_tpl = Arc::new(job.url_template.clone());
-    let progress = Arc::new(AtomicUsize::new(0));
     let stats = Arc::new(DownloadStats::new());
     let gate = Arc::new(ConnGate::new(conns));
     let asm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_ASM));
@@ -3200,27 +3637,72 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
         })
     };
 
-    type StripHandle =
-        tokio::task::JoinHandle<Vec<(u32, u32, Result<(Vec<f32>, usize)>)>>;
+    type StripHandle = tokio::task::JoinHandle<Vec<TileResult>>;
 
-    // One ancestor cache for the whole run: the parent fill of every strip
-    // shares it, so each ancestor is fetched once (changelog 28).
-    let ancestors = AncestorCache::new(client.clone(), &job.url_template, dec);
     let tile_deadline = job_tile_deadline(&job)?;
-
-    let spawn_strip = |coords: Vec<(u32, u32)>| -> StripHandle {
-        let (cl, ut, pr, st) = (client.clone(), url_tpl.clone(), progress.clone(), stats.clone());
-        let (g, un, anc) = (gate.clone(), unstarted.clone(), ancestors.clone());
-        let start_time = start;
-        tokio::spawn(async move {
-            let ctx = FetchCtx {
-                client: &cl, url_template: &ut, zoom, dec, concurrency: conns,
-                progress: &pr, total, stats: &st, start_time, gate: &g,
-                unstarted: Some(&un), ancestors: &anc, tile_deadline,
-            };
-            download_tiles(&ctx, coords).await
-        })
+    let fetch = FetchCtx {
+        client: client.clone(), url_template: job.url_template.as_str().into(), zoom, dec,
+        concurrency: conns, progress: Arc::new(AtomicUsize::new(0)), total,
+        stats: stats.clone(), start_time: start, gate: gate.clone(),
+        unstarted: Some(unstarted.clone()),
+        // One ancestor cache for the whole run: the parent fill of every
+        // strip shares it, so each ancestor is fetched once (changelog 28) —
+        // or not at all when the raw source-tile cache has it (changelog 38).
+        ancestors: AncestorCache::with_tile_cache(client.clone(), &job.url_template, dec, tile_cache.clone()),
+        tile_deadline,
+        cache: cache_use,
+        #[cfg(test)]
+        on_decode: None,
     };
+    let spawn_strip = |coords: Vec<(u32, u32)>| -> StripHandle {
+        let ctx = fetch.clone();
+        tokio::spawn(async move { download_tiles(&ctx, coords).await })
+    };
+
+    // 5a. Learn the source tile edge BEFORE sizing any strip (changelog 36).
+    //     Strips used to be sized for 512 px tiles until one had decoded: a
+    //     wide 256 px pass got a first strip of a quarter of the rows it could
+    //     have had ("strip rows: 1 … 367 strips"), and at ≥ 512 connections
+    //     the first two such strips reserved 2 × 1 GB of the 2 GiB budget and
+    //     the pipeline idled 2–4 s until both were assembled. The first tile
+    //     of the first strip is fetched alone, through the normal path (gate,
+    //     retries, deadline, parent fill, stats, progress line), and its
+    //     result is handed to that strip — it is never fetched twice. A probe
+    //     that fails, or has not finished after EDGE_PROBE_WAIT, leaves the
+    //     first strip sized for MAX_TILE_PX as before (that strip then awaits
+    //     the probe); every later strip is sized from the edge once known.
+    let first_tile = row_tiles.iter().zip(y0..)
+        .find_map(|(cols, ty)| cols.first().map(|&tx| (tx, ty)));
+    let mut probe: Option<((u32, u32), EdgeProbe)> = None;
+    if let Some(tile) = first_tile {
+        unstarted.fetch_add(1, Ordering::Relaxed);
+        let mut h = spawn_strip(vec![tile]);
+        let got = match tokio::time::timeout(EDGE_PROBE_WAIT, &mut h).await {
+            Ok(joined) => {
+                let r = joined?;
+                // Also a tile filled from an ancestor: one service, one edge.
+                if let Some((_, _, Ok((_, edge)))) = r.first() {
+                    let _ = stats.tile_edge.compare_exchange(
+                        0, *edge, Ordering::Relaxed, Ordering::Relaxed);
+                }
+                EdgeProbe::Done(r)
+            }
+            Err(_) => EdgeProbe::Running(h),
+        };
+        probe = Some((tile, got));
+    }
+    let edge_now = || match stats.tile_edge.load(Ordering::Relaxed) {
+        0 => MAX_TILE_PX,
+        known => known,
+    };
+
+    let (avail0, budget0) = ram_now();
+    let rows0 = strip_rows_for(budget0, nx, edge_now(), tuning.max_strip_rows);
+    eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available; \
+               re-evaluated before every strip)",
+        budget0 >> 20, rows0, avail0 as f64 / 1e9);
+    eprintln!("[Download] {} strips, {} tile-rows/strip, assembly {}/{} threads (max {} concurrent)",
+        (ny as u32).div_ceil(rows0), rows0, asm_threads, num_cpus, MAX_CONCURRENT_ASM);
 
     // Strips download concurrently and are assembled in COMPLETION order, so
     // one straggler strip does not idle the strips behind it. Strips cover
@@ -3233,6 +3715,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     let mut expected_next = 0usize;
     let mut shown_rows = rows0;
     let mut max_rows = 0u32;
+    let mut first_rows = 0u32;
     let mut edge_known = false;
 
     loop {
@@ -3257,7 +3740,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                 break;
             }
             let known = stats.tile_edge.load(Ordering::Relaxed);
-            let edge = if known == 0 { MAX_TILE_PX } else { known };
+            let edge = edge_now();
             let (avail, budget) = ram_now();
             let rows = strip_rows_for(budget, nx, edge, tuning.max_strip_rows);
             let (sy0, sy1) = (next_row, (next_row + (rows - 1)).min(y1));
@@ -3281,16 +3764,52 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                 eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available)",
                     budget >> 20, rows, avail as f64 / 1e9);
             }
-            let coords: Vec<(u32, u32)> = (sy0..=sy1)
+            let mut coords: Vec<(u32, u32)> = (sy0..=sy1)
                 .flat_map(|ty| row_tiles[(ty - y0) as usize].iter().map(move |&tx| (tx, ty)))
                 .collect();
+            // The first strip starts at the probe's row and takes the probe
+            // over: its tile is not fetched again (`unstarted` counted it
+            // when it started), its bytes are in this strip's `bytes`.
+            let taken = probe.take();
+            if let Some((tile, _)) = &taken {
+                debug_assert_eq!(coords.first(), Some(tile), "the first strip holds the probe tile");
+                coords.retain(|c| c != tile);
+            }
+            // With a raw source-tile cache, column by column: a pack holds one
+            // tile column, so consecutive hits read through one kept pack
+            // handle instead of each opening its pack (changelog 38). Order
+            // within a strip changes no byte — results are placed by (x, y).
+            if fetch.cache.is_some() {
+                coords.sort_unstable();
+            }
             // Strips this run will have if the rows stay as they are now.
             let of = launched + 1 + ((y1 - sy1) as usize).div_ceil(rows as usize);
             held.fetch_add(bytes, Ordering::AcqRel);
-            unstarted.fetch_add(n_tiles, Ordering::Relaxed);
+            unstarted.fetch_add(coords.len(), Ordering::Relaxed);
             let h = spawn_strip(coords);
             let meta = (launched, of, sy0, sy1, bytes);
-            pipeline.push(async move { (meta, h.await) });
+            pipeline.push(async move {
+                let mut joined = h.await;
+                if let Some((_, got)) = taken {
+                    // The probe's tile first: `TileSize::adopt` then fixes
+                    // the edge the strips were sized with.
+                    let first = match got {
+                        EdgeProbe::Done(r) => Ok(r),
+                        EdgeProbe::Running(h) => h.await,
+                    };
+                    joined = match (first, joined) {
+                        (Ok(mut all), Ok(rest)) => {
+                            all.extend(rest);
+                            Ok(all)
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    };
+                }
+                (meta, joined)
+            });
+            if launched == 0 {
+                first_rows = sy1 - sy0 + 1;
+            }
             launched += 1;
             max_rows = max_rows.max(sy1 - sy0 + 1);
             next_row = sy1 + 1;
@@ -3331,8 +3850,9 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
         let strip_total = results.len();
         let strip_err = strip_total - strip_ok;
         if strip_err > 0 {
-            eprintln!("[Strip {}/{}] {} tiles: {} ok, {} FAILED",
-                strip_idx + 1, of, strip_total, strip_ok, strip_err);
+            // Diagnostic (changelog 36/37): `AETHER_DIAG_FILE`, else stderr.
+            crate::diag::err(&format!("[Strip {}/{}] {} tiles: {} ok, {} FAILED",
+                strip_idx + 1, of, strip_total, strip_ok, strip_err));
         }
 
         // Spawn assembly — process one tile-row at a time. Its bytes leave
@@ -3456,11 +3976,12 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                     drop(results);
                     let work_ms = t_work.elapsed().as_millis();
                     let out_mb = total_px as f64 * 2.0 / (1024.0 * 1024.0);
-                    eprintln!(
+                    // Diagnostic, one per strip: `AETHER_DIAG_FILE`, else stderr.
+                    crate::diag::err(&format!(
                         "[Strip {}/{}] setup={}ms work={}ms({} rows, {:.1}Mpx, {:.0}MB) total={:.2}s",
                         si, ns, setup_ms, work_ms, total_rows,
                         total_px as f64 / 1e6, out_mb, asm_start.elapsed().as_secs_f64(),
-                    );
+                    ));
                     Ok(())
                 }).await;
                 held.fetch_sub(bytes, Ordering::AcqRel);
@@ -3519,6 +4040,12 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     let attempted = stats.total_tiles();
     ticker.abort();
     if let Ok(mut w) = stats.window_line.lock() { *w = Some(gate.summary_line()); }
+    // Every tile is in: let the cache writer finish what is queued (also on
+    // the fatal path — what did arrive is worth keeping).
+    if let Some(c) = &tile_cache {
+        let lines = c.finish().lines(c.dir());
+        if let Ok(mut l) = stats.cache_lines.lock() { *l = lines; }
+    }
     if fetch_failure_is_fatal(failed, attempted) {
         stats.log_summary(start.elapsed().as_secs_f64(), Retries::Counted(STRIP_MAX_RETRIES));
         let no_data = stats.no_data_count();
@@ -3560,7 +4087,10 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     stats.log_summary(elapsed, Retries::Counted(STRIP_MAX_RETRIES));
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     cleanup.keep();
-    Ok(DownloadReport { tiles_fetched: total, strips: launched, max_strip_rows: max_rows })
+    Ok(DownloadReport {
+        tiles_fetched: total, strips: launched, max_strip_rows: max_rows,
+        first_strip_rows: first_rows,
+    })
 }
 
 /// Fuse vector-tile buildings onto the `.abt` tiles the downloader just wrote.
@@ -3910,8 +4440,9 @@ pub async fn run_download_mem(
         let strip_total = results.len();
         let strip_err = strip_total - strip_ok;
         if strip_err > 0 {
-            eprintln!("[StripMem {}/{}] {} tiles: {} ok, {} FAILED",
-                strip_idx + 1, strips.len(), strip_total, strip_ok, strip_err);
+            // Diagnostic: `AETHER_DIAG_FILE`, else stderr.
+            crate::diag::err(&format!("[StripMem {}/{}] {} tiles: {} ok, {} FAILED",
+                strip_idx + 1, strips.len(), strip_total, strip_ok, strip_err));
         }
 
         // Fix (or re-check) the tile edge, and size the grid to it. A source
@@ -5349,6 +5880,94 @@ mod tests {
         assert!(!is_retryable(&e), "the budget is spent; no retry");
         assert!(!timing.stalled());
         assert_eq!(TILE_DEADLINE, std::time::Duration::from_secs(20));
+    }
+
+    // ── One task per source tile (changelog 36) ──
+
+    static DECODING: AtomicUsize = AtomicUsize::new(0);
+    static DECODING_PEAK: AtomicUsize = AtomicUsize::new(0);
+    static DECODE_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// The decode hook: holds its thread for 200 ms, as a CPU-bound decode
+    /// does, and records how many tiles were decoding at once, and where.
+    fn busy_decode() {
+        let now = DECODING.fetch_add(1, Ordering::SeqCst) + 1;
+        DECODING_PEAK.fetch_max(now, Ordering::SeqCst);
+        DECODE_THREADS.lock().unwrap().push(std::thread::current().id());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        DECODING.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_tiles_of_one_strip_decode_in_parallel_on_several_workers() {
+        let (port, _) = counting_tile_server(0);
+        let tpl = format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}.png");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4).enable_all().build().unwrap();
+        let client = tile_client(32).unwrap();
+        let coords: Vec<(u32, u32)> = (0..32u32).map(|i| (8640 + i % 8, 5700 + i / 8)).collect();
+        let ctx = |n: usize| FetchCtx {
+            client: client.clone(), url_template: tpl.as_str().into(), zoom: 14,
+            dec: dec_terrarium, concurrency: 32, progress: Arc::new(AtomicUsize::new(0)),
+            total: n, stats: Arc::new(DownloadStats::new()), start_time: Instant::now(),
+            gate: Arc::new(ConnGate::new(32)), unstarted: None,
+            ancestors: AncestorCache::new(client.clone(), &tpl, dec_terrarium),
+            tile_deadline: TILE_DEADLINE, cache: None, on_decode: Some(busy_decode),
+        };
+        let check = |got: &[TileResult], asked: &[(u32, u32)]| {
+            let mut seen: Vec<(u32, u32)> = got.iter().map(|(x, y, r)| {
+                assert!(r.is_ok(), "tile {x}/{y}: {:?}", r.as_ref().err());
+                (*x, *y)
+            }).collect();
+            let mut want = asked.to_vec();
+            seen.sort();
+            want.sort();
+            assert_eq!(seen, want, "every tile exactly once");
+        };
+        let reset = || {
+            DECODING_PEAK.store(0, Ordering::SeqCst);
+            DECODE_THREADS.lock().unwrap().clear();
+        };
+
+        // Control — the shape before changelog 36: the strip's tiles as
+        // futures of ONE task. A blocking decode stalls every other tile of
+        // the strip, so no two ever decode at once, however many workers.
+        reset();
+        let few = coords[..8].to_vec();
+        let (c, todo) = (ctx(few.len()), few.clone());
+        let serial = rt.block_on(rt.spawn(async move {
+            stream::iter(todo)
+                .map(|(x, y)| { let c = c.clone(); async move { fetch_tile(&c, x, y).await } })
+                .buffer_unordered(32)
+                .collect::<Vec<_>>()
+                .await
+        })).unwrap();
+        check(&serial, &few);
+        assert_eq!(DECODING_PEAK.load(Ordering::SeqCst), 1, "one task decodes one tile at a time");
+
+        // `download_tiles`: one task per tile, spread over the workers.
+        reset();
+        let (c, todo) = (ctx(coords.len()), coords.clone());
+        let parallel = rt.block_on(rt.spawn(async move { download_tiles(&c, todo).await })).unwrap();
+        check(&parallel, &coords);
+        let peak = DECODING_PEAK.load(Ordering::SeqCst);
+        let threads: std::collections::HashSet<_> =
+            DECODE_THREADS.lock().unwrap().iter().copied().collect();
+        assert!(peak >= 2, "the tiles of one call decoded one at a time (peak {peak})");
+        assert!(threads.len() >= 2, "all decodes ran on one thread");
+    }
+
+    #[test]
+    fn the_connections_fit_under_the_open_file_limit_or_are_left_alone() {
+        assert_eq!(fds_needed(256), 608);
+        assert_eq!(connections_within(256, None), 256, "no such limit (Windows)");
+        assert_eq!(connections_within(256, Some(1 << 20)), 256);
+        assert_eq!(connections_within(256, Some(608)), 256, "exactly fits");
+        assert_eq!(connections_within(256, Some(607)), 255);
+        assert_eq!(connections_within(256, Some(256)), 80, "macOS's default soft limit, not raised");
+        assert_eq!(connections_within(1024, Some(1024)), 464);
+        assert_eq!(connections_within(16, Some(10)), 1, "never below one connection");
     }
 
     #[test]

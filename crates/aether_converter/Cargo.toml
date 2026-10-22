@@ -1,6 +1,6 @@
 [package]
 name = "aether_converter"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 license.workspace = true
 
@@ -75,6 +75,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+# Global allocator of the native Windows binary only (src/main.rs, CONTRACT
+# changelog 37): the Windows heap hands large blocks back to the OS on free,
+# so every tile buffer and window came back as fresh, faulting pages (34 565
+# faults per 2 m tile measured there, 1.8x Linux; sys 15 % of CPU). MIT. Not
+# built for Linux/macOS (their allocators were measured fine) nor for the
+# wasm crate (`native` is off there).
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
@@ -89,5 +96,5 @@ libc = "0.2"
 
 [features]
 default = ["native"]
-native = ["tokio/rt-multi-thread", "dep:sysinfo", "dep:rayon"]
+native = ["tokio/rt-multi-thread", "dep:sysinfo", "dep:rayon", "dep:mimalloc"]
 bc6h = ["image_dds"]

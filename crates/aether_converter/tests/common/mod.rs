@@ -290,6 +290,15 @@ pub fn serve_tiles<F>(route: F) -> (u16, TileCounts)
 where
     F: Fn(u32, u32, u32) -> Option<Vec<u8>> + Send + Sync + 'static,
 {
+    serve_tiles_delayed(move |z, x, y| route(z, x, y).map(|png| (png, 0)))
+}
+
+/// [`serve_tiles`] whose route also says how long to wait (ms) before the
+/// response head goes out.
+pub fn serve_tiles_delayed<F>(route: F) -> (u16, TileCounts)
+where
+    F: Fn(u32, u32, u32) -> Option<(Vec<u8>, u64)> + Send + Sync + 'static,
+{
     use std::io::{BufRead, BufReader};
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -307,12 +316,17 @@ where
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" { line.clear(); }
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                // A query (`?key=…`) is not part of the tile's address.
+                let path = path.split('?').next().unwrap_or("/");
                 let zxy: Vec<u32> = path.trim_start_matches('/').trim_end_matches(".png")
                     .split('/').filter_map(|p| p.parse().ok()).collect();
                 if zxy.len() != 3 { return; }
                 *counts.lock().unwrap().entry((zxy[0], zxy[1], zxy[2])).or_insert(0) += 1;
                 let (status, body) = match route(zxy[0], zxy[1], zxy[2]) {
-                    Some(png) => ("200 OK", png),
+                    Some((png, delay_ms)) => {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        ("200 OK", png)
+                    }
                     None => ("404 Not Found", Vec::new()),
                 };
                 let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\

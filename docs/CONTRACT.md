@@ -463,7 +463,13 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    replaced tile is a new inode. `.abt` bytes are identical (verified on
 >    24 swissALTI3D 2 m tiles of 5556² px against the previous converter).
 >    A killed converter can leave `*.abt.tmp-<pid>` files; consumers that
->    scan output directories should ignore them.
+>    scan output directories should ignore them. Since 0.2.8 the final
+>    rename waits out a transient refusal (Windows "access denied" /
+>    sharing violation while a scanner or indexer still holds the file: up
+>    to ten attempts 100 ms apart, then the tile fails as before), and a
+>    volume that cannot sync (`sync_data` answers ENOTSUP / EINVAL — some
+>    network and exFAT mounts) no longer fails the tile; the rename still
+>    replaces the output atomically.
 > 35. **`probe` reports where the pixel data ends (§1.2a; additive;
 >    `aether_converter` 0.2.7; 2026-10-21).** Every `ok: true` line gains
 >    `last_chunk_end` (int | null): offset + byte count of the image's LAST
@@ -477,6 +483,213 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    `BLOCK_SIZE_x_y` of that block (`tools/probe_vs_gdal.py`). Lines of a
 >    converter built before this item lack the field: a consumer must then
 >    not take the pixel data as complete. Nothing else changes.
+> 36. **CLI `download`: one task per source tile, strips sized from the real
+>    tile edge, longer keep-alive, two concurrent assemblies (§1.2, §9b;
+>    `aether_converter` 0.2.8; 2026-10-21).** No job-JSON change; `.abt` bytes
+>    are identical (`cmp` of all six outputs of a z15 AWS Terrarium pass —
+>    4 690 source tiles, 389 MB, six 10 m tiles — between 0.2.7 and this
+>    build; tests against 1-row strips). Motivation: at 256 connections a run
+>    plateaued at 190–270 tiles/s (Windows: 230 tiles/s, 14–15 MB/s) with ONE
+>    tokio worker thread at ~100 % CPU — a strip's tiles were futures of one
+>    task, so their TLS reads, body copies and decodes ran on one thread at a
+>    time — while a warm S3 request takes 237 ms and 1 024 connections drew no
+>    429/503. (a) **One task per source tile.** A tile's whole life —
+>    connection slot, attempts, back-offs, deadline, decode, parent fill,
+>    tallies, progress line — is its own tokio task, spread over all worker
+>    threads; per strip at most `max_connections` of them are alive, as
+>    before. The connection window and slot rules (§1.2), the `[Download]
+>    <pct>%` cadence and format, the `[Degraded]`/`[Stats]` lines and the
+>    failure rules are unchanged, and progress lines still reach stderr in
+>    count order. Measured on 4 CPUs, five runs each, against S3 (the network
+>    there is capped at ~21 MB/s, so the rate is the link's: 186–253 tiles/s,
+>    before 198–253; 230 both at equal background load): busiest thread per
+>    0.5 s sample 50–60 % max, 30–48 % median (before 81–105 % / 49–54 %);
+>    against a loopback server, where the CPUs are the limit,
+>    968–1 444 tiles/s (before 762, three threads at 106–110 %). Decoding
+>    stays on the tile's thread (1.6 ms mean per 256 px tile):
+>    `spawn_blocking` ran 19–24 % fewer tiles/s there. (b) **Strips sized from
+>    the real tile edge.** The first tile of the first strip is fetched alone
+>    before any strip is sized, through the normal path (counted in progress
+>    and `[Stats]` like any tile; its result goes to its strip, it is never
+>    fetched twice), and the strip rows come from its edge. Strips used to be
+>    sized for 512 px tiles until a tile had decoded: a wide 256 px pass
+>    opened with `strip rows: 1` ("367 strips"), and at ≥ 512 connections its
+>    first two strips reserved 2 × 1 GB of the 2 GiB budget and the pipeline
+>    idled 2–4 s. Now `[Download] RAM budget: … strip rows: <r> (…;
+>    re-evaluated before every strip)` and `[Download] <s> strips, …` are
+>    printed once, after that tile, with the real edge (the pass above: `strip
+>    rows: 32`, 3 strips; before 14 and 5). The first strip starts one request
+>    later: the RAM-budget line came 0.69–0.99 s after the `z=` header
+>    (before: 0.05–0.09 s), cold connections at a 146 ms RTT. When that tile
+>    fails, or has not arrived after 5 s, the first strip is sized for 512 px
+>    as before and takes the tile over when it lands; later strips are
+>    re-sized as before (`[Download] RAM budget: … (<a> GB available)`). In a
+>    pass of ≤ 100 tiles that tile's progress line may now precede the
+>    RAM-budget lines; the `[Download] z=…` header still precedes every
+>    request. (c) **Keep-alive 30 s** (was 5 s): an idle gap of a few seconds
+>    no longer closes the warm sockets (~700 reopened per gap at ≥ 512
+>    connections). (d) **Two strips assemble at once** on max(CPUs / 2, 2)
+>    threads (was one at a time on max(CPUs / 4, 2): ~450 tiles/s on 16 CPUs).
+>    The RAM budget still holds them — a strip's tiles count against it until
+>    its assembly ends — plus one tile-row of grid (`nx × edge² × 4 B`) per
+>    assembly; the plan line reads `… assembly <t>/<n> threads (max 2
+>    concurrent)`. (e) **`[Stats] Tile latency:` gains a trailing ` first-byte
+>    avg=<ms>ms`**: the mean, over every request attempt, of the wait from
+>    sending the request to the response head (connection setup, TLS, server
+>    time; an attempt that failed first counts until it failed), beside `avg`,
+>    the whole tile (body, retries, parent fill): a slow server or setup shows
+>    in the first, a slow link in the gap (measured: 464–615 ms of
+>    852–1 162 ms). CLI `download` and repair jobs only; the in-memory and
+>    browser paths print the line as before. A parser of the text after `Tile
+>    latency:` must allow the suffix. (f) **Per-strip lines are diagnostics:**
+>    `[Strip i/n] …` (assembly timing, `… FAILED`) and `[StripMem i/n] …` go
+>    to `AETHER_DIAG_FILE` when it is set (item 37), else to stderr as before.
+>    (g) **Open-file limit (unix).** A run holds up to a socket per connection
+>    in use, as many again idle in its pool, and resolver sockets — measured
+>    peaks of 263 to 548 descriptors at 256 connections, over macOS's default
+>    soft limit of 256, where EMFILE fails a connect or the `open()` of an
+>    output tile (which fails the run). When the soft limit is below `2 ×
+>    max_connections + 96`, the converter raises it towards the hard limit
+>    (macOS: at most `kern.maxfilesperproc`), best effort, never fatal; if
+>    even that cannot hold them, it runs `(limit − 96) / 2` connections (at
+>    least 1) and says so before the `[Download] z=` header, whose
+>    `connections=` and the `[Stats] Connection window: start` then carry that
+>    number: `[Download] open-file limit <l>: <c> connections instead of
+>    max_connections <m> (<d> descriptors would not fit)` (informational; one
+>    line). Windows has no such limit and is unchanged. Unchanged: the job
+>    JSON (the schema's `max_connections` description gains (g)), `.abt`
+>    bytes, exit codes, every parsed line (`[Download] z=…`, `[Download]
+>    <pct>%`, `[Degraded]`, `[Stats] Tiles:`, `NO-DATA`, `DEGRADED:`,
+>    `Connection window:`), retries, deadlines, the parent fill, and repair
+>    jobs (which get (a), (c), (e) and (g)).
+> 37. **`AETHER_DIAG_FILE`: diagnostic lines to a file; batch `ingest` keeps
+>    file I/O off its compute threads (§1.2; additive; `aether_converter`
+>    0.2.8; 2026-10-21).** No job-JSON change; `.abt` bytes, exit codes and
+>    every parsed line are unchanged (`cmp` of all 25 outputs against 0.2.7: a
+>    15-tile 2 m batch over a synthetic swissALTI3D-like set — 600 LZW Float32
+>    LV95 files, partial files, `-9999` borders, partial tiles, `void_fill_m`,
+>    a WGS84 base behind — a 10 m batch, a 90 m single job over 601 sources,
+>    the repository's LZW/Deflate test rasters with a `nodata` override, and
+>    `.abt` sources). Motivation: a 920-tile 2 m batch on 16 threads (1 028 s)
+>    spent 10.4 s of each tile's 17.9 s of thread time blocked in opens,
+>    reads, writes and syncs on the compute threads, and the Waveshed log
+>    panel mirrored its 920 diagnostic lines. (a) **`AETHER_DIAG_FILE`.**
+>    When this environment variable names a path, `ingest`'s per-tile
+>    `[Rust] tile …` lines and `download`'s `[Strip …]` / `[StripMem …]`
+>    lines (item 36) are appended to that file — created if missing, never
+>    truncated, each line flushed — instead of stdout / stderr; unset or
+>    empty, they stay on the console. A file that cannot be opened costs one
+>    stderr line, `[Warn] AETHER_DIAG_FILE = "<path>" cannot be opened
+>    (<cause>); diagnostics go to the console`, and never fails a run.
+>    `[Rust] run:` and every parsed line (`[Tile]`, `[Rust] Progress:`,
+>    `[Download] …`, `[Degraded]`, `[Stats] …`, `[Warn] …`) stay on their
+>    streams. (b) **`[Rust] tile` gains `, geom <s>s, write <s>s, total
+>    <s>s`** (row geometry and band planning; the wall time of writing,
+>    syncing and renaming the tile file; the tile's wall time on its compute
+>    thread, which in a batch ends at the hand-off to a writer thread — the
+>    write overlaps the next tile). The line now appears once the tile is
+>    written (or has failed after sampling, with `write 0.0s`), before its
+>    `[Tile]` line; `decode` is the window decode plus any wait for a read
+>    still in flight, `MB read` includes reads issued ahead. (c) **`[Rust]
+>    run:` gains `, blocked ~<s>s`** = wall × threads − (user + sys), floored
+>    at 0 — thread time not on a CPU (a single job counts rayon's global
+>    pool). (d) **I/O off the compute threads.** A batch hands each sampled
+>    tile to one of max(1, min(4, threads / 2)) writer threads that create,
+>    write, flush, `sync_data`, close and rename it (item 34 unchanged: a
+>    failed write removes its temp file and fails that tile, `[Error] Failed
+>    to process tile:` as before); a compute thread waits only when every
+>    writer is busy, so a batch holds at most one finished tile per writer
+>    beyond the one each compute thread works on. Source opens, header reads
+>    and chunk reads run on I/O threads (2 × CPUs, 8..32); a band's reads are
+>    issued while the band before it samples (≤ 32 MB per tile ahead, the
+>    rest when its window decodes). Source files stay open between reads —
+>    at most a quarter of the soft `RLIMIT_NOFILE`, 16..256, on Unix; 512 on
+>    Windows — so a file is opened once per run while it stays cached, not
+>    once per band; they are opened with the platform defaults (Windows:
+>    share read/write/delete), so a source can still be replaced or deleted
+>    during a run. `[Tile]` and `[Rust] Progress:` are printed once a tile's
+>    file is committed, as before; the progress count is now taken under the
+>    stdout lock, so no tile's progress line can overtake another tile's
+>    `[Tile]` line. (e) **Less allocation, less CPU.** Written tiles' output
+>    buffers, window buffers and read buffers are reused (no zero fill where
+>    every sample is overwritten); the Windows binary allocates through
+>    mimalloc (Linux and macOS keep the system allocator). Row geometry
+>    reuses a transform wherever the next row repeats it with bit-identical
+>    inputs, and the sampler skips, per 64-px block, sources whose rectangle
+>    the block's cell centres provably miss, with a fast path for blocks
+>    inside one file — the same floating-point operations in the same order.
+>    Measured on 4 CPUs (medians of three interleaved runs). Sources and
+>    outputs on a 9p mount, the 2 m batch (755 source listings): wall 12.7 →
+>    9.6 s, CPU 26.4 → 21.1 s, page faults 294 k → 195 k; opens 1 606 → 851;
+>    the compute threads' openat / pread64 / write / fdatasync / rename
+>    1 596 / 1 913 / 932 / 15 / 15 → none (strace); per tile, header 0.13–0.21
+>    → 0.03–0.05 s, decode 0.79–0.81 → 0.25–0.31 s, geom 0.31–0.35 s, write
+>    1.0–1.1 s on the writer threads, whose throughput on that mount (~100
+>    MB/s) now bounds the run. In RAM, with 0.2.7's tiff decoder: CPU 27.2 →
+>    20.1 s, wall 8.2 → 5.3 s, utilization 83 → 95 % (the row-geometry and
+>    sampler steps each took 18–19 % off the CPU in step-by-step runs). Peak
+>    RSS of that batch 0.47–0.49 → 0.71–0.75 GB (writer-held tiles, kept
+>    buffers, reads ahead).
+> 38. **CLI `download`: raw source-tile cache, `cache_dir` job field (§1.2, §9b; additive; `aether_converter` 0.2.8; 2026-10-21).**
+>    New optional job field `cache_dir` (string | null; absent, `null` or
+>    `""` → no cache, the run is exactly as before). Set, it names a
+>    directory that keeps what tile services answered — each HTTP 200 body as
+>    it arrived (PNG/WebP bytes, before decode) and each HTTP 404 — shared by
+>    every job, service and zoom that names it and by converter processes
+>    running at once: the CLI `download` looks every source tile of the fetch
+>    set up before any request, decodes a hit from the cached bytes without a
+>    connection slot or a request, and writes every answer it fetches (the
+>    parent fill's coarser tiles too), so a later job fetches only what the
+>    cache lacks. Never cached: a failed, timed-out or undecodable tile, nor
+>    what the parent fill makes of a tile (a `[Degraded]` tile is fetched
+>    again by the next job); a 404 is remembered until the directory is
+>    deleted. Repair jobs (changelog 28) refetch their listed tiles and
+>    replace their cached answers. **Layout and format** (§9b *Raw source-tile
+>    cache*): `<cache_dir>/<service_key>/z<zoom>/x<x>_y<y div 256>.pack` and
+>    `<service_key>/service.json`, `service_key` = the first 16 hex digits of
+>    SHA-256(`url_template`, query string included, + "\n" + lower-cased
+>    `encoding`) — templates that differ only in their query (`?layer=a` /
+>    `?layer=b`, or two API keys) never share a directory — while
+>    `service.json` records the template without its query string, so a key
+>    in the query never reaches the disk in clear text (one placed in the path
+>    does); a pack holds one
+>    tile column's 256 rows: magic `AETP`, u16 version 1, u32 zoom, u32 x, u32
+>    yblock, 256 index entries of 20 bytes (u64 offset, u32 length, u8 status
+>    0 unknown / 1 present / 2 HTTP 404, 3 reserved, u32 CRC-32), then the
+>    bodies, appended; little-endian. A writer locks the pack (`flock` on
+>    unix incl. macOS, an exclusive-write open on Windows), appends, then
+>    rewrites the entry; readers take no lock and validate every entry
+>    (header, bounds, CRC), so a torn write, a damaged entry or a body that no
+>    longer decodes is a miss — refetched and rewritten (appended; the old
+>    bytes stay behind, nothing compacts) — never a wrong tile. A cache that
+>    cannot be created or used costs one `[Warn] cache_dir <dir> cannot be
+>    used (<reason>); downloading without cache` and the run goes on; a pack
+>    another writer holds for 10 s is not written by this run (one `[Warn]
+>    cache_dir …` line per run). **Consumers see** informational lines, not
+>    parsed: `[Download] cache: <hits> of <total> source tiles from cache`
+>    once, after the pass header and before the first request (`<hits>` =
+>    entries found; one whose bytes then fail their CRC or decode is fetched
+>    after all), and, last in the `[Stats]` block, `[Stats] Cache: <hits>
+>    hits, <fetched> fetched, <written> written to <cache_dir>` (`<hits> +
+>    <fetched>` = `<total>`), followed, when the parent fill asked for coarser
+>    tiles, by `[Stats] Cache, coarser parents: <h> hits, <f> fetched, <w>
+>    written`. **Unchanged:** `.abt` bytes (tested: cached against fetched
+>    against cache-less runs, with 404s, parent fills, corrupt entries, a
+>    repair, two concurrent processes and 1-row strips; measured on S3 with
+>    the z15 pass of item 36 — 4 690 source tiles, six 10 m tiles, 256
+>    connections, 4 CPUs: run 1 fetched 388.6 MB in 20.3 s and wrote 4 690
+>    entries, 407 881 368 bytes in 70 packs; run 2, same job into a fresh
+>    output directory, made no request — no bytes over the network — took
+>    6.3 s and is `cmp`-identical on all six tiles), every parsed line — a hit
+>    counts in `[Download] <pct>%`, `[Stats] Tiles:`, `NO-DATA`, `Repaired`,
+>    `DEGRADED:` exactly like the fetched tile it stands for — exit codes,
+>    retries, deadlines, and the in-memory and browser downloaders (they
+>    ignore the field). `[Stats] Downloaded:` and the progress line's MB/s
+>    count network bytes only, and a run that made no request at all prints
+>    `[Stats] Tile latency:` without its `first-byte avg=` suffix. With a
+>    cache, a strip hands its tiles out column by column (a pack is a column;
+>    order never changes a byte). Older converters ignore `cache_dir`: gate
+>    on `aether_converter` 0.2.8 (§1.5).
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -626,31 +839,53 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   style** — *not* the `[P:]/[S:]/[E:]/[D:]` markers of §1.1.
 * **Ingest progress** (stdout): `[Rust] Progress: <n>/<total>` (emitted every 10
   tiles and once at completion) — `println!("[Rust] Progress: {}/{}", curr, total)`.
-* **Ingest diagnostic lines** (stdout; `aether_converter` ≥ 0.2.7, changelog
-  31; **diagnostic, not parsed** — for people reading a log, wording may
-  change, consumers must not match them). Every tile, single job or batch,
-  prints when its terrain is sampled:
+* **Ingest diagnostic lines** (stdout, or the file `AETHER_DIAG_FILE` names
+  — below; `aether_converter` ≥ 0.2.7, changelog 31, 37; **diagnostic, not
+  parsed** — for people reading a log, wording may change, consumers must
+  not match them). Every tile, single job or batch, prints once its file is
+  written (or the tile failed after its terrain was sampled):
 
   ```
-  [Rust] tile <name>: <n> sources, header <s>s (open <ms> ms, read <ms> ms avg), decode <s>s (<files> files, <MB> MB read), sample <s>s, bands <n>
+  [Rust] tile <name>: <n> sources, header <s>s (open <ms> ms, read <ms> ms avg), decode <s>s (<files> files, <MB> MB read), sample <s>s, bands <n>, geom <s>s, write <s>s, total <s>s
   ```
 
   `header` is the wall time of resolving the tile's source headers (open and
   read-and-parse averaged over the headers this tile actually read — 0 when
-  all came from the batch's header cache), `decode` the window loads (files
-  read from disk and bytes read; windows served from the chunk cache cost no
-  file), `sample` the resampling, `bands` the row bands. An `ingest` process
-  prints at exit — after the batch result, also when the run fails:
+  all came from the batch's header cache), `decode` the window loads (the
+  decode plus any wait for a read still in flight; files read from disk and
+  bytes read, reads issued ahead included; windows served from the chunk
+  cache cost no file), `sample` the resampling, `bands` the row bands,
+  `geom` the row geometry and band planning, `write` the wall time of
+  writing, syncing and renaming the tile file (`0.0` when the tile failed
+  before), and `total` the tile's wall time on its compute thread — in a
+  batch the write runs on a writer thread, overlapping the next tile, and is
+  not part of it. In a batch the line precedes the tile's `[Tile]` line. A
+  converter before 0.2.8 ends the line at `bands <n>` and prints it when
+  sampling ends. An `ingest` process prints at exit — after the batch
+  result, also when the run fails — on stdout:
 
   ```
-  [Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>
+  [Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>, blocked ~<s>s
   ```
 
   (`getrusage` on Unix: minor + major faults; `GetProcessTimes` /
   `GetProcessMemoryInfo` `PageFaultCount` on Windows). `threads` is the
   batch's worker-pool size (the `[Rust] Rayon Pool:` count); the field and
-  its comma are omitted when no batch ran (a single-job file). Neither line
-  contains `Progress:` or starts with `[Tile]`.
+  its comma are omitted when no batch ran (a single-job file). `blocked`
+  (≥ 0.2.8) is wall × threads − (user + sys), floored at 0: thread time
+  spent waiting rather than computing (a single job counts rayon's global
+  pool). Neither line contains `Progress:` or starts with `[Tile]`.
+
+  **`AETHER_DIAG_FILE` (≥ 0.2.8, changelog 37).** When this environment
+  variable names a path, the `[Rust] tile …` lines (and `download`'s
+  `[Strip …]` / `[StripMem …]` lines, changelog 36) are appended to that
+  file — created if missing, never truncated, each line flushed as written
+  — and not printed on the console. Unset or empty: the console, as before.
+  A file that cannot be opened costs one stderr line, `[Warn]
+  AETHER_DIAG_FILE = "<path>" cannot be opened (<cause>); diagnostics go to
+  the console`, and the lines stay on the console; it never fails a run.
+  `[Rust] run:` and every parsed line stay on their streams. Older builds
+  ignore the variable.
 * **Per-tile coverage line** (stdout, batch ingest only; `aether_converter`
   ≥ 0.2.7, changelog 33). After each tile that was written:
 
@@ -863,13 +1098,17 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   arrival until their strip is assembled, so the run budgets them: before
   every strip launch, budget = min(available RAM / 4, 2 GiB), at least
   256 MiB; strip rows = clamp(budget / 2 / (`<nx>` × edge² × 4 B), 1, 32),
-  so two strips fit (edge = 512 until the first tile decodes); a strip
+  so two strips fit (edge = that of the run's first tile, fetched alone
+  before any strip is sized — changelog 36; 512 only while that tile has
+  failed or is out for more than 5 s); a strip
   starts only when its bytes plus those of every launched, not yet
   assembled strip fit the budget (or none is outstanding), and only once
   the strips in flight have fewer unstarted tiles than the connection
   window. Each output row samples exactly one tile-row, so strip size never
   changes a byte. `[Download] <s> strips, <r> tile-rows/strip, …` reports
-  the initial plan; `[Strip i/n]` lines count against the current estimate.
+  the initial plan; `[Strip i/n]` lines count against the current estimate
+  (they are diagnostics and go to `AETHER_DIAG_FILE` when it is set —
+  changelog 36, 37).
 * **Disk-space failure — `[MPT-critical]` / QGIS-critical.** When the estimated
   `.abt` output exceeds free space, `download` **fails** (`anyhow::bail!`, non-zero
   exit). The exact and only emitted string (`crates/aether_converter/src/download.rs`,
@@ -1196,6 +1435,8 @@ Known capability gates consumers rely on:
 | `probe` subcommand (§1.2a; older builds exit `2`, unknown sub-command) | `aether_converter 0.2.7` |
 | `[Tile] <name> covered=<c>/<t>` lines in batch `ingest` (§1.2; absent before → coverage unknown) | `aether_converter 0.2.7` |
 | Atomic tile replacement in `ingest` (temp file + rename; §1.2, §6) | `aether_converter 0.2.7` |
+| `AETHER_DIAG_FILE` — `ingest`'s `[Rust] tile` and `download`'s `[Strip …]` diagnostic lines to a file (§1.2; older builds ignore the variable and keep printing them on the console) | `aether_converter 0.2.8` |
+| `download` job field `cache_dir` (§9b; older builds ignore it — nothing is cached and every job fetches everything) | `aether_converter 0.2.8` |
 
 ---
 
@@ -1205,6 +1446,7 @@ Known capability gates consumers rely on:
 |----------|---------|---------|
 | `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key — **v1 or v2** (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
 | `RUST_LOG` | `aether_core`, toolkit CLIs | `env_logger` level filter. **Must be `info` (or lower)** for the log-line progress diagnostics of §1.1(b) to appear. Markers in §1.1(a) do not depend on it. |
+| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move. |
 | `AETHER_BIN_DIR` | consumers only | Convention for locating the engine binaries. **Not read by any engine/toolkit code** — it is purely a consumer-side discovery hint. Do not add engine logic that depends on it. |
 | `PYTHONUNBUFFERED` | consumers only | Set by Python consumers so a child process's stdout markers/log lines arrive line-by-line rather than block-buffered. Not read by Rust code. |
 
@@ -2028,12 +2270,13 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `encoding` | string | **required** | `"terrarium"` or `"mapbox"` (case-insensitive). Any other value fails: `Unknown encoding '<x>'`. |
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
-| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). |
+| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 | `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **20** (changelog 30; was 60). At expiry the tile stops as a `timeout` failure and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
 | `repair_source_tiles` | array of `[z, x, y]`? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6 (gate on `--version`, §1.5: older builds ignore the field and download the whole job). Fetch **only** these source tiles and patch them into the job's **existing** `.abt` files — see *Repair jobs* below. |
+| `cache_dir` | string? | optional | Additive, changelog 38, `aether_converter` ≥ 0.2.8 (older builds ignore it). Directory of the raw source-tile cache, shared by every job, service and zoom that names it and by concurrent converter processes; absent, `null` or `""` → no cache. Every source tile is looked up there before any request and every HTTP 200 body that decoded and every 404 the run fetches is written there — see *Raw source-tile cache* below. A directory that cannot be used is one `[Warn]` line, never an error. CLI `download` only (repair jobs refetch their listed tiles and rewrite their entries); the in-memory downloaders ignore it. |
 
 `SubTileSpec`:
 
@@ -2059,6 +2302,10 @@ tiles, Mapterhorn and MapTiler's `terrain-rgb` serve **512 px** ones (MapTiler's
 `tiles.json` declares `"scale": "2.000000"`, i.e. `@2x`). The edge is therefore
 taken from the first tile that decodes and held for the rest of the run; the
 assembly grid, its row stride and the per-tile-row sample count all follow it.
+The CLI `download` fetches its first tile before it sizes any strip, so the
+strips' share of the RAM budget is reckoned with the real edge; 512 px is
+assumed only while that tile has failed or is out for more than 5 s
+(changelog 36).
 
 This does **not** change the ground resolution: `zoom` is the caller's choice
 and is untouched. A 512 px z12 tile covers exactly the ground a 256 px z12 tile
@@ -2142,6 +2389,113 @@ The CLI `download` then:
    and already-built pixels.
 
 `fetch_bounds` stays rejected on this path, as for every file-based run.
+
+**Raw source-tile cache (`cache_dir`, changelog 38, `aether_converter` ≥ 0.2.8).**
+A job naming `cache_dir` shares one on-disk store of what tile services
+answered with every other job, service and zoom that names the same
+directory (a relative path resolves against the working directory, like
+`output_dir`; absent, `null` or `""` → no cache and the run is exactly as
+without the field). What it holds is the **raw answer**: each HTTP 200 body
+exactly as it arrived (PNG/WebP bytes, before any decode) and each HTTP 404
+("no tile here"). The CLI `download` looks every source tile of its fetch
+set up before any request (one index read per pack), decodes a hit from the
+cached bytes when its turn comes — without a connection slot and without a
+request — and writes every answer it fetches into the cache, so a later job
+fetches only what the cache lacks. The parent fill (§1.2) looks its coarser
+tiles up and writes them the same way. **Never cached:** a tile that failed
+(any class of the `[Stats] ERRORS` tally but 404), timed out, did not decode,
+or was filled from a coarser zoom (a `[Degraded]` tile is fetched again by
+the next job; what the fill made of a tile is never stored, only the raw
+answers it was made from). A 404 is remembered until the directory is
+deleted. Repair jobs refetch their listed tiles on purpose (no lookup) and
+replace their cached answers with the fresh ones; their parent fill uses the
+cache like a full run. The in-memory and browser downloaders ignore the
+field.
+
+Layout (`service_key` = the first 16 hex digits, lower case, of SHA-256 over
+`url_template` exactly as the job gives it — **query string included** — +
+`"\n"` + the lower-cased `encoding`; Python:
+`hashlib.sha256(f"{url_template}\n{encoding.lower()}".encode()).hexdigest()[:16]`
+— the AWS Terrarium template of `fixtures/jobs/download_job.json` with
+`terrarium` is `54d18ad3dc1a2f05`):
+
+```
+<cache_dir>/<service_key>/service.json                 {"encoding": …, "url_template": <the template without its query string>}  (informational, written once)
+<cache_dir>/<service_key>/z<zoom>/x<x>_y<yblock>.pack   yblock = y div 256
+```
+
+Templates that differ only in their query string never share a directory,
+so datasets a service tells apart by a query parameter
+(`…/{z}/{x}/{y}?layer=a` / `?layer=b`) can never read each other's tiles.
+Two API keys for one service (`…/{y}.webp?key=A` / `?key=B`) therefore get
+two directories — disk, not correctness — whose `service.json` files show
+the same template: it is recorded without its query string (everything from
+the first `?` on removed; the path, placeholders included, stays), so a key
+in the query never reaches the disk in clear text; the directory name is a
+truncated hash. A key placed in the **path** is part of the recorded
+template and does land in `service.json`.
+
+A pack holds the 256 tile rows `y = yblock·256 + i` of one tile column. All
+integers little-endian:
+
+| Offset | Bytes | Field |
+|--------|-------|-------|
+| 0 | 4 | magic `AETP` |
+| 4 | 2 | u16 version = 1 |
+| 6 | 4 | u32 zoom |
+| 10 | 4 | u32 x |
+| 14 | 4 | u32 yblock |
+| 18 | 256 × 20 | index, entry `i` = tile `y = yblock·256 + i`: u64 offset of the body, u32 length, u8 status (0 unknown, 1 present, 2 no tile = HTTP 404), 3 reserved bytes (0), u32 CRC-32 (IEEE, zlib's) of the body |
+| 5138 | … | data region: bodies, appended |
+
+A full pack of AWS z15 tiles is ~256 × 73 KB ≈ 19 MB. **Writing:** the
+writer locks the pack (unix incl. macOS: `flock(LOCK_EX)`; Windows: the
+pack opened for writing with share mode `FILE_SHARE_READ`, which refuses
+every other writer and admits readers), appends the bodies in one write,
+then writes their index entries in place, and closes the file (which
+releases the lock; the OS releases it when a process dies, so no lock
+outlives its writer). A pack another writer holds for 10 s is not written by
+this run (one `[Warn] cache_dir …` line per run); the run goes on. Several
+converter processes may use one cache at once. **Reading** takes no lock and
+validates every entry: the header must name this very zoom/column/yblock
+and version 1, a present body must lie past the index and inside the file
+and match its CRC, a 404 entry must have length and CRC 0. Any entry that
+fails — a torn or interrupted write, a damaged byte, a body that no longer
+decodes — is a miss: the tile is fetched and the entry rewritten (appended
+again and repointed; the old bytes become garbage). Nothing compacts a
+pack; deleting the directory (or any part of it) is always safe while no
+converter runs. A pack with another version is neither read nor written. A
+run keeps at most 16 packs open for reading (a most-recently-used set) plus
+one transient open per worker thread and the writer's handle, never one
+descriptor per pack; the CLI's open-file reserve (changelog 36) counts them.
+
+What a run prints (stderr, informational, **not parsed** — consumers may log
+them): after the pass header and before the first request,
+
+```
+[Download] cache: <hits> of <total> source tiles from cache
+```
+
+once, `<hits>` = the fetch-set tiles whose entry the lookup found (an entry
+whose bytes then fail their CRC or decode is fetched after all); as the last
+lines of the `[Stats]` block,
+
+```
+[Stats] Cache: <hits> hits, <fetched> fetched, <written> written to <cache_dir>
+[Stats] Cache, coarser parents: <hits> hits, <fetched> fetched, <written> written
+```
+
+(the first always, `<hits> + <fetched>` = the pass `<total>`; the second only
+when the parent fill asked for coarser tiles), and a directory that cannot be
+created or used:
+`[Warn] cache_dir <dir> cannot be used (<reason>); downloading without cache`
+— once, never fatal. A repair job prints `[Download] cache: 0 of <n> source
+tiles from cache (a repair refetches every listed tile)`. A hit counts in
+every parsed line exactly like the fetched tile it stands for —
+`[Download] <pct>% (<done>/<total>)`, `[Stats] Tiles:`, `NO-DATA (HTTP 404):`,
+`Repaired …`, `DEGRADED:` — and the `.abt` bytes are identical whether a tile
+came from the cache or the network; `[Stats] Downloaded:` and the progress
+line's MB/s count network bytes only.
 
 ---
 

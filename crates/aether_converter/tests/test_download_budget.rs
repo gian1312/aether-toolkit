@@ -1,11 +1,14 @@
 //! CLI `download`, changelog 30: only the source tiles that touch a requested
 //! output tile are fetched, and strips are sized from a RAM budget — neither
-//! may change a byte of any `.abt` the run produces.
+//! may change a byte of any `.abt` the run produces. Changelog 36: the strips
+//! are sized from the real tile edge, learnt from the first tile before any
+//! strip is sized, and that tile is not fetched twice.
 //!
 //! Contract surface: `docs/CONTRACT.md` §1.2 (`[Download] z=… tiles=…`,
-//! `[Stats] Tiles:`, the progress line's trailing `window` field). The tile
-//! source is a loopback HTTP server that counts every request, so these tests
-//! are hermetic and assert on what went over the wire.
+//! `[Stats] Tiles:`, the progress line's trailing `window` field, `[Stats]
+//! Tile latency:`). The tile source is a loopback HTTP server that counts
+//! every request, so these tests are hermetic and assert on what went over
+//! the wire.
 
 mod common;
 
@@ -14,7 +17,10 @@ use std::path::{Path, PathBuf};
 use aether_converter::download::{
     lat2ty, lon2tx, run_download_tuned, tx2lon, ty2lat, DownloadTuning,
 };
-use common::{read_dir_bytes, run_download_cli, serve_tiles, terrarium_png, tile_ground, TileCounts};
+use common::{
+    read_dir_bytes, run_download_cli, serve_tiles, serve_tiles_delayed, terrarium_png, tile_ground,
+    TileCounts,
+};
 
 const Z: u32 = 12;
 
@@ -91,6 +97,12 @@ fn two_far_corners_of_a_bbox_fetch_only_their_own_tiles_and_write_the_same_bytes
     let last = err.lines().filter(|l| l.starts_with("[Download] 100% (8/8) — ")).last()
         .unwrap_or_else(|| panic!("no final progress line; stderr:\n{err}"));
     assert!(last.contains(" in-flight, window 64"), "{last}");
+    // Changelog 36: the latency line gains the mean wait for a response head.
+    let lat = err.lines().find(|l| l.starts_with("[Stats] Tile latency: min="))
+        .unwrap_or_else(|| panic!("no latency line; stderr:\n{err}"));
+    let fb = lat.split(" first-byte avg=").nth(1)
+        .and_then(|v| v.strip_suffix("ms")).and_then(|v| v.parse::<u64>().ok());
+    assert!(fb.is_some(), "want `… max=<n>ms first-byte avg=<n>ms`: {lat}");
 
     // The whole rectangle, as before (comparison run): 30 tiles, same bytes.
     let (port, counts) = server();
@@ -149,5 +161,104 @@ fn strips_of_32_3_and_1_tile_rows_write_the_same_bytes() {
             assert_eq!(na, nb);
             assert!(a == b, "{na}: strip boundaries changed the output");
         }
+    }
+}
+
+/// Specs covering exactly the tiles `tx0..tx0+4 × ty0..ty0+16`: 64 px squares
+/// 3.8 tile widths wide, stacked down the column, the last one pulled up so
+/// it ends inside tile-row 15.
+fn four_by_sixteen() -> Vec<serde_json::Value> {
+    let (tx0, ty0) = origin();
+    let w = tx2lon(tx0 + 1, Z) - tx2lon(tx0, Z);
+    let side = 3.8 * w;
+    let (top, bot) = (ty2lat(ty0, Z), ty2lat(ty0 + 16, Z));
+    let margin = 0.01 * (ty2lat(ty0 + 15, Z) - bot);
+    let lon = tx2lon(tx0, Z) + 0.1 * w;
+    let mut tiles = Vec::new();
+    let mut lat = top - margin;
+    while lat - side > bot + margin {
+        tiles.push(spec(&format!("s{}.abt", tiles.len()), lat, lon, side));
+        lat -= side;
+    }
+    tiles.push(spec(&format!("s{}.abt", tiles.len()), bot + margin + side, lon, side));
+    tiles
+}
+
+/// A 16 MiB budget: a strip may hold 8 MiB — 8 tile-rows of four 256 px
+/// tiles, or 2 of four 512 px ones.
+const BUDGET: usize = 16 << 20;
+
+fn same_bytes(a: &Path, b: &Path) {
+    let (a, b) = (read_dir_bytes(a), read_dir_bytes(b));
+    assert!(!a.is_empty());
+    assert_eq!(a.len(), b.len());
+    for ((na, ba), (nb, bb)) in a.iter().zip(&b) {
+        assert_eq!(na, nb);
+        assert!(ba == bb, "{na}: strip sizing changed the output");
+    }
+}
+
+#[test]
+fn the_first_tile_sets_the_edge_before_any_strip_is_sized() {
+    // Every build before changelog 36 sized strips for 512 px tiles until a
+    // tile had decoded: 2 rows for the first strip here, 8 only for the later
+    // ones. The first tile is now fetched alone before any strip is sized, so
+    // the first strip already gets the 8 rows 256 px tiles allow — and that
+    // tile goes to its strip instead of being fetched again.
+    let tiles = four_by_sixteen();
+    let dir = tempfile::tempdir().unwrap();
+    let (port, counts) = server();
+    let (job, out) = write_job(dir.path(), port, "probed", &tiles);
+    let report = run_download_tuned(&job, DownloadTuning { ram_budget: Some(BUDGET), ..Default::default() })
+        .unwrap();
+    assert_eq!(report.tiles_fetched, 64, "{report:?}");
+    assert_eq!((report.first_strip_rows, report.strips, report.max_strip_rows), (8, 2, 8),
+               "both strips sized from the probed 256 px edge: {report:?}");
+    let got = fetched(&counts); // asserts every tile was requested exactly once
+    assert_eq!(got.len(), 64);
+    assert_eq!(got.iter().map(|t| t.1).collect::<std::collections::BTreeSet<_>>().len(), 16);
+
+    let (port, _) = server();
+    let (job1, out1) = write_job(dir.path(), port, "rows1", &tiles);
+    run_download_tuned(&job1, DownloadTuning { max_strip_rows: Some(1), ..Default::default() }).unwrap();
+    same_bytes(&out, &out1);
+}
+
+#[test]
+fn a_failed_or_slow_edge_probe_sizes_the_first_strip_for_512_px_and_keeps_its_tile() {
+    // The probe is the first tile of the first tile-row. (1) It 404s at every
+    // zoom: no edge comes from it. (2) It answers after 6 s, past the 5 s the
+    // run waits for it. Either way the first strip is sized as before
+    // changelog 36 — for 512 px tiles, 2 rows — the run completes, every
+    // tile is requested once (the slow probe is not re-fetched by its strip),
+    // and the bytes are those of 1-row strips over the same answers.
+    let (tx0, ty0) = origin();
+    let tiles = four_by_sixteen();
+    for (label, lost, delay_ms) in [("lost", true, 0u64), ("slow", false, 6000)] {
+        let dir = tempfile::tempdir().unwrap();
+        let route = move |z: u32, x: u32, y: u32, delay: u64| {
+            let probe = (x, y) == (tx0, ty0);
+            (z == Z && !(lost && probe)).then(|| {
+                (terrarium_png(tile_ground(z, x, y)), if probe { delay } else { 0 })
+            })
+        };
+        let (port, counts) = serve_tiles_delayed(move |z, x, y| route(z, x, y, delay_ms));
+        let (job, out) = write_job(dir.path(), port, label, &tiles);
+        let t0 = std::time::Instant::now();
+        let report = run_download_tuned(&job, DownloadTuning { ram_budget: Some(BUDGET), ..Default::default() })
+            .unwrap();
+        assert_eq!(report.first_strip_rows, 2, "{label}: sized for 512 px: {report:?}");
+        let at_z: Vec<usize> = counts.lock().unwrap().iter()
+            .filter(|((z, _, _), _)| *z == Z).map(|(_, &n)| n).collect();
+        assert_eq!(at_z.len(), 64, "{label}");
+        assert!(at_z.iter().all(|&n| n == 1), "{label}: a tile was requested twice: {at_z:?}");
+        if delay_ms > 0 {
+            assert!(t0.elapsed().as_millis() as u64 >= delay_ms, "{label}: the probe's tile was not waited for");
+        }
+
+        let (port, _) = serve_tiles_delayed(move |z, x, y| route(z, x, y, 0));
+        let (job1, out1) = write_job(dir.path(), port, &format!("{label}_rows1"), &tiles);
+        run_download_tuned(&job1, DownloadTuning { max_strip_rows: Some(1), ..Default::default() }).unwrap();
+        same_bytes(&out, &out1);
     }
 }

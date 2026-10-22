@@ -197,22 +197,44 @@ fn proc_usage() -> ProcUsage {
     ProcUsage { user_s: 0.0, sys_s: 0.0, page_faults: 0 }
 }
 
-/// The process diagnostic line (stdout; changelog 31, not parsed):
-/// `[Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>`.
+/// The process diagnostic line (stdout; changelog 31/37, not parsed):
+/// `[Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>, blocked ~<s>s`.
 /// `page faults` counts minor and major faults (Windows: `PageFaultCount`);
 /// `threads` is the batch's rayon pool size ([`note_batch_threads`]) and is
-/// omitted, with its comma, when no batch ran.
+/// omitted, with its comma, when no batch ran; `blocked` = wall × threads −
+/// (user + sys), floored at 0 (a single job counts rayon's global pool).
 pub fn print_run_stats(wall_s: f64) {
     let u = proc_usage();
-    let threads = match BATCH_THREADS.load(Ordering::Relaxed) {
+    let batch = BATCH_THREADS.load(Ordering::Relaxed);
+    let threads = match batch {
         0 => String::new(),
         n => format!(", threads {n}"),
     };
+    // Thread time not spent on a CPU (changelog 37): what the compute
+    // threads waited for — the file system, a free writer, each other. A
+    // single job's parallel loops run on rayon's global pool.
+    let pool = match batch {
+        0 => compute_threads(),
+        n => n,
+    };
+    let blocked = (wall_s * pool as f64 - (u.user_s + u.sys_s)).max(0.0);
     println!(
-        "[Rust] run: wall {:.1}s, cpu user {:.1}s sys {:.1}s, page faults {}{}",
-        wall_s, u.user_s, u.sys_s, u.page_faults, threads
+        "[Rust] run: wall {:.1}s, cpu user {:.1}s sys {:.1}s, page faults {}{}, blocked ~{:.1}s",
+        wall_s, u.user_s, u.sys_s, u.page_faults, threads, blocked
     );
     let _ = std::io::stdout().flush();
+}
+
+/// Threads of rayon's global pool (1 without the `native` feature).
+fn compute_threads() -> usize {
+    #[cfg(feature = "native")]
+    {
+        rayon::current_num_threads()
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        1
+    }
 }
 
 /// Prints [`print_run_stats`] when dropped — created at the top of `main`, it
@@ -231,6 +253,244 @@ impl RunStats {
 impl Drop for RunStats {
     fn drop(&mut self) {
         print_run_stats(self.start.ns() as f64 / 1e9);
+    }
+}
+
+// -- Source I/O off the compute threads (changelog 37) --------------------------
+//
+// Opening a source, reading its header and reading the byte ranges of the
+// chunks a band needs are file-system waits — on a slow volume (a network
+// share, a 9p mount, a disk behind an on-access scanner) more than half of a
+// tile's thread time. They run on a small pool of I/O threads instead of the
+// rayon compute threads: a tile submits a band's reads one band ahead (they
+// are read while the previous band samples) and its compute threads only
+// decode. Everything here is plain `std` and behaves the same on Linux,
+// macOS and Windows; without the `native` feature (the browser build, which
+// never ingests) every task simply runs inline.
+
+/// A value one thread produces and another waits for.
+struct Ticket<T> {
+    slot: std::sync::Mutex<Option<T>>,
+    ready: std::sync::Condvar,
+}
+
+impl<T> Ticket<T> {
+    fn new() -> Arc<Self> {
+        Arc::new(Ticket { slot: std::sync::Mutex::new(None), ready: std::sync::Condvar::new() })
+    }
+
+    fn put(&self, v: T) {
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+        self.ready.notify_all();
+    }
+
+    /// Wait for the value and take it (each ticket has one consumer).
+    fn take(&self) -> T {
+        let mut g = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(v) = g.take() {
+                return v;
+            }
+            g = self.ready.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+type IoTask = Box<dyn FnOnce() + Send>;
+
+struct IoQueues {
+    /// Reads a thread is waiting for right now (headers, a band's first
+    /// reads, deferred windows): served first.
+    urgent: std::collections::VecDeque<IoTask>,
+    /// Reads for the next band, issued while the current one samples.
+    ahead: std::collections::VecDeque<IoTask>,
+}
+
+/// The process's source I/O threads.
+struct IoPool {
+    queues: std::sync::Mutex<IoQueues>,
+    work: std::sync::Condvar,
+    /// Threads that started; 0 runs every task inline on the caller.
+    live: std::sync::atomic::AtomicUsize,
+}
+
+/// I/O threads: twice the cores (a read mostly waits), 8..=32.
+fn io_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_mul(2).clamp(8, 32)
+}
+
+fn io_pool() -> &'static IoPool {
+    static POOL: OnceLock<IoPool> = OnceLock::new();
+    static START: std::sync::Once = std::sync::Once::new();
+    let pool = POOL.get_or_init(|| IoPool {
+        queues: std::sync::Mutex::new(IoQueues {
+            urgent: std::collections::VecDeque::new(),
+            ahead: std::collections::VecDeque::new(),
+        }),
+        work: std::sync::Condvar::new(),
+        live: std::sync::atomic::AtomicUsize::new(0),
+    });
+    START.call_once(|| {
+        if !cfg!(feature = "native") {
+            return;
+        }
+        for i in 0..io_threads() {
+            let spawned = std::thread::Builder::new()
+                .name(format!("aether-io-{i}"))
+                .stack_size(1 << 20)
+                .spawn(move || pool.serve());
+            match spawned {
+                Ok(_) => {
+                    pool.live.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => break, // fewer threads (or none: inline) — never a failure
+            }
+        }
+    });
+    pool
+}
+
+impl IoPool {
+    fn serve(&self) {
+        loop {
+            let task = {
+                let mut q = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+                loop {
+                    if let Some(t) = q.urgent.pop_front().or_else(|| q.ahead.pop_front()) {
+                        break t;
+                    }
+                    q = self.work.wait(q).unwrap_or_else(|p| p.into_inner());
+                }
+            };
+            task();
+        }
+    }
+
+    /// Run *work* on an I/O thread; its result arrives in the ticket. A
+    /// panic becomes an error, so no waiter is ever left hanging.
+    fn submit<X: Send + 'static>(
+        &self,
+        urgent: bool,
+        work: impl FnOnce() -> Result<X> + Send + 'static,
+    ) -> Arc<Ticket<Result<X>>> {
+        let ticket = Ticket::new();
+        let out = ticket.clone();
+        let task: IoTask = Box::new(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error: a source read panicked")));
+            out.put(r);
+        });
+        if self.live.load(Ordering::Relaxed) == 0 {
+            task();
+        } else {
+            let mut q = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+            if urgent {
+                q.urgent.push_back(task);
+            } else {
+                q.ahead.push_back(task);
+            }
+            drop(q);
+            self.work.notify_one();
+        }
+        ticket
+    }
+}
+
+/// Source files a [`ChunkCache`] keeps open at most. A batch reads each
+/// source in the band(s) its rows reach, tile after tile; keeping the handle
+/// makes that one open per file instead of one per band (and the header's
+/// open serves the windows), and neighbouring tiles share the files along
+/// their edge. Bounded well below every platform's descriptor limit: on
+/// Unix a quarter of the soft `RLIMIT_NOFILE` (macOS defaults to 256, many
+/// Linux shells to 1024), 16..=256; on Windows, which has no such limit for
+/// file handles, 512.
+fn max_open_sources() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: getrlimit fills the zeroed struct it is handed.
+            let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+                let soft = rl.rlim_cur;
+                // RLIM_INFINITY and huge limits clamp to the cap below.
+                let quarter = if soft == libc::RLIM_INFINITY { 1024 } else { (soft / 4).min(1024) as usize };
+                return quarter.clamp(16, 256);
+            }
+            64
+        }
+        #[cfg(not(unix))]
+        {
+            512
+        }
+    })
+}
+
+/// Order keys at or above this are handles in use (least recently used
+/// first); below it, handles nobody is known to need soon — a header's open
+/// before its windows are read, a source a tile has finished with — which
+/// are evicted first, oldest first.
+const OPEN_IN_USE: u64 = 1 << 62;
+
+/// The open source files, by [`FileSource::id`].
+#[derive(Default)]
+struct OpenFiles {
+    files: HashMap<u64, (Arc<File>, u64)>,
+    /// Order key -> id; the smallest key is evicted first.
+    order: std::collections::BTreeMap<u64, u64>,
+    /// Next keys of the two classes.
+    spare_tick: u64,
+    used_tick: u64,
+}
+
+impl OpenFiles {
+    fn next_key(&mut self, in_use: bool) -> u64 {
+        if in_use {
+            self.used_tick += 1;
+            OPEN_IN_USE + self.used_tick
+        } else {
+            self.spare_tick += 1;
+            self.spare_tick
+        }
+    }
+
+    /// The handle of *id*, now in use.
+    fn get(&mut self, id: u64) -> Option<Arc<File>> {
+        let key = self.next_key(true);
+        let (f, k) = self.files.get_mut(&id)?;
+        self.order.remove(k);
+        *k = key;
+        self.order.insert(key, id);
+        Some(f.clone())
+    }
+
+    /// Mark *id* as not needed soon (it stays open until evicted).
+    fn spare(&mut self, id: u64) {
+        let key = self.next_key(false);
+        if let Some((_, k)) = self.files.get_mut(&id) {
+            self.order.remove(k);
+            *k = key;
+            self.order.insert(key, id);
+        }
+    }
+
+    /// Keep *file* for *id* (an existing entry wins); returns the handle to
+    /// use and the evicted ones, for the caller to close outside the lock.
+    fn put(&mut self, id: u64, file: Arc<File>, in_use: bool, cap: usize) -> (Arc<File>, Vec<Arc<File>>) {
+        if let Some(f) = self.get(id) {
+            return (f, vec![file]);
+        }
+        let mut evicted = Vec::new();
+        while self.files.len() >= cap.max(1) {
+            let Some((_, old)) = self.order.pop_first() else { break };
+            if let Some((f, _)) = self.files.remove(&old) {
+                evicted.push(f);
+            }
+        }
+        let key = self.next_key(in_use);
+        self.order.insert(key, id);
+        self.files.insert(id, (file.clone(), key));
+        (file, evicted)
     }
 }
 
@@ -414,6 +674,9 @@ pub struct ChunkCache {
     /// Parsed projections by proj string, for the WGS84 bounding box every
     /// file source gets at header time (`None`: the string did not parse).
     projs: std::sync::Mutex<HashMap<String, Option<Arc<Proj>>>>,
+    /// Source files kept open between reads ([`max_open_sources`]); an
+    /// evicted handle closes when its last reader drops it.
+    open: std::sync::Mutex<OpenFiles>,
 }
 
 impl ChunkCache {
@@ -430,7 +693,54 @@ impl ChunkCache {
             }),
             budget: budget_bytes,
             projs: std::sync::Mutex::new(HashMap::new()),
+            open: std::sync::Mutex::new(OpenFiles::default()),
         }
+    }
+
+    /// An open handle to *src*'s file: the kept one, else a fresh open
+    /// (counted; kept for the next read). Positioned reads never move a
+    /// shared cursor, so one handle serves every thread — except on targets
+    /// without them (neither Unix nor Windows), which always open afresh.
+    fn file(&self, src: &FileSource) -> Result<Arc<File>> {
+        if !cfg!(any(unix, windows)) {
+            return Ok(Arc::new(open_counted(&src.path).with_context(|| format!("Opening {:?}", src.path))?));
+        }
+        if let Some(f) = self.open.lock().unwrap().get(src.id) {
+            return Ok(f);
+        }
+        let f = Arc::new(open_counted(&src.path).with_context(|| format!("Opening {:?}", src.path))?);
+        Ok(self.keep_file(src.id, f, true))
+    }
+
+    /// Keep *file* open for source *id* — `in_use` for a window read, else
+    /// as a spare (a header's open); returns the handle to use.
+    fn keep_file(&self, id: u64, file: Arc<File>, in_use: bool) -> Arc<File> {
+        if !cfg!(any(unix, windows)) {
+            return file;
+        }
+        let (f, evicted) = self.open.lock().unwrap().put(id, file, in_use, max_open_sources());
+        drop(evicted); // closed here, outside the lock
+        f
+    }
+
+    /// A tile is done with these sources: their handles become the first
+    /// to go (another tile may still reuse them until then).
+    fn spare_files(&self, ids: impl IntoIterator<Item = u64>) {
+        let mut g = self.open.lock().unwrap();
+        for id in ids {
+            g.spare(id);
+        }
+    }
+
+    /// Which of *keys* are not cached (no LRU touch: a plan, not a use).
+    fn missing(&self, keys: &[ChunkKey]) -> Vec<bool> {
+        let g = self.inner.lock().unwrap();
+        keys.iter().map(|k| !g.chunks.contains_key(k)).collect()
+    }
+
+    /// The parsed header of *spec* if it is already cached.
+    fn meta_cached(&self, spec: &SourceSpec) -> Option<Arc<FileSource>> {
+        self.inner.lock().unwrap().metas.get(&cache_key(spec)).cloned()
     }
 
     /// The configured budget in bytes.
@@ -504,7 +814,7 @@ impl ChunkCache {
         }
         // Parsed without the lock held: thousands of headers per batch must
         // not serialise every tile behind one file open.
-        let mut parsed = read_file_source(&spec.path, spec.nodata)?;
+        let (mut parsed, handle) = read_file_source_keep(&spec.path, spec.nodata)?;
         parsed.wgs84_bbox = self.projected_bbox(spec, &parsed.geom);
         let mut g = self.inner.lock().unwrap();
         if let Some(m) = g.metas.get(&key) {
@@ -514,6 +824,11 @@ impl ChunkCache {
         g.next_id += 1;
         let m = Arc::new(FileSource { id, ..parsed });
         g.metas.insert(key, m.clone());
+        drop(g);
+        // The header's open serves the window reads too, while it lasts.
+        if let Some(h) = handle {
+            self.keep_file(id, Arc::new(h), false);
+        }
         Ok(m)
     }
 
@@ -1115,10 +1430,13 @@ fn open_source(path: &Path, nodata_override: Option<f64>) -> Result<(File, bool)
 /// [`open_source`] for the streaming path: the file behind a [`BlockReader`]
 /// whose first block — fetched with one positioned read — also answers the
 /// magic sniff. The reader sits just past the magic for an `.abt`, at 0 for
-/// anything else.
-fn open_source_blocks(path: &Path, nodata_override: Option<f64>) -> Result<(BlockReader, bool)> {
+/// anything else. Also returns a duplicate of the handle (`None` if the
+/// system refuses one), which shares the open file: the window reads reuse
+/// it instead of opening the file again.
+fn open_source_blocks(path: &Path, nodata_override: Option<f64>) -> Result<(BlockReader, bool, Option<File>)> {
     use std::io::{Seek, SeekFrom};
     let file = open_counted(path).with_context(|| format!("Opening {:?}", path))?;
+    let keep = file.try_clone().ok();
     let mut reader = BlockReader::new(file);
     let is_abt = reader.head(4).with_context(|| format!("Reading {:?}", path))? == b"AETH";
     if is_abt {
@@ -1131,7 +1449,7 @@ fn open_source_blocks(path: &Path, nodata_override: Option<f64>) -> Result<(Bloc
         }
         reader.seek(SeekFrom::Start(4)).with_context(|| format!("Reading {:?}", path))?;
     }
-    Ok((reader, is_abt))
+    Ok((reader, is_abt, keep))
 }
 
 /// A GeoTIFF decoder over *reader* with the decode-buffer cap lifted.
@@ -1652,17 +1970,23 @@ pub fn load_source_to_ram(path: &Path, nodata_override: Option<f64>) -> Result<A
 /// The parse runs over a [`BlockReader`]: the IFD and its tag data cost a few
 /// 16 KB positioned reads wherever they sit, not a refill of a large buffer
 /// at every seek the `tiff` crate makes.
-fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSource> {
-    let (mut reader, is_abt) = open_source_blocks(path, nodata_override)?;
+///
+/// Also returns a second handle to the file it opened (when one could be
+/// made), for the window reads that follow.
+fn read_file_source_keep(path: &Path, nodata_override: Option<f64>) -> Result<(FileSource, Option<File>)> {
+    let (mut reader, is_abt, keep) = open_source_blocks(path, nodata_override)?;
     if is_abt {
         let (geom, size, stride) = read_abt_header(path, &mut reader)?;
-        return Ok(FileSource {
-            id: 0,
-            path: path.to_path_buf(),
-            geom,
-            layout: FileLayout::Abt { size, stride },
-            wgs84_bbox: None,
-        });
+        return Ok((
+            FileSource {
+                id: 0,
+                path: path.to_path_buf(),
+                geom,
+                layout: FileLayout::Abt { size, stride },
+                wgs84_bbox: None,
+            },
+            keep,
+        ));
     }
     let mut decoder = tiff_decoder(reader)?;
     let hdr = read_tiff_header(&mut decoder, path, nodata_override)?;
@@ -1675,20 +1999,29 @@ fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSou
     let chunk_w = if tiled { chunk_w } else { hdr.geom.width };
     let chunks = across as usize * hdr.geom.height.div_ceil(chunk_h) as usize;
     let direct = direct_chunks(&mut decoder, tiled, chunk_w as usize, chunks);
-    Ok(FileSource {
-        id: 0,
-        path: path.to_path_buf(),
-        geom: hdr.geom,
-        layout: FileLayout::Tiff {
-            nodata: hdr.nodata,
-            value_xform: hdr.value_xform,
-            chunk_w,
-            chunk_h,
-            across,
-            direct,
+    Ok((
+        FileSource {
+            id: 0,
+            path: path.to_path_buf(),
+            geom: hdr.geom,
+            layout: FileLayout::Tiff {
+                nodata: hdr.nodata,
+                value_xform: hdr.value_xform,
+                chunk_w,
+                chunk_h,
+                across,
+                direct,
+            },
+            wgs84_bbox: None,
         },
-        wgs84_bbox: None,
-    })
+        keep,
+    ))
+}
+
+/// [`read_file_source_keep`] without the handle.
+#[cfg(test)]
+fn read_file_source(path: &Path, nodata_override: Option<f64>) -> Result<FileSource> {
+    read_file_source_keep(path, nodata_override).map(|(src, _)| src)
 }
 
 /// The header facts of the image *dec* points at that the direct chunk
@@ -1773,41 +2106,87 @@ fn plan_runs(mut items: Vec<(u64, u64, Wanted)>) -> Vec<Run> {
     runs
 }
 
-/// Read one run with one positioned read; the buffer is short only at end of
-/// file. A run past [`MAX_RUN_BYTES`] (one huge chunk) is clamped to the
-/// file's length first, so a corrupt byte count cannot allocate past it.
-fn read_run(file: &File, path: &Path, run: &Run) -> Result<Vec<u8>> {
-    let mut len = run.end - run.start;
+/// Reusable buffers: the smallest one of at least `n` elements (and at
+/// most four times that, so a small request does not pin a huge buffer),
+/// cut or grown to exactly `n`. The kept elements are stale — callers use
+/// this only for buffers they overwrite completely; growth is zero-filled.
+fn take_buf<T: Copy + Default>(pool: &std::sync::Mutex<Vec<Vec<T>>>, n: usize) -> Vec<T> {
+    let found = {
+        let mut g = pool.lock().unwrap_or_else(|p| p.into_inner());
+        let best = g
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.capacity() >= n && b.capacity() / 4 <= n)
+            .min_by_key(|(_, b)| b.capacity())
+            .map(|(i, _)| i);
+        best.map(|i| g.swap_remove(i))
+    };
+    match found {
+        Some(mut b) => {
+            if b.len() >= n {
+                b.truncate(n);
+            } else {
+                b.resize(n, T::default());
+            }
+            b
+        }
+        None => vec![T::default(); n],
+    }
+}
+
+/// Return a buffer to *pool*, which keeps at most *keep_bytes* of them.
+fn give_buf<T>(pool: &std::sync::Mutex<Vec<Vec<T>>>, b: Vec<T>, keep_bytes: usize) {
+    let mut g = pool.lock().unwrap_or_else(|p| p.into_inner());
+    let held: usize = g.iter().map(|v| v.capacity()).sum();
+    if (held + b.capacity()) * std::mem::size_of::<T>() <= keep_bytes {
+        g.push(b);
+    }
+}
+
+/// Read buffers, shared by the I/O threads (that fill them) and the decode
+/// threads (that hand them back).
+fn read_bufs() -> &'static std::sync::Mutex<Vec<Vec<u8>>> {
+    static BUFS: OnceLock<std::sync::Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+    BUFS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Bytes of read buffers kept for reuse, process-wide.
+const KEEP_READ_BYTES: usize = 16 << 20;
+
+/// Hand a decoded run's bytes back for the next read.
+fn recycle_read_buf(b: Vec<u8>) {
+    give_buf(read_bufs(), b, KEEP_READ_BYTES);
+}
+
+/// Read `[start, end)` with one positioned read; the buffer is short only at
+/// end of file. A run past [`MAX_RUN_BYTES`] (one huge chunk) is clamped to
+/// the file's length first, so a corrupt byte count cannot allocate past it.
+fn read_run(file: &File, path: &Path, start: u64, end: u64) -> Result<Vec<u8>> {
+    let mut len = end - start;
     if len > MAX_RUN_BYTES {
         let file_len = file.metadata().with_context(|| format!("Reading {:?}", path))?.len();
-        len = len.min(file_len.saturating_sub(run.start));
+        len = len.min(file_len.saturating_sub(start));
     }
-    let mut buf = vec![0u8; len as usize];
-    let got = read_full_at(file, &mut buf, run.start).with_context(|| format!("Reading {:?}", path))?;
+    // A reused buffer's stale bytes are overwritten by the read, and cut
+    // off where the file ends.
+    let mut buf = take_buf(read_bufs(), len as usize);
+    let got = read_full_at(file, &mut buf, start).with_context(|| format!("Reading {:?}", path))?;
     buf.truncate(got);
     Ok(buf)
 }
 
-/// Decode the window `[x0, x1) x [y0, y1)` of one file source (clamped to
-/// the file by the caller), through the chunk cache.
-///
-/// The chunks the cache does not hold are read with one positioned read per
-/// run of neighbouring chunks — one open, no IFD parse — and decoded by
-/// [`DirectChunks`] (an `.abt` strip is raw rows). A file the direct decoder
-/// does not cover, and any chunk it cannot decode, goes through the `tiff`
-/// decoder instead, so the samples (and any error) are the `tiff` crate's.
-fn load_window(
-    src: &FileSource,
-    (x0, x1, y0, y1): (u32, u32, u32, u32),
-    cache: &ChunkCache,
-    hold: &TileHold,
-) -> Result<Window> {
-    let g = &src.geom;
-    debug_assert!(x0 < x1 && y0 < y1 && x1 <= g.width && y1 <= g.height);
-    let ww = (x1 - x0) as usize;
-    let mut out = vec![0i16; ww * (y1 - y0) as usize];
+/// Decoded-window buffers of one tile, handed back at the end of each band
+/// for the next band's windows.
+type WinPool = std::sync::Mutex<Vec<Vec<i16>>>;
 
-    // The chunk grid, and per chunk the rectangle of image pixels it holds.
+/// Bytes of window buffers a tile keeps between bands (the windows of a
+/// band fit its band budget, so this keeps what the next band will reuse).
+const KEEP_WIN_BYTES: usize = DEFAULT_BAND_BUDGET_BYTES;
+
+/// The chunks of *src* a window `[x0, x1) x [y0, y1)` needs, with the
+/// rectangle of image pixels each holds.
+fn window_chunks(src: &FileSource, (x0, x1, y0, y1): (u32, u32, u32, u32)) -> Vec<Wanted> {
+    let g = &src.geom;
     let (cw, ch, across) = match &src.layout {
         FileLayout::Tiff { chunk_w, chunk_h, across, .. } => (*chunk_w, *chunk_h, *across),
         FileLayout::Abt { size, .. } => (*size as u32, ABT_STRIP_ROWS.min(*size as u32), 1),
@@ -1821,6 +2200,170 @@ fn load_window(
             wanted.push(Wanted { key: (src.id, cy * across + cx), cx0, cy0, dw, dh });
         }
     }
+    wanted
+}
+
+/// The file range `(offset, len)` that holds chunk *w*, for the layouts read
+/// with positioned reads (`None`: the `tiff` decoder reads it itself).
+fn chunk_extent(src: &FileSource, w: &Wanted) -> Option<(u64, u64)> {
+    match &src.layout {
+        FileLayout::Abt { size, stride } => {
+            let off = ABT_HEADER_BYTES + u64::from(w.cy0) * *stride as u64;
+            Some((off, (w.dh as u64 - 1) * *stride as u64 + (*size * 2) as u64))
+        }
+        FileLayout::Tiff { direct: Some(direct), .. } => Some(direct.extent(w.key.1, w.dh as usize)),
+        FileLayout::Tiff { direct: None, .. } => None,
+    }
+}
+
+/// One positioned read issued for a window: the chunks of one run and the
+/// ticket its bytes arrive in.
+struct RunRead {
+    start: u64,
+    /// `(offset, len, chunk)` in file order.
+    items: Vec<(u64, u64, Wanted)>,
+    bytes: Arc<Ticket<Result<Vec<u8>>>>,
+}
+
+/// The source reads of one tile, for the `[Rust] tile` line: bytes read
+/// (on the I/O threads) and which sources had to be read at all.
+struct TileReads {
+    bytes: AtomicU64,
+    files: Vec<AtomicBool>,
+}
+
+impl TileReads {
+    fn new(sources: usize) -> Arc<Self> {
+        Arc::new(TileReads { bytes: AtomicU64::new(0), files: (0..sources).map(|_| AtomicBool::new(false)).collect() })
+    }
+}
+
+/// Bytes a band issues reads for when it is planned (ahead of its decode),
+/// per tile — small next to a tile's band budget, so the memory estimate
+/// that sizes the batch pool still holds.
+const READ_AHEAD_BYTES: u64 = 32 << 20;
+
+/// Submit *runs* of source *idx* to the I/O pool; `urgent` for reads a
+/// thread is about to wait for, else they are read behind them.
+fn submit_runs(
+    src: &Arc<FileSource>,
+    idx: usize,
+    cache: &Arc<ChunkCache>,
+    runs: Vec<Run>,
+    urgent: bool,
+    reads: &Arc<TileReads>,
+) -> Vec<RunRead> {
+    if !runs.is_empty() {
+        reads.files[idx].store(true, Ordering::Relaxed);
+    }
+    runs.into_iter()
+        .map(|run| {
+            let (src, cache, reads) = (src.clone(), cache.clone(), reads.clone());
+            let (start, end) = (run.start, run.end);
+            let bytes = io_pool().submit(urgent, move || {
+                let file = cache.file(&src)?;
+                let buf = read_run(&file, &src.path, start, end)?;
+                reads.bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                Ok(buf)
+            });
+            RunRead { start, items: run.items, bytes }
+        })
+        .collect()
+}
+
+/// Issue the reads of the chunks a window will need that are neither cached
+/// nor held, for [`load_window`] to decode. The band's reads stop at
+/// *budget* bytes (urgent or ahead): what they leave is read when the window
+/// loads, a window at a time per decode thread, so the raw bytes a tile
+/// holds stay bounded. `None` when nothing needs reading (or the layout is
+/// the `tiff` decoder's).
+fn read_window_ahead(
+    src: &Arc<FileSource>,
+    idx: usize,
+    rect: (u32, u32, u32, u32),
+    cache: &Arc<ChunkCache>,
+    hold: &TileHold,
+    urgent: bool,
+    budget: &mut u64,
+    reads: &Arc<TileReads>,
+) -> Option<Vec<RunRead>> {
+    if matches!(src.layout, FileLayout::Tiff { direct: None, .. }) {
+        return None;
+    }
+    let wanted = window_chunks(src, rect);
+    let keys: Vec<ChunkKey> = wanted.iter().map(|w| w.key).collect();
+    let missing = cache.missing(&keys);
+    let items: Vec<(u64, u64, Wanted)> = {
+        let held = hold.lock().unwrap();
+        wanted
+            .iter()
+            .zip(missing)
+            .filter(|(w, m)| *m && !held.contains_key(&w.key))
+            .filter_map(|(w, _)| chunk_extent(src, w).map(|(off, len)| (off, len, *w)))
+            .collect()
+    };
+    if items.is_empty() {
+        return None;
+    }
+    let mut runs = plan_runs(items);
+    let mut keep = 0;
+    for r in &runs {
+        let len = r.end - r.start;
+        if len > *budget {
+            break;
+        }
+        *budget -= len;
+        keep += 1;
+    }
+    runs.truncate(keep);
+    if runs.is_empty() {
+        return None;
+    }
+    Some(submit_runs(src, idx, cache, runs, urgent, reads))
+}
+
+/// Decode the window `[x0, x1) x [y0, y1)` of one file source (clamped to
+/// the file by the caller), through the chunk cache.
+///
+/// The chunks the cache does not hold are read with one positioned read per
+/// run of neighbouring chunks — on the I/O threads, through the cache's kept
+/// file handle, no IFD parse; *ahead* are the reads the band issued for this
+/// window in advance — and decoded here by [`DirectChunks`] (an `.abt` strip
+/// is raw rows). A file the direct decoder does not cover, and any chunk it
+/// cannot decode, goes through the `tiff` decoder instead (on this thread),
+/// so the samples (and any error) are the `tiff` crate's.
+#[allow(clippy::too_many_arguments)]
+fn load_window(
+    src: &Arc<FileSource>,
+    idx: usize,
+    (x0, x1, y0, y1): (u32, u32, u32, u32),
+    cache: &Arc<ChunkCache>,
+    hold: &TileHold,
+    ahead: Option<Vec<RunRead>>,
+    reads: &Arc<TileReads>,
+    pool: &WinPool,
+) -> Result<Window> {
+    let g = &src.geom;
+    debug_assert!(x0 < x1 && y0 < y1 && x1 <= g.width && y1 <= g.height);
+    let ww = (x1 - x0) as usize;
+
+    // The chunk grid, and per chunk the rectangle of image pixels it holds.
+    let wanted = window_chunks(src, (x0, x1, y0, y1));
+
+    // The chunks tile the image, so their overlaps with the window cover it
+    // exactly once and every sample is written below before it is read: a
+    // reused buffer needs no zero fill. Should the overlaps ever not add up
+    // to the window, it is zero-filled as it always was.
+    let n = ww * (y1 - y0) as usize;
+    let overlap: usize = wanted
+        .iter()
+        .map(|w| {
+            let cols = x1.min(w.cx0 + w.dw).saturating_sub(x0.max(w.cx0)) as usize;
+            let rows = y1.min(w.cy0 + w.dh).saturating_sub(y0.max(w.cy0)) as usize;
+            cols * rows
+        })
+        .sum();
+    let mut out = if overlap == n { take_buf(pool, n) } else { vec![0i16; n] };
 
     let keys: Vec<ChunkKey> = wanted.iter().map(|w| w.key).collect();
     let mut got = cache.get_many(&keys);
@@ -1880,21 +2423,37 @@ fn load_window(
     };
     let open = || open_counted(&src.path).with_context(|| format!("Opening {:?}", src.path));
 
+    // The reads behind the misses: those issued ahead, plus — urgent, now —
+    // any miss they do not cover (a chunk evicted since, the read-ahead
+    // budget, a deferred window). A read ahead whose chunks are all cached
+    // by now is dropped unused.
+    let runs = |misses: &[Wanted]| -> Vec<RunRead> {
+        let mut runs = ahead.unwrap_or_default();
+        let covered: std::collections::HashSet<ChunkKey> =
+            runs.iter().flat_map(|r| r.items.iter().map(|it| it.2.key)).collect();
+        let rest: Vec<(u64, u64, Wanted)> = misses
+            .iter()
+            .filter(|w| !covered.contains(&w.key))
+            .filter_map(|w| chunk_extent(src, w).map(|(off, len)| (off, len, *w)))
+            .collect();
+        if !rest.is_empty() {
+            runs.extend(submit_runs(src, idx, cache, plan_runs(rest), true, reads));
+        }
+        let need: std::collections::HashSet<ChunkKey> = misses.iter().map(|w| w.key).collect();
+        runs.retain_mut(|r| {
+            r.items.retain(|it| need.contains(&it.2.key));
+            !r.items.is_empty()
+        });
+        runs
+    };
+
     if !misses.is_empty() {
         match &src.layout {
             FileLayout::Abt { size, stride } => {
                 let (size, stride) = (*size, *stride);
                 let row_bytes = size * 2;
-                let file = open()?;
-                let items = misses
-                    .iter()
-                    .map(|w| {
-                        let off = ABT_HEADER_BYTES + u64::from(w.cy0) * stride as u64;
-                        (off, (w.dh as u64 - 1) * stride as u64 + row_bytes as u64, *w)
-                    })
-                    .collect();
-                for run in plan_runs(items) {
-                    let buf = read_run(&file, &src.path, &run)?;
+                for run in runs(&misses) {
+                    let buf = run.bytes.take()?;
                     for (off, _, w) in &run.items {
                         let base = (off - run.start) as usize;
                         let mut data = vec![0i16; size * w.dh as usize];
@@ -1916,22 +2475,15 @@ fn load_window(
                         place(w, &data);
                         keep(w.key, data);
                     }
+                    recycle_read_buf(buf);
                 }
             }
             FileLayout::Tiff { nodata, value_xform, direct: Some(direct), .. } => {
-                let file = open()?;
                 let mut lzw = None;
                 // The `tiff` decoder, opened only if a chunk needs it.
                 let mut fallback: Option<(Decoder<BlockReader>, Option<(usize, usize)>)> = None;
-                let items = misses
-                    .iter()
-                    .map(|w| {
-                        let (off, len) = direct.extent(w.key.1, w.dh as usize);
-                        (off, len, *w)
-                    })
-                    .collect();
-                for run in plan_runs(items) {
-                    let buf = read_run(&file, &src.path, &run)?;
+                for run in runs(&misses) {
+                    let buf = run.bytes.take()?;
                     for (off, len, w) in &run.items {
                         let lo = ((off - run.start) as usize).min(buf.len());
                         let hi = (lo as u64 + len).min(buf.len() as u64) as usize;
@@ -1960,6 +2512,7 @@ fn load_window(
                         place(w, &data);
                         keep(w.key, data);
                     }
+                    recycle_read_buf(buf);
                 }
             }
             FileLayout::Tiff { nodata, value_xform, direct: None, .. } => {
@@ -2178,6 +2731,10 @@ fn fwd(wgs84: &Proj, dst: &Proj, lat: f64, lon: f64) -> Option<(f64, f64)> {
 /// pixels, so the row simply has no candidates from this group. (Decision:
 /// this is a coverage question, not an error — the job's other sources and
 /// `void_fill_m` decide what such pixels become.)
+///
+/// The sampler builds rows with [`make_row_geom_shared`], which gives the
+/// same geometry with fewer transforms; this per-row form is its reference.
+#[cfg_attr(not(test), allow(dead_code))]
 fn make_row_geom(
     wgs84: &Proj,
     dst: &Proj,
@@ -2259,6 +2816,161 @@ fn make_row_geom(
         })
         .collect();
     Some(RowGeom { segs, shift: CHUNK_SHIFT, mask: chunk - 1, min_e, max_e, min_n, max_n })
+}
+
+/// The transforms a row made at one latitude — its start and end longitude
+/// and, for a chunked row, every segment boundary — kept for the next row,
+/// whose north edge is (bit for bit, more often than not) this row's south
+/// edge.
+struct LatPts {
+    lat_bits: u64,
+    start: (f64, f64),
+    end: (f64, f64),
+    bounds: Option<Vec<(f64, f64)>>,
+}
+
+/// [`make_row_geom`], reusing the previous row's south-edge transforms
+/// (*prev*) when this row's `lat_hi` is the same `f64`, and the
+/// linearity check's end points as the segment boundaries at the same
+/// longitudes. Every transform it skips is one it would have repeated with
+/// bit-identical inputs, so the geometry is identical (pinned by
+/// `shared_row_geometry_is_identical_to_the_per_row_one`).
+#[allow(clippy::too_many_arguments)]
+fn make_row_geom_shared(
+    wgs84: &Proj,
+    dst: &Proj,
+    lat_hi: f64,
+    lat_lo: f64,
+    ul_lon: f64,
+    pixel_deg: f64,
+    out_size: usize,
+    min_scale: f64,
+    prev: &mut Option<LatPts>,
+) -> Option<RowGeom> {
+    let reuse = prev.take().filter(|p| p.lat_bits == lat_hi.to_bits());
+    let lon_end = ul_lon + out_size as f64 * pixel_deg;
+    let ((e_start, n_start), (e_end, n_end), hi_bounds) = match reuse {
+        Some(p) => (p.start, p.end, p.bounds),
+        None => (fwd(wgs84, dst, lat_hi, ul_lon)?, fwd(wgs84, dst, lat_hi, lon_end)?, None),
+    };
+    let lo_start = fwd(wgs84, dst, lat_lo, ul_lon)?;
+    let lo_end = fwd(wgs84, dst, lat_lo, lon_end)?;
+    let (n_lo_start, n_lo_end) = (lo_start.1, lo_end.1);
+
+    let inv_size = 1.0 / out_size as f64;
+    let step_e = (e_end - e_start) * inv_size;
+    let step_n = (n_end - n_start) * inv_size;
+    let step_nlo = (n_lo_end - n_lo_start) * inv_size;
+
+    // Row-midpoint linearity check (see make_row_geom).
+    let mid_lon = ul_lon + (out_size as f64 * 0.5) * pixel_deg;
+    let (e_mid, n_mid) = fwd(wgs84, dst, lat_hi, mid_lon)?;
+    let lerp_e = (e_start + e_end) * 0.5;
+    let lerp_n = (n_start + n_end) * 0.5;
+    let dev = ((e_mid - lerp_e).powi(2) + (n_mid - lerp_n).powi(2)).sqrt();
+
+    if dev < ROW_LERP_TOLERANCE_PX * min_scale {
+        *prev = Some(LatPts { lat_bits: lat_lo.to_bits(), start: lo_start, end: lo_end, bounds: None });
+        return Some(RowGeom {
+            segs: vec![Seg { e0: e_start, n0: n_start, nlo0: n_lo_start, step_e, step_n, step_nlo }],
+            shift: usize::BITS - 1,
+            mask: usize::MAX,
+            min_e: e_start.min(e_end),
+            max_e: e_start.max(e_end),
+            min_n: n_start.min(n_end),
+            max_n: n_start.max(n_end),
+        });
+    }
+
+    // Slow path: 64-px chunks, endpoints transformed per chunk boundary.
+    let chunk = 1usize << CHUNK_SHIFT;
+    let n_segs = out_size.div_ceil(chunk);
+    let x_at = |i: usize| (i * chunk).min(out_size);
+    // One latitude's boundary transforms; the row's end points are known.
+    let bounds_of = |lat: f64, start: (f64, f64), end: (f64, f64)| -> Option<Vec<(f64, f64)>> {
+        (0..=n_segs)
+            .map(|i| {
+                let lon = ul_lon + x_at(i) as f64 * pixel_deg;
+                if i == 0 && lon.to_bits() == ul_lon.to_bits() {
+                    Some(start)
+                } else if i == n_segs && lon.to_bits() == lon_end.to_bits() {
+                    Some(end)
+                } else {
+                    fwd(wgs84, dst, lat, lon)
+                }
+            })
+            .collect()
+    };
+    let hi = match hi_bounds {
+        Some(b) => b,
+        None => bounds_of(lat_hi, (e_start, n_start), (e_end, n_end))?,
+    };
+    let lo = bounds_of(lat_lo, lo_start, lo_end)?;
+    let boundaries: Vec<(usize, f64, f64, f64)> =
+        (0..=n_segs).map(|i| (x_at(i), hi[i].0, hi[i].1, lo[i].1)).collect();
+    *prev = Some(LatPts { lat_bits: lat_lo.to_bits(), start: lo_start, end: lo_end, bounds: Some(lo) });
+
+    let (mut min_e, mut max_e) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_n, mut max_n) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &(_, e, n, _) in &boundaries {
+        min_e = min_e.min(e);
+        max_e = max_e.max(e);
+        min_n = min_n.min(n);
+        max_n = max_n.max(n);
+    }
+    let segs = boundaries
+        .windows(2)
+        .map(|w| {
+            let (x0, e0, n0, nlo0) = w[0];
+            let (x1, e1, n1, nlo1) = w[1];
+            let inv = 1.0 / (x1 - x0) as f64;
+            Seg {
+                e0,
+                n0,
+                nlo0,
+                step_e: (e1 - e0) * inv,
+                step_n: (n1 - n0) * inv,
+                step_nlo: (nlo1 - nlo0) * inv,
+            }
+        })
+        .collect();
+    Some(RowGeom { segs, shift: CHUNK_SHIFT, mask: chunk - 1, min_e, max_e, min_n, max_n })
+}
+
+/// Rows a geometry run computes in order, sharing transforms between
+/// neighbours ([`make_row_geom_shared`]); runs go in parallel.
+const ROW_RUN: usize = 16;
+
+/// One CRS group's geometry for rows `r0..r1`: `row_lat_of(y)` is row
+/// `y`'s cell-centre parallel, its south edge one pixel further south.
+#[allow(clippy::too_many_arguments)]
+fn band_row_geoms(
+    wgs84: &Proj,
+    dst: &Proj,
+    min_scale: f64,
+    (r0, r1): (usize, usize),
+    row_lat_of: &(impl Fn(usize) -> f64 + Sync),
+    ul_lon: f64,
+    pixel_deg: f64,
+    out_size: usize,
+) -> Vec<Option<RowGeom>> {
+    let run = |a: usize| -> Vec<Option<RowGeom>> {
+        let mut prev = None;
+        (a..(a + ROW_RUN).min(r1))
+            .map(|y| {
+                let row_lat = row_lat_of(y);
+                make_row_geom_shared(
+                    wgs84, dst, row_lat, row_lat - pixel_deg, ul_lon, pixel_deg, out_size, min_scale, &mut prev,
+                )
+            })
+            .collect()
+    };
+    let starts: Vec<usize> = (r0..r1).step_by(ROW_RUN).collect();
+    #[cfg(feature = "native")]
+    let runs: Vec<Vec<Option<RowGeom>>> = starts.into_par_iter().map(run).collect();
+    #[cfg(not(feature = "native"))]
+    let runs: Vec<Vec<Option<RowGeom>>> = starts.into_iter().map(run).collect();
+    runs.into_iter().flatten().collect()
 }
 
 /// Convert one tile, decoding this job's `buildings_pbf_dir` (if any) for it.
@@ -2384,6 +3096,34 @@ fn prj_row_candidate(g: &SourceGeom, geom: &RowGeom) -> bool {
     g.origin_n >= geom.min_n && g.limit_n <= geom.max_n && g.limit_e >= geom.min_e && g.origin_e <= geom.max_e
 }
 
+/// `(min_e, max_e, min_n, max_n)` of the cell centres of pixels
+/// `xa..=xb` of a row — both in one geometry segment — evaluated with the
+/// sampling loop's own expressions at the two ends (a centre coordinate is
+/// monotone in the pixel within a segment, so these are its extremes).
+#[inline]
+fn centre_bounds(geom: &RowGeom, xa: usize, xb: usize) -> (f64, f64, f64, f64) {
+    debug_assert_eq!(xa >> geom.shift, xb >> geom.shift, "a block spans one segment");
+    let at = |x: usize| {
+        let seg = &geom.segs[x >> geom.shift];
+        let lx = (x & geom.mask) as f64;
+        (seg.e0 + seg.step_e * lx, seg.n0 + seg.step_n * lx)
+    };
+    let ((ea, na), (eb, nb)) = (at(xa), at(xb));
+    (ea.min(eb), ea.max(eb), na.min(nb), na.max(nb))
+}
+
+/// Whether a projected source can pass the sampler's containment test
+/// (`n <= origin_n && n >= limit_n && e >= origin_e && e < limit_e`) at any
+/// cell centre within *c* ([`centre_bounds`]). `false` only when it fails
+/// at all of them; a non-finite bound keeps the source.
+#[inline]
+fn may_hold(img: &SourceGeom, (min_e, max_e, min_n, max_n): (f64, f64, f64, f64)) -> bool {
+    if !(min_e.is_finite() && max_e.is_finite() && min_n.is_finite() && max_n.is_finite()) {
+        return true;
+    }
+    !(max_n < img.limit_n || min_n > img.origin_n || max_e < img.origin_e || min_e >= img.limit_e)
+}
+
 /// Lower window edge (pixels) for a footprint bound: 2 pixels of margin below
 /// what `sample_span` can return, clamped to the file.
 fn px_lo(v: f64, dim: u32) -> u32 {
@@ -2442,55 +3182,363 @@ fn shadowed_sources(
 /// indices and clamped to the file exactly as before), so the bytes do not
 /// depend on the band size or the budgets; a read outside a planned window
 /// refuses the tile rather than guessing.
+///
+/// The tile file is written on the calling thread before this returns (a
+/// batch hands it to a [`TileWriter`] instead, see [`process_tile_batched`]).
 pub fn process_tile_opts(
     job: IngestJob,
     cache_arc: ImageCache,
     pbf_buildings: Option<&PbfBuildingSet>,
     opts: &IngestOptions,
 ) -> Result<TileStats> {
+    let tile = sample_tile(job, cache_arc, pbf_buildings, opts, None)?;
+    let w = Clock::now();
+    let written = write_tile(&tile);
+    tile.line.print(w.ns(), tile.t0.ns());
+    written.map(|()| tile.stats)
+}
+
+/// Called once with a batch tile's final result: the write's outcome when
+/// the tile was sampled, else the sampling error.
+pub type TileDone = Box<dyn FnOnce(Result<TileStats>) + Send>;
+
+/// [`process_tile_opts`] for a batch: the tile is sampled on the calling
+/// thread and its bytes are handed to *writer*, so the thread is free for
+/// the next tile while the file is written, synced and renamed. *done* runs
+/// exactly once — on the calling thread when sampling fails, else on the
+/// writer thread once the tile is committed or its write failed (a failed
+/// write has removed its temp file, exactly as in [`process_tile_opts`]).
+pub fn process_tile_batched(
+    job: IngestJob,
+    cache_arc: ImageCache,
+    pbf_buildings: Option<&PbfBuildingSet>,
+    opts: &IngestOptions,
+    writer: &TileWriter,
+    done: TileDone,
+) {
+    let spare = writer.spare_buffer();
+    let tile = match sample_tile(job, cache_arc, pbf_buildings, opts, spare) {
+        Ok(t) => t,
+        Err(e) => return done(Err(e)),
+    };
+    let stats = tile.stats;
+    // The tile's time on this thread ends here: the write overlaps the
+    // next tile (a wait for a free writer is not counted).
+    let total_ns = tile.t0.ns();
+    writer.submit(WriteJob {
+        tile,
+        then: Box::new(move |r: Result<()>, line: TileLine, write_ns: u64| {
+            line.print(write_ns, total_ns);
+            done(r.map(|()| stats))
+        }),
+    });
+}
+
+/// The payload of a finished tile.
+enum TileBody {
+    /// R16SINT rows of `size` samples, each followed by `pad` zero bytes
+    /// (the 256-byte row alignment of §6).
+    Rows { buf: Vec<i16>, size: usize, pad: usize },
+    /// An already-encoded payload (BC6H blocks).
+    #[allow(dead_code)]
+    Raw(Vec<u8>),
+}
+
+/// The `[Rust] tile …` diagnostic line (changelog 31, extended by 37) of one
+/// sampled tile. Not parsed by any consumer; goes to `AETHER_DIAG_FILE`
+/// when that is set, else to stdout ([`crate::diag::out`]).
+struct TileLine {
+    name: String,
+    sources: usize,
+    header_s: f64,
+    open_ms: f64,
+    read_ms: f64,
+    decode_s: f64,
+    files: usize,
+    mb: f64,
+    sample_s: f64,
+    bands: u32,
+    geom_s: f64,
+}
+
+impl TileLine {
+    /// Print with the write's wall time and the tile's wall time on its
+    /// compute thread.
+    fn print(&self, write_ns: u64, total_ns: u64) {
+        crate::diag::out(&format!(
+            "[Rust] tile {}: {} sources, header {:.1}s (open {:.1} ms, read {:.1} ms avg), \
+             decode {:.1}s ({} files, {:.1} MB read), sample {:.1}s, bands {}, geom {:.1}s, \
+             write {:.1}s, total {:.1}s",
+            self.name,
+            self.sources,
+            self.header_s,
+            self.open_ms,
+            self.read_ms,
+            self.decode_s,
+            self.files,
+            self.mb,
+            self.sample_s,
+            self.bands,
+            self.geom_s,
+            write_ns as f64 / 1e9,
+            total_ns as f64 / 1e9,
+        ));
+    }
+}
+
+/// A sampled tile, ready to be written: its 44-byte header and payload.
+struct ReadyTile {
+    dst: PathBuf,
+    header: Vec<u8>,
+    body: TileBody,
+    stats: TileStats,
+    /// The tile's diagnostic line, printed once the tile is written.
+    line: TileLine,
+    /// When the tile started on its compute thread.
+    t0: Clock,
+    /// The ENOSPC test hook, read on the thread that sampled the tile.
+    #[cfg(test)]
+    fail_after: Option<usize>,
+}
+
+/// Write *tile* to `<dst>.tmp-<pid>` and rename it over `dst` ([`TileFile`]),
+/// creating the output directory first. Any error removes the temp file and
+/// leaves `dst` untouched.
+fn write_tile(tile: &ReadyTile) -> Result<()> {
+    if let Some(dir) = tile.dst.parent() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("creating output directory {:?}", dir))?;
+    }
+    // Written to `<output>.tmp-<pid>` beside the output and renamed over it
+    // only once flushed and synced ([`TileFile`]): a failed write (a full
+    // disk) leaves no truncated tile under the final name, and an existing
+    // tile is replaced by a new inode instead of being truncated in place —
+    // views hardlink pool tiles, and their inode stays intact.
+    let mut w = TileFile::open_temp(
+        &tile.dst,
+        #[cfg(test)]
+        tile.fail_after,
+    )?;
+    w.write_all(&tile.header)?;
+    match &tile.body {
+        TileBody::Rows { buf, size, pad } => {
+            // Legacy R16SINT writing with 256-byte pitch padding
+            let padding_buf = vec![0u8; *pad];
+            for chunk in buf.chunks(*size) {
+                let ptr = chunk.as_ptr() as *const u8;
+                let len = chunk.len() * 2;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                w.write_all(slice)?;
+                if *pad > 0 {
+                    w.write_all(&padding_buf)?;
+                }
+            }
+        }
+        TileBody::Raw(bytes) => w.write_all(bytes)?,
+    }
+    w.commit()
+}
+
+/// One tile for a [`TileWriter`]: the bytes, and what to do with the
+/// write's outcome.
+struct WriteJob {
+    tile: ReadyTile,
+    /// Runs with the write's result, the tile's line and the write's wall
+    /// time.
+    then: Box<dyn FnOnce(Result<()>, TileLine, u64) + Send>,
+}
+
+/// Write one job and report it. A panic while writing becomes the tile's
+/// error; a panic in the report itself propagates (it kills this writer
+/// thread and [`TileWriter::finish`] re-raises it, as a panic on a compute
+/// thread takes the batch down).
+fn run_write_job(job: WriteJob, spares: &Spares) {
+    let WriteJob { tile, then } = job;
+    let w = Clock::now();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| write_tile(&tile)))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("writing output tile {:?} panicked", tile.dst)));
+    let write_ns = w.ns();
+    if let TileBody::Rows { buf, .. } = tile.body {
+        spares.give(buf);
+    }
+    then(r, tile.line, write_ns);
+}
+
+/// Output buffers of written tiles, for the next tiles to sample into: a
+/// 2 m tile's buffer is 62 MB, and a fresh one costs ~15 000 page faults
+/// (most of a tile's) and an allocator round trip to the OS.
+struct Spares {
+    bufs: std::sync::Mutex<Vec<Vec<i16>>>,
+    keep: usize,
+}
+
+impl Spares {
+    fn give(&self, buf: Vec<i16>) {
+        let mut g = self.bufs.lock().unwrap_or_else(|p| p.into_inner());
+        if g.len() < self.keep {
+            g.push(buf);
+        }
+    }
+
+    fn take(&self) -> Option<Vec<i16>> {
+        self.bufs.lock().unwrap_or_else(|p| p.into_inner()).pop()
+    }
+}
+
+/// Dedicated threads that write a batch's tiles (changelog 37): each file's
+/// create, write, flush, `sync_data`, close and rename runs here, never on a
+/// compute thread. A compute thread waits only when every writer is busy
+/// and the queue (one slot per writer) is full — the back-pressure that
+/// bounds the finished tiles held in memory. If no thread can be started,
+/// or the writers are gone, a job is written inline on the submitting
+/// thread instead: slower, never lost.
+pub struct TileWriter {
+    tx: Option<std::sync::mpsc::SyncSender<WriteJob>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    spares: Arc<Spares>,
+}
+
+impl TileWriter {
+    /// A writer with *threads* writer threads (at least one) that keeps up
+    /// to *spare_buffers* written tiles' buffers for reuse (one per compute
+    /// thread is enough).
+    ///
+    /// The hand-off is a rendezvous: a tile is held by its compute thread
+    /// until a writer takes it, so a batch holds at most one finished tile
+    /// per writer beyond the one each compute thread works on.
+    pub fn new(threads: usize, spare_buffers: usize) -> TileWriter {
+        let threads = threads.max(1);
+        let spares = Arc::new(Spares { bufs: std::sync::Mutex::new(Vec::new()), keep: spare_buffers });
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WriteJob>(0);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let mut workers = Vec::with_capacity(threads);
+        for i in 0..threads {
+            let (rx, spares) = (rx.clone(), spares.clone());
+            let spawned = std::thread::Builder::new().name(format!("aether-write-{i}")).spawn(move || loop {
+                // The lock is held while waiting, so idle writers queue on it
+                // and each job goes to exactly one of them.
+                let job = rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                match job {
+                    Ok(job) => run_write_job(job, &spares),
+                    Err(_) => return, // every sender is gone: the batch is done
+                }
+            });
+            match spawned {
+                Ok(h) => workers.push(h),
+                Err(_) => break,
+            }
+        }
+        TileWriter { tx: (!workers.is_empty()).then_some(tx), workers, spares }
+    }
+
+    fn submit(&self, job: WriteJob) {
+        match &self.tx {
+            Some(tx) => {
+                if let Err(std::sync::mpsc::SendError(job)) = tx.send(job) {
+                    run_write_job(job, &self.spares);
+                }
+            }
+            None => run_write_job(job, &self.spares),
+        }
+    }
+
+    /// A written tile's output buffer to sample the next tile into.
+    fn spare_buffer(&self) -> Option<Vec<i16>> {
+        self.spares.take()
+    }
+
+    /// Wait until every submitted tile is written and reported. Re-raises a
+    /// panic of a writer thread.
+    pub fn finish(mut self) {
+        self.shut_down();
+    }
+
+    fn shut_down(&mut self) {
+        drop(self.tx.take());
+        let mut panic = None;
+        for h in self.workers.drain(..) {
+            if let Err(p) = h.join() {
+                panic.get_or_insert(p);
+            }
+        }
+        if let Some(p) = panic {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(p);
+            }
+        }
+    }
+}
+
+impl Drop for TileWriter {
+    fn drop(&mut self) {
+        self.shut_down();
+    }
+}
+
+/// Everything of [`process_tile_opts`] but the file write.
+fn sample_tile(
+    job: IngestJob,
+    cache_arc: ImageCache,
+    pbf_buildings: Option<&PbfBuildingSet>,
+    opts: &IngestOptions,
+    spare: Option<Vec<i16>>,
+) -> Result<ReadyTile> {
+    // The tile's start on this thread (`total` of the `[Rust] tile` line).
+    let t0 = Clock::now();
     // 0. Normalize the legacy aliases into sources[] — ONE code path from here.
     let sources = job.effective_sources()?;
 
-    let private_cache;
-    let chunk_cache: &ChunkCache = match &opts.chunk_cache {
-        Some(c) => c,
-        None => {
-            private_cache = ChunkCache::new(DEFAULT_CHUNK_CACHE_BYTES);
-            &private_cache
-        }
+    let chunk_cache: Arc<ChunkCache> = match &opts.chunk_cache {
+        Some(c) => c.clone(),
+        None => Arc::new(ChunkCache::new(DEFAULT_CHUNK_CACHE_BYTES)),
     };
+    let chunk_cache = &chunk_cache;
 
     // 1.-2. Resolve every source's header (pixels come later, per band). A
     // listed source that cannot be opened or parsed is FATAL — even one this
     // tile never samples: writing the tile without it would silently drop
-    // terrain and the run would still report success. The headers are read
-    // in parallel (each is an open and a positioned read or two, so the pass
-    // is I/O-bound); the error reported is still the first in source order.
+    // terrain and the run would still report success. The headers not yet
+    // cached are read on the I/O threads, all at once (each is an open and a
+    // positioned read or two); the error reported is still the first in
+    // source order.
     // Where this tile's time goes, for the `[Rust] tile …` line (changelog 31).
     let diag = TileDiag::default();
     let hdr_clock = Clock::now();
-    let resolve = |s: &SourceSpec| -> Result<Src> {
-        let key = cache_key(s);
-        let injected = cache_arc.lock().unwrap().get(&key).cloned();
-        Ok(match injected {
-            Some(img) => Src::Mem(img),
-            None => {
-                let mark = IoMark::now();
-                let meta = chunk_cache.meta(s);
-                diag.header(mark.since());
-                Src::File(meta.with_context(|| format!("loading source {:?}", key.0))?)
-            }
-        })
-    };
-    #[cfg(feature = "native")]
-    let resolved: Vec<Result<Src>> = sources.par_iter().map(resolve).collect();
-    #[cfg(not(feature = "native"))]
-    let resolved: Vec<Result<Src>> = sources.iter().map(resolve).collect();
-    let hdr_ns = hdr_clock.ns();
-    let mut srcs: Vec<Src> = Vec::with_capacity(sources.len());
-    for s in resolved {
-        srcs.push(s?);
+    enum Header {
+        Ready(Src),
+        Reading(Arc<Ticket<Result<(Arc<FileSource>, IoDelta)>>>),
     }
+    let pending: Vec<Header> = sources
+        .iter()
+        .map(|s| {
+            let injected = cache_arc.lock().unwrap().get(&cache_key(s)).cloned();
+            if let Some(img) = injected {
+                return Header::Ready(Src::Mem(img));
+            }
+            if let Some(meta) = chunk_cache.meta_cached(s) {
+                return Header::Ready(Src::File(meta));
+            }
+            let (cache, spec) = (chunk_cache.clone(), s.clone());
+            Header::Reading(io_pool().submit(true, move || {
+                // Measured on the I/O thread that does the read.
+                let mark = IoMark::now();
+                let meta = cache.meta(&spec)?;
+                Ok((meta, mark.since()))
+            }))
+        })
+        .collect();
+    let mut srcs: Vec<Src> = Vec::with_capacity(sources.len());
+    for (h, s) in pending.into_iter().zip(&sources) {
+        srcs.push(match h {
+            Header::Ready(src) => src,
+            Header::Reading(t) => {
+                let (meta, io) = t.take().with_context(|| format!("loading source {:?}", s.path))?;
+                diag.header(io);
+                Src::File(meta)
+            }
+        });
+    }
+    let hdr_ns = hdr_clock.ns();
     let geoms: Vec<SourceGeom> = srcs
         .iter()
         .map(|s| match s {
@@ -2594,7 +3642,21 @@ pub fn process_tile_opts(
     let ul_lat_c = job.ul_lat - 0.5 * pixel_deg;
     let out_size = job.size_px as usize;
     let total_pixels = out_size * out_size;
-    let mut buffer = vec![0i16; total_pixels];
+    // Every pixel is written by the sampling loop below (each band covers
+    // whole rows, each row every column) before anything reads the buffer,
+    // so a written tile's buffer is reused as it is — no zero fill, no fresh
+    // pages. Only a buffer that is too short grows (zero-filling the growth).
+    let mut buffer = match spare {
+        Some(mut b) if b.capacity() >= total_pixels && b.capacity() / 4 <= total_pixels => {
+            if b.len() >= total_pixels {
+                b.truncate(total_pixels);
+            } else {
+                b.resize(total_pixels, 0);
+            }
+            b
+        }
+        _ => vec![0i16; total_pixels],
+    };
 
     // What a pixel no source covers becomes: the void sentinel, or the job's
     // requested fill elevation (round half away from zero, saturating i16).
@@ -2693,133 +3755,201 @@ pub fn process_tile_opts(
     let hold: TileHold = std::sync::Mutex::new(HashMap::new());
     let mut peak_window_bytes: usize = 0;
     let mut bands: u32 = 0;
-    // Sources whose windows had to be read from disk (not all from cache).
-    let dec_files: Vec<AtomicBool> = (0..srcs.len()).map(|_| AtomicBool::new(false)).collect();
+    // Bytes read for this tile's windows, and the sources whose windows had
+    // to be read from disk at all (not all from cache).
+    let reads = TileReads::new(srcs.len());
+    let win_pool: WinPool = std::sync::Mutex::new(Vec::new());
     let mut sample_ns = 0u64;
-    let mut band_rows = out_size.clamp(1, MAX_BAND_ROWS);
-    let mut r0 = 0usize;
+    let row_lat_of = |y: usize| ul_lat_c - (y as f64 * pixel_deg);
 
-    while r0 < out_size {
-        let r1 = (r0 + band_rows).min(out_size);
-        let row_lat_of = |y: usize| ul_lat_c - (y as f64 * pixel_deg);
+    // The projected geometry of each band row, one per CRS group
+    // ([`band_row_geoms`]). `row_lat` is the row's cell-centre parallel; the
+    // second latitude one pixel south gets its own transforms because the
+    // cell footprint (±half a pixel around the centre) needs a northing
+    // extent, and a projected northing of a WGS84 parallel drifts along the
+    // row.
 
-        // The projected geometry of each band row, one per CRS group. `row_lat`
-        // is the row's cell-centre parallel; the second latitude one pixel
-        // south gets its own transforms because the cell footprint (±half a
-        // pixel around the centre) needs a northing extent, and a projected
-        // northing of a WGS84 parallel drifts along the row.
-        let geom_row = |y: usize| -> Vec<Option<RowGeom>> {
-            let row_lat = row_lat_of(y);
-            groups
+    /// One planned row band.
+    struct BandPlan {
+        r0: usize,
+        r1: usize,
+        geoms: Vec<Vec<Option<RowGeom>>>,
+        rects: Vec<Option<(u32, u32, u32, u32)>>,
+        est: usize,
+        shadowed: Vec<bool>,
+        /// The reads issued for each eager window.
+        ahead: Vec<Option<Vec<RunRead>>>,
+    }
+
+    // Plan the band that starts at row `r0` and is at most `band_rows` tall
+    // (thinner when its windows would exceed the band budget), and issue its
+    // windows' reads: `urgent` for a band that loads right away, else as
+    // reads ahead, read while the band before it samples.
+    let plan_band = |r0: usize, mut band_rows: usize, urgent: bool| -> BandPlan {
+        // Row geometry and each row's footprint extent, per CRS group:
+        // computed once for the widest band tried — a band re-planned
+        // thinner keeps the prefix it already has.
+        let mut band_geoms: Vec<Vec<Option<RowGeom>>> = Vec::new();
+        let mut band_exts: Vec<Vec<Option<RowExt>>> = Vec::new();
+        loop {
+            let r1 = (r0 + band_rows).min(out_size);
+            if band_geoms.len() > r1 - r0 {
+                band_geoms.truncate(r1 - r0);
+                band_exts.truncate(r1 - r0);
+            } else if band_geoms.len() < r1 - r0 {
+                let mut cols: Vec<std::vec::IntoIter<Option<RowGeom>>> = groups
+                    .iter()
+                    .map(|g| {
+                        band_row_geoms(&wgs84, &g.proj, g.min_scale, (r0, r1), &row_lat_of, ul_lon_c, pixel_deg, out_size)
+                            .into_iter()
+                    })
+                    .collect();
+                band_geoms = (r0..r1).map(|_| cols.iter_mut().map(|c| c.next().unwrap()).collect()).collect();
+                band_exts = band_geoms
+                    .iter()
+                    .map(|row| row.iter().map(|g| g.as_ref().map(|g| row_extent(g, out_size))).collect())
+                    .collect();
+            }
+
+            // The window of each file source this band can read.
+            let rects: Vec<Option<(u32, u32, u32, u32)>> = srcs
                 .iter()
-                .map(|g| {
-                    make_row_geom(
-                        &wgs84, &g.proj, row_lat, row_lat - pixel_deg,
-                        ul_lon_c, pixel_deg, out_size, g.min_scale,
-                    )
-                })
-                .collect()
-        };
-        #[cfg(feature = "native")]
-        let band_geoms: Vec<Vec<Option<RowGeom>>> = (r0..r1).into_par_iter().map(geom_row).collect();
-        #[cfg(not(feature = "native"))]
-        let band_geoms: Vec<Vec<Option<RowGeom>>> = (r0..r1).map(geom_row).collect();
-
-        // The window of each file source this band can read.
-        let rects: Vec<Option<(u32, u32, u32, u32)>> = srcs
-            .iter()
-            .enumerate()
-            .map(|(i, src)| {
-                if let Src::Mem(_) = src {
-                    return None;
-                }
-                let g = &geoms[i];
-                match kinds[i] {
-                    SourceKind::Geographic => {
-                        let (x0, x1) = geo_x_rect[i]?;
-                        let (mut y0, mut y1) = (u32::MAX, 0u32);
-                        for y in r0..r1 {
-                            if let Some((a, b)) = geo_row_span(g, row_lat_of(y), pixel_deg) {
-                                y0 = y0.min(a);
-                                y1 = y1.max(b);
-                            }
-                        }
-                        (y0 < y1).then_some((x0, x1, y0, y1))
+                .enumerate()
+                .map(|(i, src)| {
+                    if let Src::Mem(_) = src {
+                        return None;
                     }
-                    SourceKind::Projected(gi) => {
-                        let mut ext = RowExt::EMPTY;
-                        for row in &band_geoms {
-                            if let Some(geom) = &row[gi] {
-                                if prj_row_candidate(g, geom) {
-                                    ext.union(&row_extent(geom, out_size));
+                    let g = &geoms[i];
+                    match kinds[i] {
+                        SourceKind::Geographic => {
+                            let (x0, x1) = geo_x_rect[i]?;
+                            let (mut y0, mut y1) = (u32::MAX, 0u32);
+                            for y in r0..r1 {
+                                if let Some((a, b)) = geo_row_span(g, row_lat_of(y), pixel_deg) {
+                                    y0 = y0.min(a);
+                                    y1 = y1.max(b);
                                 }
                             }
+                            (y0 < y1).then_some((x0, x1, y0, y1))
                         }
-                        if ext.is_empty() {
-                            return None;
+                        SourceKind::Projected(gi) => {
+                            let mut ext = RowExt::EMPTY;
+                            for (row, exts) in band_geoms.iter().zip(&band_exts) {
+                                if let (Some(geom), Some(row_ext)) = (&row[gi], &exts[gi]) {
+                                    if prj_row_candidate(g, geom) {
+                                        ext.union(row_ext);
+                                    }
+                                }
+                            }
+                            if ext.is_empty() {
+                                return None;
+                            }
+                            let (inv_x, inv_y) = (1.0 / g.scale_x, 1.0 / g.scale_y);
+                            let x0 = px_lo((ext.e_min - g.origin_e) * inv_x, g.width);
+                            let x1 = px_hi((ext.e_max - g.origin_e) * inv_x, g.width);
+                            let y0 = px_lo((g.origin_n - ext.n_max) * inv_y, g.height);
+                            let y1 = px_hi((g.origin_n - ext.n_min) * inv_y, g.height);
+                            (x0 < x1 && y0 < y1).then_some((x0, x1, y0, y1))
                         }
-                        let (inv_x, inv_y) = (1.0 / g.scale_x, 1.0 / g.scale_y);
-                        let x0 = px_lo((ext.e_min - g.origin_e) * inv_x, g.width);
-                        let x1 = px_hi((ext.e_max - g.origin_e) * inv_x, g.width);
-                        let y0 = px_lo((g.origin_n - ext.n_max) * inv_y, g.height);
-                        let y1 = px_hi((g.origin_n - ext.n_min) * inv_y, g.height);
-                        (x0 < x1 && y0 < y1).then_some((x0, x1, y0, y1))
                     }
-                }
-            })
-            .collect();
-        let est: usize = rects
-            .iter()
-            .flatten()
-            .map(|&(x0, x1, y0, y1)| (x1 - x0) as usize * (y1 - y0) as usize * 2)
-            .sum();
-        if est > opts.band_budget_bytes && r1 - r0 > 1 {
-            band_rows = ((r1 - r0) / 2).max(1);
-            continue; // re-plan a thinner band
+                })
+                .collect();
+            let est: usize = rects
+                .iter()
+                .flatten()
+                .map(|&(x0, x1, y0, y1)| (x1 - x0) as usize * (y1 - y0) as usize * 2)
+                .sum();
+            if est > opts.band_budget_bytes && r1 - r0 > 1 {
+                band_rows = ((r1 - r0) / 2).max(1);
+                continue; // re-plan a thinner band
+            }
+
+            // Shadowing: a candidate whose WGS84 box, clipped to the band, lies
+            // inside the box of a higher-priority candidate is probably never
+            // sampled — the sampler stops at the first source with ground. Its
+            // window is decoded only if the sampling loop actually falls through
+            // to it (a void in the source above, a gap the box overstates). A
+            // window never sampled was never needed, so the bytes do not change;
+            // a mosaic of side-by-side tiles shadows nothing and loads eagerly.
+            let band_box = [
+                job.ul_lon,
+                job.ul_lat - r1 as f64 * pixel_deg,
+                job.ul_lon + out_size as f64 * pixel_deg,
+                job.ul_lat - r0 as f64 * pixel_deg,
+            ];
+            let shadowed = shadowed_sources(&rects, &bboxes, band_box);
+
+            // The reads of the eager windows' chunks the cache does not hold.
+            let mut budget = READ_AHEAD_BYTES;
+            let ahead = (0..srcs.len())
+                .map(|i| match (&srcs[i], rects[i]) {
+                    (Src::File(f), Some(rect)) if !shadowed[i] => {
+                        read_window_ahead(f, i, rect, chunk_cache, &hold, urgent, &mut budget, &reads)
+                    }
+                    _ => None,
+                })
+                .collect();
+            return BandPlan { r0, r1, geoms: std::mem::take(&mut band_geoms), rects, est, shadowed, ahead };
         }
+    };
 
-        // Shadowing: a candidate whose WGS84 box, clipped to the band, lies
-        // inside the box of a higher-priority candidate is probably never
-        // sampled — the sampler stops at the first source with ground. Its
-        // window is decoded only if the sampling loop actually falls through
-        // to it (a void in the source above, a gap the box overstates). A
-        // window never sampled was never needed, so the bytes do not change;
-        // a mosaic of side-by-side tiles shadows nothing and loads eagerly.
-        let band_box = [
-            job.ul_lon,
-            job.ul_lat - r1 as f64 * pixel_deg,
-            job.ul_lon + out_size as f64 * pixel_deg,
-            job.ul_lat - r0 as f64 * pixel_deg,
-        ];
-        let shadowed = shadowed_sources(&rects, &bboxes, band_box);
-
+    // Row geometry and planning (`geom` of the `[Rust] tile` line).
+    let mut geom_ns = 0u64;
+    let plan_clock = Clock::now();
+    let mut next = Some(plan_band(0, out_size.clamp(1, MAX_BAND_ROWS), true));
+    geom_ns += plan_clock.ns();
+    while let Some(BandPlan { r0, r1, geoms: band_geoms, rects, est, shadowed, ahead }) = next.take() {
         // Decode the band's unshadowed windows, sources in parallel.
-        let load = |i: usize| -> Result<Option<Window>> {
+        let load = |i: usize, ahead: Option<Vec<RunRead>>| -> Result<Option<Window>> {
             match (&srcs[i], rects[i]) {
                 (Src::File(f), Some(rect)) => {
                     let mark = IoMark::now();
-                    let w = load_window(f, rect, chunk_cache, &hold);
+                    let w = load_window(f, i, rect, chunk_cache, &hold, ahead, &reads, &win_pool);
+                    // Reads made on this thread (the `tiff`-decoder paths);
+                    // the I/O threads count theirs in `reads`.
                     let (opens, _, bytes, _) = mark.since();
                     diag.dec_bytes.fetch_add(bytes, Ordering::Relaxed);
                     if opens > 0 {
-                        dec_files[i].store(true, Ordering::Relaxed);
+                        reads.files[i].store(true, Ordering::Relaxed);
                     }
                     w.map(Some).with_context(|| format!("loading source {:?}", f.path))
                 }
                 _ => Ok(None),
             }
         };
-        let eager = |i: usize| if shadowed[i] { Ok(None) } else { load(i) };
+        let eager = |(i, ahead): (usize, Option<Vec<RunRead>>)| if shadowed[i] { Ok(None) } else { load(i, ahead) };
         let dec_clock = Clock::now();
         #[cfg(feature = "native")]
-        let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).into_par_iter().map(eager).collect();
+        let loaded: Vec<Result<Option<Window>>> = ahead.into_par_iter().enumerate().map(eager).collect();
         #[cfg(not(feature = "native"))]
-        let loaded: Vec<Result<Option<Window>>> = (0..srcs.len()).map(eager).collect();
+        let loaded: Vec<Result<Option<Window>>> = ahead.into_iter().enumerate().map(eager).collect();
         diag.dec_ns.fetch_add(dec_clock.ns(), Ordering::Relaxed);
         let mut windows: Vec<Option<Window>> = Vec::with_capacity(loaded.len());
         for w in loaded {
             windows.push(w?);
         }
+
+        // Plan the next band now: its reads go out while this one samples.
+        // It is sized from this band's measured density, aiming just under
+        // the budget.
+        if r1 < out_size {
+            let band_rows = if est == 0 {
+                MAX_BAND_ROWS
+            } else {
+                let scaled = (r1 - r0) as f64 * (opts.band_budget_bytes as f64 / est as f64) * 0.9;
+                (scaled as usize).clamp(1, MAX_BAND_ROWS)
+            };
+            let plan_clock = Clock::now();
+            next = Some(plan_band(r1, band_rows, false));
+            geom_ns += plan_clock.ns();
+        }
+        // Sources this band read and the next does not: this tile is done
+        // with them (bands run north to south), so their open handles go
+        // first when the cache needs room.
+        chunk_cache.spare_files((0..srcs.len()).filter_map(|i| match &srcs[i] {
+            Src::File(f) if rects[i].is_some() && next.as_ref().map_or(true, |p| p.rects[i].is_none()) => Some(f.id),
+            _ => None,
+        }));
 
         // Shadowed windows, decoded once on first use by whichever row needs
         // them (other rows wait for that one decode).
@@ -2828,7 +3958,7 @@ pub fn process_tile_opts(
         let lazy_view = |i: usize| -> WinView<'_> {
             let loaded = lazy[i].get_or_init(|| {
                 let t = Clock::now();
-                let w = load(i);
+                let w = load(i, None);
                 diag.lazy_ns.fetch_add(t.ns(), Ordering::Relaxed);
                 w
             });
@@ -2899,51 +4029,62 @@ pub fn process_tile_opts(
                 }
             }
 
-            for (x, out_pixel) in row_buffer.iter_mut().enumerate() {
-                let mut val = VOID_ELEV;
-                // Consecutive candidates in the same CRS reuse the pixel's
-                // transformed cell footprint — one lerp per pixel per CRS, so a
-                // stack of same-CRS tiles costs what the old single-CRS loop cost.
-                let mut cached_geom = usize::MAX;
-                let mut cell = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            // Per block of 64 pixels (one geometry segment), the candidates
+            // that can hold any of its cell centres. Within a segment a
+            // centre coordinate is `c0 + step * lx` — monotone in `lx` — so
+            // its extremes over the block are at the block's first and last
+            // pixel, evaluated with the loop's own expressions; a projected
+            // candidate whose rectangle those extremes miss fails the
+            // containment test at every pixel of the block and is skipped
+            // there. The rest are scanned in priority order exactly as
+            // before, so the first source with ground wins at every pixel.
+            let block = 1usize << CHUNK_SHIFT;
+            let n_blocks = out_size.div_ceil(block);
+            let mut picks: Vec<u32> = Vec::with_capacity(row_srcs.len() * 2);
+            let mut starts: Vec<u32> = Vec::with_capacity(n_blocks + 1);
+            let mut centres: Vec<Option<(f64, f64, f64, f64)>> = vec![None; row_geoms.len()];
+            for b in 0..n_blocks {
+                starts.push(picks.len() as u32);
+                let (bx0, bx1) = (b * block, ((b + 1) * block).min(out_size));
+                for (slot, geom) in centres.iter_mut().zip(row_geoms) {
+                    *slot = geom.as_ref().map(|g| centre_bounds(g, bx0, bx1 - 1));
+                }
+                for (j, src) in row_srcs.iter().enumerate() {
+                    let keep = match src {
+                        RowSrc::Geo { .. } => true,
+                        RowSrc::Prj { img, geom_idx, .. } => centres[*geom_idx].map_or(true, |c| may_hold(img, c)),
+                    };
+                    if keep {
+                        picks.push(j as u32);
+                    }
+                }
+            }
+            starts.push(picks.len() as u32);
 
-                for src in row_srcs.iter_mut() {
-                    match src {
-                        RowSrc::Geo { win, lazy, spans, py0, py1 } => {
-                            let (px0, px1) = spans[x];
-                            if px0 < px1 {
-                                if let Some(i) = *lazy {
-                                    *lazy = None;
-                                    *win = lazy_view(i);
-                                }
-                                if let Some(v) = sample_cell(win, px0, px1, *py0, *py1, &mut row_miss) {
-                                    val = v;
-                                    break;
-                                }
-                            }
-                        }
-                        RowSrc::Prj { img, win, lazy, inv_x, inv_y, geom_idx } => {
-                            if *geom_idx != cached_geom {
-                                // The cell this output pixel stands for: one
-                                // output pixel wide and one output row tall,
-                                // centred on the cell's own centre (e, n) — the
-                                // ground footprint CONTRACT §6 promises the
-                                // average is taken over.
-                                let geom = row_geoms[*geom_idx].as_ref().unwrap();
-                                let seg = &geom.segs[x >> geom.shift];
-                                let lx = (x & geom.mask) as f64;
-                                let e = seg.e0 + seg.step_e * lx;
-                                let n = seg.n0 + seg.step_n * lx;
+            for b in 0..n_blocks {
+                let cands = &picks[starts[b] as usize..starts[b + 1] as usize];
+                let (bx0, bx1) = (b * block, ((b + 1) * block).min(out_size));
+
+                // Fast path: one projected candidate for the whole block — the
+                // inside of a source file, where at ratio ~1 every cell is one
+                // sample. The same arithmetic per pixel as the loop below,
+                // in the same order, without the candidate scan: the block's
+                // segment is fixed, and the footprint edges are formed only
+                // when the centre is inside the file.
+                if let [j] = *cands {
+                    if let RowSrc::Prj { img, win, lazy, inv_x, inv_y, geom_idx } = &mut row_srcs[j as usize] {
+                        let geom = row_geoms[*geom_idx].as_ref().unwrap();
+                        let seg = &geom.segs[bx0 >> geom.shift];
+                        for (x, out_pixel) in (bx0..bx1).zip(&mut row_buffer[bx0..bx1]) {
+                            let lx = (x & geom.mask) as f64;
+                            let e = seg.e0 + seg.step_e * lx;
+                            let n = seg.n0 + seg.step_n * lx;
+                            let mut val = VOID_ELEV;
+                            if n <= img.origin_n && n >= img.limit_n && e >= img.origin_e && e < img.limit_e {
                                 let e_lo = e - seg.step_e * 0.5;
                                 let e_hi = e + seg.step_e * 0.5;
                                 let half_n = (n - (seg.nlo0 + seg.step_nlo * lx)) * 0.5;
-                                cell = (e, n, e_lo, e_hi, n + half_n, n - half_n);
-                                cached_geom = *geom_idx;
-                            }
-                            let (e, n, e_lo, e_hi, n_hi, n_lo) = cell;
-                            if n <= img.origin_n && n >= img.limit_n
-                                && e >= img.origin_e && e < img.limit_e
-                            {
+                                let (n_hi, n_lo) = (n + half_n, n - half_n);
                                 let (px0, px1) = sample_span(
                                     (e_lo - img.origin_e) * *inv_x,
                                     (e_hi - img.origin_e) * *inv_x,
@@ -2954,29 +4095,105 @@ pub fn process_tile_opts(
                                     (img.origin_n - n_lo) * *inv_y,
                                     img.height,
                                 );
-                                // First source that has real ground under the cell
-                                // wins, as before. The footprint is clipped to that
-                                // one image, so a cell straddling two source tiles
-                                // averages the part inside the tile its corner
-                                // landed in — still an average of real terrain.
                                 if let Some(i) = *lazy {
                                     *lazy = None;
                                     *win = lazy_view(i);
                                 }
                                 if let Some(v) = sample_cell(win, px0, px1, py0, py1, &mut row_miss) {
                                     val = v;
-                                    break;
+                                }
+                            }
+                            if val == VOID_ELEV {
+                                *out_pixel = void_fill;
+                            } else {
+                                row_covered += 1;
+                                *out_pixel = val;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                for x in bx0..bx1 {
+                    let out_pixel = &mut row_buffer[x];
+                    let mut val = VOID_ELEV;
+                    // Consecutive candidates in the same CRS reuse the pixel's
+                    // transformed cell footprint — one lerp per pixel per CRS, so a
+                    // stack of same-CRS tiles costs what the old single-CRS loop cost.
+                    let mut cached_geom = usize::MAX;
+                    let mut cell = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+
+                    for &j in cands {
+                        match &mut row_srcs[j as usize] {
+                            RowSrc::Geo { win, lazy, spans, py0, py1 } => {
+                                let (px0, px1) = spans[x];
+                                if px0 < px1 {
+                                    if let Some(i) = *lazy {
+                                        *lazy = None;
+                                        *win = lazy_view(i);
+                                    }
+                                    if let Some(v) = sample_cell(win, px0, px1, *py0, *py1, &mut row_miss) {
+                                        val = v;
+                                        break;
+                                    }
+                                }
+                            }
+                            RowSrc::Prj { img, win, lazy, inv_x, inv_y, geom_idx } => {
+                                if *geom_idx != cached_geom {
+                                    // The cell this output pixel stands for: one
+                                    // output pixel wide and one output row tall,
+                                    // centred on the cell's own centre (e, n) — the
+                                    // ground footprint CONTRACT §6 promises the
+                                    // average is taken over.
+                                    let geom = row_geoms[*geom_idx].as_ref().unwrap();
+                                    let seg = &geom.segs[x >> geom.shift];
+                                    let lx = (x & geom.mask) as f64;
+                                    let e = seg.e0 + seg.step_e * lx;
+                                    let n = seg.n0 + seg.step_n * lx;
+                                    let e_lo = e - seg.step_e * 0.5;
+                                    let e_hi = e + seg.step_e * 0.5;
+                                    let half_n = (n - (seg.nlo0 + seg.step_nlo * lx)) * 0.5;
+                                    cell = (e, n, e_lo, e_hi, n + half_n, n - half_n);
+                                    cached_geom = *geom_idx;
+                                }
+                                let (e, n, e_lo, e_hi, n_hi, n_lo) = cell;
+                                if n <= img.origin_n && n >= img.limit_n
+                                    && e >= img.origin_e && e < img.limit_e
+                                {
+                                    let (px0, px1) = sample_span(
+                                        (e_lo - img.origin_e) * *inv_x,
+                                        (e_hi - img.origin_e) * *inv_x,
+                                        img.width,
+                                    );
+                                    let (py0, py1) = sample_span(
+                                        (img.origin_n - n_hi) * *inv_y,
+                                        (img.origin_n - n_lo) * *inv_y,
+                                        img.height,
+                                    );
+                                    // First source that has real ground under the cell
+                                    // wins, as before. The footprint is clipped to that
+                                    // one image, so a cell straddling two source tiles
+                                    // averages the part inside the tile its corner
+                                    // landed in — still an average of real terrain.
+                                    if let Some(i) = *lazy {
+                                        *lazy = None;
+                                        *win = lazy_view(i);
+                                    }
+                                    if let Some(v) = sample_cell(win, px0, px1, py0, py1, &mut row_miss) {
+                                        val = v;
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                if val == VOID_ELEV {
-                    *out_pixel = void_fill;
-                } else {
-                    row_covered += 1;
-                    *out_pixel = val;
+                    if val == VOID_ELEV {
+                        *out_pixel = void_fill;
+                    } else {
+                        row_covered += 1;
+                        *out_pixel = val;
+                    }
                 }
             }
             covered_px.fetch_add(row_covered, Ordering::Relaxed);
@@ -3016,47 +4233,45 @@ pub fn process_tile_opts(
                 job.output_path, r0, r1
             );
         }
+        // The band's window buffers go back for the next band's windows.
+        let lazy_windows = lazy.into_iter().filter_map(|c| c.into_inner().and_then(Result::ok).flatten());
+        for w in windows.into_iter().flatten().chain(lazy_windows) {
+            if let WinBuf::Own(v) = w.buf {
+                give_buf(&win_pool, v, KEEP_WIN_BYTES.min(opts.band_budget_bytes));
+            }
+        }
         bands += 1;
-        // Size the next band from this one's measured density, aiming just
-        // under the budget.
-        band_rows = if est == 0 {
-            MAX_BAND_ROWS
-        } else {
-            let scaled = (r1 - r0) as f64 * (opts.band_budget_bytes as f64 / est as f64) * 0.9;
-            (scaled as usize).clamp(1, MAX_BAND_ROWS)
-        };
-        r0 = r1;
     }
     drop(hold);
 
-    // The per-tile diagnostic line (stdout; changelog 31, not parsed). Header
+    // The per-tile diagnostic line (changelog 31/37, not parsed). Header
     // averages are over the headers this tile actually read (cache misses);
     // deferred window loads run inside sampling and are counted as decode.
-    {
+    // Printed once the tile is written (or has failed after sampling).
+    let line = {
         let opens = diag.hdr_opens.load(Ordering::Relaxed);
         let avg_ms = |ns: &AtomicU64| {
             if opens > 0 { ns.load(Ordering::Relaxed) as f64 / opens as f64 / 1e6 } else { 0.0 }
         };
         let lazy_ns = diag.lazy_ns.load(Ordering::Relaxed);
-        let name = job.output_path.file_name().map_or_else(
-            || job.output_path.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
-        println!(
-            "[Rust] tile {}: {} sources, header {:.1}s (open {:.1} ms, read {:.1} ms avg), \
-             decode {:.1}s ({} files, {:.1} MB read), sample {:.1}s, bands {}",
-            name,
-            sources.len(),
-            hdr_ns as f64 / 1e9,
-            avg_ms(&diag.hdr_open_ns),
-            avg_ms(&diag.hdr_read_ns),
-            (diag.dec_ns.load(Ordering::Relaxed) + lazy_ns) as f64 / 1e9,
-            dec_files.iter().filter(|f| f.load(Ordering::Relaxed)).count(),
-            diag.dec_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0),
-            sample_ns.saturating_sub(lazy_ns) as f64 / 1e9,
-            bands
-        );
-    }
+        TileLine {
+            name: job.output_path.file_name().map_or_else(
+                || job.output_path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
+            sources: sources.len(),
+            header_s: hdr_ns as f64 / 1e9,
+            open_ms: avg_ms(&diag.hdr_open_ns),
+            read_ms: avg_ms(&diag.hdr_read_ns),
+            decode_s: (diag.dec_ns.load(Ordering::Relaxed) + lazy_ns) as f64 / 1e9,
+            files: reads.files.iter().filter(|f| f.load(Ordering::Relaxed)).count(),
+            mb: (diag.dec_bytes.load(Ordering::Relaxed) + reads.bytes.load(Ordering::Relaxed)) as f64
+                / (1024.0 * 1024.0),
+            sample_s: sample_ns.saturating_sub(lazy_ns) as f64 / 1e9,
+            bands,
+            geom_s: geom_ns as f64 / 1e9,
+        }
+    };
 
     let stats = TileStats {
         covered_px: covered_px.load(Ordering::Relaxed),
@@ -3065,161 +4280,161 @@ pub fn process_tile_opts(
         bands,
     };
 
-    // Building Rasterization
-    if let Some(fgb) = &job.buildings_file {
-        // A buildings source that cannot be read fails the tile, exactly as an
-        // unusable `buildings_pbf_dir` does below. This used to warn and exit 0,
-        // which wrote building-less terrain under an identity that claims
-        // buildings — a cache hit forever, for every later run.
-        if let Err(e) = apply_buildings(&job, &mut buffer, fgb, pixel_deg) {
-            anyhow::bail!(
-                "failed to apply buildings from buildings_file {:?} to {:?}: {:#}; \
-                 refusing to write a building-less tile",
-                fgb,
-                job.output_path,
-                e
-            );
-        }
-    }
-    match (&job.buildings_pbf_dir, pbf_buildings) {
-        (Some(_), Some(set)) => apply_buildings_pbf(&job, &mut buffer, set, pixel_deg),
-        (Some(dir), None) => anyhow::bail!(
-            "buildings_pbf_dir {:?} was requested but no decoded building set was \
-             supplied for {:?}; refusing to write a building-less tile",
-            dir,
-            job.output_path
-        ),
-        (None, _) => {}
-    }
-
-    let format_str = job.format.as_deref().unwrap_or("r16sint");
-    let is_bc6h = format_str.eq_ignore_ascii_case("bc6h");
-
-    #[cfg(not(feature = "bc6h"))]
-    if is_bc6h {
-        return Err(anyhow::anyhow!("BC6H format requested but binary was built without the 'bc6h' feature"));
-    }
-
-    // Dynamic BaseElev calculation for BC6H
-    let mut base_elev = 0i16;
-    if is_bc6h {
-        let mut min_elev = i16::MAX;
-        for &v in buffer.iter() {
-            if v > -5000 && v < min_elev {
-                min_elev = v;
+    // Everything after sampling. A failure here still prints the tile's
+    // diagnostic line (its terrain was sampled), then fails the tile.
+    let finished = (|| -> Result<(Vec<u8>, TileBody)> {
+        let mut buffer = buffer;
+        // Building Rasterization
+        if let Some(fgb) = &job.buildings_file {
+            // A buildings source that cannot be read fails the tile, exactly as an
+            // unusable `buildings_pbf_dir` does below. This used to warn and exit 0,
+            // which wrote building-less terrain under an identity that claims
+            // buildings — a cache hit forever, for every later run.
+            if let Err(e) = apply_buildings(&job, &mut buffer, fgb, pixel_deg) {
+                anyhow::bail!(
+                    "failed to apply buildings from buildings_file {:?} to {:?}: {:#}; \
+                     refusing to write a building-less tile",
+                    fgb,
+                    job.output_path,
+                    e
+                );
             }
         }
-        if min_elev == i16::MAX { min_elev = 0; }
-        base_elev = min_elev;
-    }
-
-    if let Some(dir) = job.output_path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating output directory {:?}", dir))?;
-    }
-    // Written to `<output>.tmp-<pid>` beside the output and renamed over it
-    // only once flushed and synced ([`TileFile`]): a failed write (a full
-    // disk) leaves no truncated tile under the final name, and an existing
-    // tile is replaced by a new inode instead of being truncated in place —
-    // views hardlink pool tiles, and their inode stays intact.
-    let mut w = TileFile::create(&job.output_path)?;
-
-    w.write_all(b"AETH")?;
-
-    // Version 2 for BC6H, Version 1 for legacy R16SINT
-    let version = if is_bc6h { 2u16 } else { 1u16 };
-    w.write_u16::<LittleEndian>(version)?;
-    w.write_u16::<LittleEndian>(job.size_px as u16)?;
-    w.write_f64::<LittleEndian>(job.ul_lat)?;
-    w.write_f64::<LittleEndian>(job.ul_lon)?;
-    w.write_f64::<LittleEndian>(pixel_deg)?;
-    w.write_f64::<LittleEndian>(pixel_deg)?;
-    w.write_i16::<LittleEndian>(base_elev)?;
-
-    let bytes_per_row_r16 = job.size_px as u32 * 2;
-    let aligned_stride_r16 = (bytes_per_row_r16 + 255) & !255;
-
-    // Calculate final physical row stride (to skip padding during decode)
-    let final_stride = if is_bc6h {
-        // BC6H block is 16 bytes. Row stride is the width of blocks * 16.
-        ((job.size_px + 3) / 4 * 16) as u16
-    } else {
-        aligned_stride_r16 as u16
-    };
-    w.write_u16::<LittleEndian>(final_stride)?;
-
-    #[cfg(feature = "bc6h")]
-    if is_bc6h {
-         // 1. Map terrain to 0-aligned RGBA float buffer
-        let mut rgba = vec![0.0f32; total_pixels * 4];
-        for (i, &v) in buffer.iter().enumerate() {
-            let real_val = if v > -5000 {
-                (v - base_elev) as f32 * 0.5 + 1.0
-            } else {
-                0.0
-            };
-            rgba[i * 4] = real_val;
-            rgba[i * 4 + 1] = real_val;
-            rgba[i * 4 + 2] = real_val;
-            rgba[i * 4 + 3] = 1.0;
+        match (&job.buildings_pbf_dir, pbf_buildings) {
+            (Some(_), Some(set)) => apply_buildings_pbf(&job, &mut buffer, set, pixel_deg),
+            (Some(dir), None) => anyhow::bail!(
+                "buildings_pbf_dir {:?} was requested but no decoded building set was \
+                 supplied for {:?}; refusing to write a building-less tile",
+                dir,
+                job.output_path
+            ),
+            (None, _) => {}
         }
 
-        // ═════════════════════════════════════════════════════════════════════
-        // [BC6H-DEBUG] Sample values before encoding
-        // ═════════════════════════════════════════════════════════════════════
-        let sample_positions: Vec<(usize, usize)> = vec![
-            (0, 0), (1, 0), (2, 0), (3, 0),
-            (0, 1), (1, 1), (2, 1), (3, 1),
-            (out_size/2, out_size/2),
-            (out_size/2+1, out_size/2),
-            (out_size-1, out_size-1),
-        ];
-        eprintln!("[BC6H-DEBUG] PRE-ENCODE sample values:");
-        for &(x, y) in &sample_positions {
-            if x < out_size && y < out_size {
-                let idx = y * out_size + x;
-                eprintln!("[BC6H-DEBUG]   px({:4},{:4}) raw_i16={:6} → R={:12.4}",
-                          x, y, buffer[idx], rgba[idx * 4]);
+        let format_str = job.format.as_deref().unwrap_or("r16sint");
+        let is_bc6h = format_str.eq_ignore_ascii_case("bc6h");
+
+        #[cfg(not(feature = "bc6h"))]
+        if is_bc6h {
+            return Err(anyhow::anyhow!("BC6H format requested but binary was built without the 'bc6h' feature"));
+        }
+
+        // Dynamic BaseElev calculation for BC6H
+        let mut base_elev = 0i16;
+        if is_bc6h {
+            let mut min_elev = i16::MAX;
+            for &v in buffer.iter() {
+                if v > -5000 && v < min_elev {
+                    min_elev = v;
+                }
             }
+            if min_elev == i16::MAX { min_elev = 0; }
+            base_elev = min_elev;
         }
 
-        // 2. Encode
-        let surface = SurfaceRgba32Float {
-            width: job.size_px,
-            height: job.size_px,
-            depth: 1,
-            layers: 1,
-            mipmaps: 1,
-            data: rgba.clone(),
+        // The 44-byte header (contract §6), assembled here and written with the
+        // payload by `write_tile`.
+        let mut w: Vec<u8> = Vec::with_capacity(ABT_HEADER_BYTES as usize);
+
+        w.write_all(b"AETH")?;
+
+        // Version 2 for BC6H, Version 1 for legacy R16SINT
+        let version = if is_bc6h { 2u16 } else { 1u16 };
+        w.write_u16::<LittleEndian>(version)?;
+        w.write_u16::<LittleEndian>(job.size_px as u16)?;
+        w.write_f64::<LittleEndian>(job.ul_lat)?;
+        w.write_f64::<LittleEndian>(job.ul_lon)?;
+        w.write_f64::<LittleEndian>(pixel_deg)?;
+        w.write_f64::<LittleEndian>(pixel_deg)?;
+        w.write_i16::<LittleEndian>(base_elev)?;
+
+        let bytes_per_row_r16 = job.size_px as u32 * 2;
+        let aligned_stride_r16 = (bytes_per_row_r16 + 255) & !255;
+
+        // Calculate final physical row stride (to skip padding during decode)
+        let final_stride = if is_bc6h {
+            // BC6H block is 16 bytes. Row stride is the width of blocks * 16.
+            ((job.size_px + 3) / 4 * 16) as u16
+        } else {
+            aligned_stride_r16 as u16
         };
+        w.write_u16::<LittleEndian>(final_stride)?;
+        let header = w;
 
-        eprintln!("[BC6H-DEBUG] Calling image_dds encode(BC6Sfloat, Fast) ...");
-        let dds_surface = surface.encode(
-            ImageFormat::BC6Ufloat,
-            Quality::Fast,
-            Mipmaps::Disabled
-        ).map_err(|e| anyhow::anyhow!("BC6H Encoding failed: {:?}", e))?;
-
-        w.write_all(&dds_surface.data)?;
-    }
-
-    if !is_bc6h {
-        // Legacy R16SINT writing with 256-byte pitch padding
-        let padding_bytes = aligned_stride_r16 - bytes_per_row_r16;
-        let padding_buf = vec![0u8; padding_bytes as usize];
-        for chunk in buffer.chunks(job.size_px as usize) {
-            let ptr = chunk.as_ptr() as *const u8;
-            let len = chunk.len() * 2;
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            w.write_all(slice)?;
-            if padding_bytes > 0 {
-                w.write_all(&padding_buf)?;
+        #[cfg(feature = "bc6h")]
+        if is_bc6h {
+             // 1. Map terrain to 0-aligned RGBA float buffer
+            let mut rgba = vec![0.0f32; total_pixels * 4];
+            for (i, &v) in buffer.iter().enumerate() {
+                let real_val = if v > -5000 {
+                    (v - base_elev) as f32 * 0.5 + 1.0
+                } else {
+                    0.0
+                };
+                rgba[i * 4] = real_val;
+                rgba[i * 4 + 1] = real_val;
+                rgba[i * 4 + 2] = real_val;
+                rgba[i * 4 + 3] = 1.0;
             }
+
+            // ═════════════════════════════════════════════════════════════════════
+            // [BC6H-DEBUG] Sample values before encoding
+            // ═════════════════════════════════════════════════════════════════════
+            let sample_positions: Vec<(usize, usize)> = vec![
+                (0, 0), (1, 0), (2, 0), (3, 0),
+                (0, 1), (1, 1), (2, 1), (3, 1),
+                (out_size/2, out_size/2),
+                (out_size/2+1, out_size/2),
+                (out_size-1, out_size-1),
+            ];
+            eprintln!("[BC6H-DEBUG] PRE-ENCODE sample values:");
+            for &(x, y) in &sample_positions {
+                if x < out_size && y < out_size {
+                    let idx = y * out_size + x;
+                    eprintln!("[BC6H-DEBUG]   px({:4},{:4}) raw_i16={:6} → R={:12.4}",
+                              x, y, buffer[idx], rgba[idx * 4]);
+                }
+            }
+
+            // 2. Encode
+            let surface = SurfaceRgba32Float {
+                width: job.size_px,
+                height: job.size_px,
+                depth: 1,
+                layers: 1,
+                mipmaps: 1,
+                data: rgba.clone(),
+            };
+
+            eprintln!("[BC6H-DEBUG] Calling image_dds encode(BC6Sfloat, Fast) ...");
+            let dds_surface = surface.encode(
+                ImageFormat::BC6Ufloat,
+                Quality::Fast,
+                Mipmaps::Disabled
+            ).map_err(|e| anyhow::anyhow!("BC6H Encoding failed: {:?}", e))?;
+
+            return Ok((header, TileBody::Raw(dds_surface.data)));
+        }
+
+        let padding_bytes = aligned_stride_r16 - bytes_per_row_r16;
+        Ok((header, TileBody::Rows { buf: buffer, size: job.size_px as usize, pad: padding_bytes as usize }))
+    })();
+    match finished {
+        Ok((header, body)) => Ok(ReadyTile {
+            dst: job.output_path,
+            header,
+            body,
+            stats,
+            line,
+            t0,
+            #[cfg(test)]
+            fail_after: FAIL_TILE_WRITES_AFTER.with(|c| c.get()),
+        }),
+        Err(e) => {
+            line.print(0, t0.ns());
+            Err(e)
         }
     }
-    w.commit()?;
-
-    Ok(stats)
 }
 
 #[cfg(test)]
@@ -3282,14 +4497,25 @@ impl TileFile {
         PathBuf::from(s)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn create(dst: &Path) -> Result<TileFile> {
+        Self::open_temp(
+            dst,
+            #[cfg(test)]
+            FAIL_TILE_WRITES_AFTER.with(|c| c.get()),
+        )
+    }
+
+    /// [`TileFile::create`] with the test hook passed in rather than read
+    /// from this thread (the tile may be written on another one).
+    fn open_temp(dst: &Path, #[cfg(test)] fail_after: Option<usize>) -> Result<TileFile> {
         let tmp = Self::temp_path(dst);
         let file = File::create(&tmp)
             .with_context(|| format!("creating output tile {:?} (as {:?})", dst, tmp))?;
         let sink = TileSink {
             file,
             #[cfg(test)]
-            fail_after: FAIL_TILE_WRITES_AFTER.with(|c| c.get()),
+            fail_after,
         };
         Ok(TileFile {
             w: Some(BufWriter::with_capacity(1024 * 1024, sink)),
@@ -3304,15 +4530,55 @@ impl TileFile {
     pub(crate) fn commit(mut self) -> Result<()> {
         let mut w = self.w.take().expect("a TileFile is committed once");
         w.flush().with_context(|| format!("writing output tile {:?}", self.tmp))?;
-        w.get_ref()
-            .file
-            .sync_data()
-            .with_context(|| format!("syncing output tile {:?}", self.tmp))?;
+        // Durability where the volume offers it: a filesystem without fsync
+        // support (network and exFAT mounts, macOS F_FULLFSYNC on SMB) must
+        // not fail every tile — the rename below still replaces the output
+        // atomically. Any other sync error is still the tile's error.
+        if let Err(e) = w.get_ref().file.sync_data() {
+            if !sync_unsupported(&e) {
+                return Err(e).with_context(|| format!("syncing output tile {:?}", self.tmp));
+            }
+        }
         drop(w); // closed before the rename: an open handle can fail it on Windows
-        fs::rename(&self.tmp, &self.dst)
+        rename_with_retry(&self.tmp, &self.dst)
             .with_context(|| format!("renaming {:?} over output tile {:?}", self.tmp, self.dst))?;
         self.done = true;
         Ok(())
+    }
+}
+
+/// `sync_data` errors that mean "this volume cannot sync" rather than "the
+/// data did not reach the disk": `Unsupported` (ENOTSUP / EOPNOTSUPP) and
+/// `InvalidInput` (EINVAL, which some network and exFAT mounts answer).
+fn sync_unsupported(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput)
+}
+
+/// A rename refused for a moment: on Windows a file a scanner (Defender's
+/// on-close scan) or an indexer still holds open answers "access denied" or
+/// a sharing violation (os errors 5 and 32) until it lets go. POSIX renames
+/// never fail that way, so the loop runs once there.
+fn rename_transient(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+        || (cfg!(windows) && matches!(e.raw_os_error(), Some(5) | Some(32)))
+}
+
+/// `fs::rename` that waits out a transient refusal ([`rename_transient`]):
+/// up to ten attempts 100 ms apart, then the last error. Single attempt on
+/// wasm32 (no sleeping there).
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let retries = if cfg!(target_arch = "wasm32") { 0 } else { 9 };
+    let mut attempt = 0;
+    loop {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < retries && rename_transient(&e) => {
+                attempt += 1;
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -4199,14 +5465,16 @@ mod tests {
         buf.truncate(44 + 280 * stride + 100);
         std::fs::write(&path, &buf).unwrap();
 
-        let src = read_file_source(&path, None).unwrap();
-        let cache = ChunkCache::new(1 << 20);
+        let src = Arc::new(read_file_source(&path, None).unwrap());
+        let cache = Arc::new(ChunkCache::new(1 << 20));
         let hold: TileHold = std::sync::Mutex::new(HashMap::new());
+        let reads = TileReads::new(1);
+        let pool: WinPool = std::sync::Mutex::new(Vec::new());
         // Rows of the intact first strip load, and hold the stored values.
-        let w = load_window(&src, (5, 300, 10, 100), &cache, &hold).unwrap();
+        let w = load_window(&src, 0, (5, 300, 10, 100), &cache, &hold, None, &reads, &pool).unwrap();
         assert_eq!(w.data()[0], 15);
         assert_eq!(w.data()[(99 - 10) * w.stride + (299 - 5)], 398);
-        let err = load_window(&src, (0, 300, 250, 290), &cache, &hold).err().unwrap();
+        let err = load_window(&src, 0, (0, 300, 250, 290), &cache, &hold, None, &reads, &pool).err().unwrap();
         assert!(
             format!("{err:#}").contains("truncated .abt payload (row 280 of 300 is incomplete)"),
             "got {err:#}"
@@ -4234,6 +5502,48 @@ mod tests {
         let [w, s, e, n] = wgs84_bbox_of_projected(&g, &proj, wgs84()).unwrap();
         assert!((w - 7.43864).abs() < 1e-3 && (n - 46.95108).abs() < 1e-3, "NW corner {w} {n}");
         assert!((e - w - 0.0131).abs() < 5e-4 && (n - s - 0.0090).abs() < 5e-4, "span {} x {}", e - w, n - s);
+    }
+
+    /// Every float of a row's geometry, as bits.
+    fn geom_bits(g: &Option<RowGeom>) -> Option<Vec<u64>> {
+        let g = g.as_ref()?;
+        let mut v = vec![g.shift as u64, g.mask as u64, g.min_e.to_bits(), g.max_e.to_bits(), g.min_n.to_bits(), g.max_n.to_bits()];
+        for s in &g.segs {
+            v.extend([s.e0, s.n0, s.nlo0, s.step_e, s.step_n, s.step_nlo].map(f64::to_bits));
+        }
+        Some(v)
+    }
+
+    #[test]
+    fn shared_row_geometry_is_identical_to_the_per_row_one() {
+        // LV95 (chunked rows) at 2 m and 10 m, UTM 32N, and a tiny tile
+        // whose rows take the single-segment path; runs of shared rows
+        // against make_row_geom row by row, bit for bit.
+        let cases = [
+            ("EPSG:2056", 47.0, 7.5, 2.0, 5556usize, 2.0),
+            ("EPSG:2056", 46.9, 7.8, 10.0, 2780, 2.0),
+            ("EPSG:32632", 47.25, 8.25, 10.0, 2780, 1.0),
+            ("EPSG:2056", 47.0, 7.5, 2.0, 24, 2.0),
+        ];
+        for (crs, ul_lat, ul_lon, res, size, min_scale) in cases {
+            let dst = Proj::from_proj_string(&crs_to_proj_string(crs, Path::new("t")).unwrap()).unwrap();
+            let pd = res * (1.0 / 111111.0);
+            let (lat_c, lon_c) = (ul_lat - 0.5 * pd, ul_lon + 0.5 * pd);
+            let row_lat_of = |y: usize| lat_c - (y as f64 * pd);
+            let rows = 300.min(size);
+            let shared = band_row_geoms(wgs84(), &dst, min_scale, (3, 3 + rows), &row_lat_of, lon_c, pd, size);
+            let mut reused = 0;
+            for (k, got) in shared.iter().enumerate() {
+                let y = 3 + k;
+                let want = make_row_geom(wgs84(), &dst, row_lat_of(y), row_lat_of(y) - pd, lon_c, pd, size, min_scale);
+                assert!(want.is_some(), "{crs} row {y} must transform");
+                assert_eq!(geom_bits(got), geom_bits(&want), "{crs} {res} m, {size} px: row {y}");
+                if k % ROW_RUN != 0 && (row_lat_of(y - 1) - pd).to_bits() == row_lat_of(y).to_bits() {
+                    reused += 1;
+                }
+            }
+            assert!(reused > rows / 3, "{crs}: the runs must actually share ({reused} of {rows})");
+        }
     }
 
     #[test]
