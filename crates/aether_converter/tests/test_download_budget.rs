@@ -103,6 +103,18 @@ fn two_far_corners_of_a_bbox_fetch_only_their_own_tiles_and_write_the_same_bytes
     let fb = lat.split(" first-byte avg=").nth(1)
         .and_then(|v| v.strip_suffix("ms")).and_then(|v| v.parse::<u64>().ok());
     assert!(fb.is_some(), "want `… max=<n>ms first-byte avg=<n>ms`: {lat}");
+    // Changelog 39: the budget is read once and fixed for the run, and the
+    // run ends with how long the launch gate kept the network idle (a
+    // diagnostic: stderr here, as AETHER_DIAG_FILE is not set).
+    let budget_lines: Vec<&str> = err.lines().filter(|l| l.starts_with("[Download] RAM budget: ")).collect();
+    assert_eq!(budget_lines.len(), 1, "{err}");
+    assert!(budget_lines[0].ends_with(" GB available at start; fixed for the run)"), "{}", budget_lines[0]);
+    let gate = err.lines().find(|l| l.starts_with("[Download] launch gate closed for "))
+        .unwrap_or_else(|| panic!("no launch-gate line; stderr:\n{err}"));
+    let secs = gate.strip_prefix("[Download] launch gate closed for ")
+        .and_then(|v| v.strip_suffix(" s (assembly behind the network)"))
+        .and_then(|v| v.parse::<f64>().ok());
+    assert!(secs.is_some_and(|s| s >= 0.0), "{gate}");
 
     // The whole rectangle, as before (comparison run): 30 tiles, same bytes.
     let (port, counts) = server();
@@ -147,6 +159,7 @@ fn strips_of_32_3_and_1_tile_rows_write_the_same_bytes() {
             .unwrap();
         let rows = fetched(&counts).iter().map(|t| t.1).collect::<std::collections::BTreeSet<_>>();
         assert_eq!(rows.len(), 8, "the job spans 8 tile-rows");
+        assert_eq!(report.held_at_end, 0, "every strip hands its bytes back: {report:?}");
         match cap {
             None => assert_eq!((report.strips, report.max_strip_rows), (1, 8), "{report:?}"),
             Some(3) => assert_eq!((report.strips, report.max_strip_rows), (3, 3), "{report:?}"),
@@ -214,6 +227,7 @@ fn the_first_tile_sets_the_edge_before_any_strip_is_sized() {
     assert_eq!(report.tiles_fetched, 64, "{report:?}");
     assert_eq!((report.first_strip_rows, report.strips, report.max_strip_rows), (8, 2, 8),
                "both strips sized from the probed 256 px edge: {report:?}");
+    assert_eq!(report.held_at_end, 0, "{report:?}");
     let got = fetched(&counts); // asserts every tile was requested exactly once
     assert_eq!(got.len(), 64);
     assert_eq!(got.iter().map(|t| t.1).collect::<std::collections::BTreeSet<_>>().len(), 16);
@@ -248,6 +262,9 @@ fn a_failed_or_slow_edge_probe_sizes_the_first_strip_for_512_px_and_keeps_its_ti
         let report = run_download_tuned(&job, DownloadTuning { ram_budget: Some(BUDGET), ..Default::default() })
             .unwrap();
         assert_eq!(report.first_strip_rows, 2, "{label}: sized for 512 px: {report:?}");
+        // Its bytes were reckoned for 512 px tiles and 256 px ones arrived
+        // (one of them never): it still hands back exactly what it took.
+        assert_eq!(report.held_at_end, 0, "{label}: {report:?}");
         let at_z: Vec<usize> = counts.lock().unwrap().iter()
             .filter(|((z, _, _), _)| *z == Z).map(|(_, &n)| n).collect();
         assert_eq!(at_z.len(), 64, "{label}");

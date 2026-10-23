@@ -5,7 +5,9 @@
 //! (`waveshed/core/terrain_adapter.py` in the QGIS plugin) EXACTLY — the
 //! plugin cross-checks its own enumeration against this output and aborts on
 //! any mismatch. Every constant and rounding step below mirrors that file;
-//! do not "improve" the arithmetic without versioning the schema.
+//! do not "improve" the arithmetic without a version the plugin can gate on.
+//! (0.2.9 did, changelog 43: the plugin snaps and starts each resolution with
+//! the same 1e-9 tolerance and rounded edge for converters >= 0.2.9 only.)
 
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -23,11 +25,27 @@ const ABT_MAX_SIZE_PX: f64 = 32000.0;
 /// Hard ceiling on the enumeration; beyond this the bbox is a typo, not a plan.
 const MAX_TILES: usize = 2_000_000;
 
+/// Tolerance, in grid steps, of the outward snap and of each resolution's
+/// enumeration start (since 0.2.9, changelog 43). The plugin applies the same
+/// value (`_SNAP_EPS`) for converters >= 0.2.9 and only for them — both sides
+/// must enumerate alike or its pre-run cross-check aborts the run.
+const SNAP_EPS: f64 = 1e-9;
+
 /// Python's `round(x, 6)`, as specified for this geometry: f64,
 /// round-half-away-from-zero via `(x*1e6).round()/1e6`.
 #[inline]
 fn round6(x: f64) -> f64 {
     (x * 1e6).round() / 1e6
+}
+
+/// Python's `round(x, 9)` for a snapped edge `idx · finest`: the grid line as
+/// the nearest double of its decimal value. Such a product lies within
+/// ~1e-14 of a multiple of 0.1 / 0.25 / 0.5 / 1 / 2, nowhere near a tie at the
+/// ninth decimal, so this and Python's correctly rounded `round(…, 9)` agree
+/// on every grid line between ±180 for every extent (checked exhaustively).
+#[inline]
+fn round9(x: f64) -> f64 {
+    (x * 1e9).round() / 1e9
 }
 
 fn extent_for_resolution(res: u32) -> f64 {
@@ -98,9 +116,12 @@ fn tile_params(sub: f64, lat: f64, lon: f64, res: u32) -> PlanTile {
 /// Build the plan for a bbox and a set of integer resolutions.
 ///
 /// The bbox is snapped OUTWARD on the finest sub-tile grid among the
-/// requested resolutions, then each resolution (ascending) is enumerated over
-/// the snapped bbox — lat/lon from `floor(edge/sub)*sub`, stepping
-/// `round6(x + sub)`, while strictly below the far edge.
+/// requested resolutions — `idx = floor(x / finest + 1e-9)` for south/west,
+/// `ceil(x / finest - 1e-9)` for north/east, edge `round(idx * finest, 9)` —
+/// then each resolution (ascending) is enumerated over the snapped bbox:
+/// lat/lon from `floor(edge / sub + 1e-9) * sub`, stepping `round6(x + sub)`,
+/// while strictly below the far edge. Before 0.2.9 the snap was the bare
+/// `floor/ceil(x / finest) * finest` and the start `floor(edge / sub) * sub`.
 pub fn build_plan(
     south: f64,
     north: f64,
@@ -162,17 +183,32 @@ pub fn build_plan(
         .iter()
         .map(|&r| subtile_degrees(r))
         .fold(f64::INFINITY, f64::min);
-    let snapped_south = (south / sub_finest).floor() * sub_finest;
-    let snapped_north = (north / sub_finest).ceil() * sub_finest;
-    let snapped_west = (west / sub_finest).floor() * sub_finest;
-    let snapped_east = (east / sub_finest).ceil() * sub_finest;
+    // Three float artefacts each grew the plan by a row or column of tiles
+    // wholly outside the area (fixed in 0.2.9, changelog 43):
+    //
+    // * an edge ON the grid whose quotient lands a hair past its line —
+    //   S 47.3 / 0.1 = 472.99999999999994 — was floored a whole step out:
+    //   the snap now tolerates SNAP_EPS grid steps;
+    // * the snapped edge was the bare product, which can land a hair past the
+    //   line the 6-decimal steps below arrive at — E 11.6466 → 117 · 0.1 =
+    //   11.700000000000001, while the steps reach 11.7, and `lon < east`
+    //   then held for one more column: the edge is now the line itself
+    //   (`round9`);
+    // * a resolution's first row/column, `floor(edge / sub)`, is taken a whole
+    //   step out when that quotient lands a hair short — 47.3 / 0.1 again,
+    //   now that the edge IS 47.3: the start tolerates SNAP_EPS too.
+    let line = |idx: f64| round9(idx * sub_finest);
+    let snapped_south = line((south / sub_finest + SNAP_EPS).floor());
+    let snapped_north = line((north / sub_finest - SNAP_EPS).ceil());
+    let snapped_west = line((west / sub_finest + SNAP_EPS).floor());
+    let snapped_east = line((east / sub_finest - SNAP_EPS).ceil());
 
     let mut tiles: Vec<PlanTile> = Vec::new();
     for &res in &res_list {
         let sub = subtile_degrees(res);
-        let mut lat = (snapped_south / sub).floor() * sub;
+        let mut lat = (snapped_south / sub + SNAP_EPS).floor() * sub;
         while lat < snapped_north {
-            let mut lon = (snapped_west / sub).floor() * sub;
+            let mut lon = (snapped_west / sub + SNAP_EPS).floor() * sub;
             while lon < snapped_east {
                 if tiles.len() >= MAX_TILES {
                     bail!(

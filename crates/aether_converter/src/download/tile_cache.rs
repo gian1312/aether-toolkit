@@ -28,10 +28,26 @@
 //!     14      4  yblock u32
 //!     18   5120  index: 256 entries of 20 bytes, entry i = tile y = yblock·256 + i:
 //!                  u64 offset of the body, u32 length, u8 status (0 unknown,
-//!                  1 present, 2 no tile = HTTP 404), 3 reserved bytes (0),
-//!                  u32 CRC-32 (IEEE) of the body
+//!                  1 present, 2 no tile = HTTP 404, 3 derived — changelog
+//!                  40), 3 reserved bytes (0), u32 CRC-32 (IEEE) of the body
 //!   5138      …  data region: bodies, appended
 //! ```
+//!
+//! **Deriving** (changelog 40, `aether_converter` 0.2.9; [`TileCache::derive`]):
+//! a fetch-set tile without a valid entry is built from the four tiles one
+//! zoom finer that cover it when the cache holds them — each a body, a 404,
+//! or itself derivable the same way, [`DERIVE_LEVELS`] zooms deep at most —
+//! so a job never fetches ground the cache holds at a finer zoom. Output
+//! pixel `(i, j)` is the mean of the 2 × 2 samples under it in the matching
+//! child, voids (samples at or below `NODATA_M`, a 404 child's whole
+//! quadrant) left out, void where all four are; four 404 children make a
+//! 404 (not stored: re-deriving it reads index entries only). The result is
+//! encoded in the service's own encoding as an 8-bit RGB PNG ([`Codec`])
+//! and stored with status 3, every derived intermediate too — a 2 × 2 mean
+//! of the service's finer tiles, NOT the service's own coarser tile. Pack
+//! version stays 1: a converter before 0.2.9 reads status 3 as unknown, a
+//! miss, and refetches the tile (rewriting the entry as status 1). Nothing
+//! is ever requested for a child.
 //!
 //! **Writing** (one writer thread per run, [`writer`]): the pack is locked
 //! (`flock` on unix, an exclusive-write open on Windows — see [`lock`]), the
@@ -44,9 +60,10 @@
 //! — delete the directory to reclaim the space.
 //!
 //! **Reading** takes no lock. Every entry is validated — the pack header must
-//! name this very column, a present body must lie inside the file past the
-//! index and match its CRC, a 404 entry must have length and CRC 0 — and any
-//! entry that fails is a miss: the tile is fetched and the entry rewritten.
+//! name this very column, a present or derived body must lie inside the
+//! file past the index and match its CRC, a 404 entry must have length and
+//! CRC 0 — and any entry that fails is a miss: the tile is derived or
+//! fetched, and the entry rewritten.
 //! A torn entry or a body cut short by a crash therefore costs one refetch,
 //! never a wrong tile. The data a valid entry points to is never rewritten in
 //! place, so an index read before another process rewrote the entry still
@@ -85,6 +102,16 @@ pub(super) const STATUS_UNKNOWN: u8 = 0;
 pub(super) const STATUS_PRESENT: u8 = 1;
 /// Index entry status: the service answered HTTP 404 — no tile here.
 pub(super) const STATUS_NO_TILE: u8 = 2;
+/// Index entry status: a body this cache derived from the four cached tiles
+/// one zoom finer (changelog 40) — validated and read like status 1.
+pub(super) const STATUS_DERIVED: u8 = 3;
+
+/// How many zooms below a tile [`TileCache::derive`] looks at most: its
+/// children (zoom + 1) may themselves be derived, down to zoom + 4, whose
+/// tiles must be cached as they are. A z11 tile from z15 is 4 + 16 + 64 +
+/// 256 child tiles; z15 → z11 is the 2 m/5 m pass → 90 m pass of the
+/// plugin.
+pub(super) const DERIVE_LEVELS: u32 = 4;
 
 /// How long the writer keeps trying to lock a pack another process holds
 /// before this run stops writing that pack (reported once per run).
@@ -256,7 +283,7 @@ impl Entry {
     /// present body's CRC is checked when it is read).
     fn usable(&self, file_len: u64) -> bool {
         match self.status {
-            STATUS_PRESENT => {
+            STATUS_PRESENT | STATUS_DERIVED => {
                 self.len > 0
                     && self.offset >= DATA_START
                     && self.offset.checked_add(self.len as u64).is_some_and(|end| end <= file_len)
@@ -274,6 +301,19 @@ pub(super) enum Cached {
     Body(Vec<u8>),
     /// The service answered HTTP 404: there is no tile here.
     NoTile,
+    /// A body this cache derived from finer cached tiles (status 3,
+    /// changelog 40): the 2 × 2 means, as a PNG in the service's encoding.
+    Derived(Vec<u8>),
+}
+
+impl Cached {
+    /// The tile's bytes, whether the service's or derived; `None` for a 404.
+    pub(super) fn body(&self) -> Option<&[u8]> {
+        match self {
+            Cached::Body(b) | Cached::Derived(b) => Some(b),
+            Cached::NoTile => None,
+        }
+    }
 }
 
 /// The header-checked index of the pack at `path` (256 entries) and the
@@ -406,9 +446,10 @@ pub(super) fn write_pack(path: &Path, key: PackKey, items: &[(usize, &Cached)]) 
             continue;
         }
         let e = match item {
-            Cached::Body(b) => {
+            Cached::Body(b) | Cached::Derived(b) => {
                 let Ok(n) = u32::try_from(b.len()) else { continue };
-                let e = Entry { offset: end + blob.len() as u64, len: n, status: STATUS_PRESENT, crc: crc32(b) };
+                let status = if matches!(item, Cached::Derived(_)) { STATUS_DERIVED } else { STATUS_PRESENT };
+                let e = Entry { offset: end + blob.len() as u64, len: n, status, crc: crc32(b) };
                 blob.extend_from_slice(b);
                 e
             }
@@ -502,6 +543,7 @@ pub(super) mod lock {
 #[derive(Default)]
 struct Counts {
     hits: AtomicUsize,
+    derived: AtomicUsize,
     fetched: AtomicUsize,
     written: AtomicUsize,
     parent_hits: AtomicUsize,
@@ -516,6 +558,9 @@ struct Counts {
 pub(super) enum Use {
     /// A source tile of the run's fetch set answered from the cache.
     Hit,
+    /// A source tile of the fetch set the cache derived from finer cached
+    /// tiles ([`TileCache::derive`], changelog 40) — a hit in every count.
+    Derived,
     /// A source tile of the fetch set that went to the network.
     Fetched,
     /// A coarser tile the parent fill needed, answered from the cache.
@@ -527,8 +572,13 @@ pub(super) enum Use {
 /// The run's cache totals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Summary {
+    /// Fetch-set tiles read from their own entries.
     pub hits: usize,
+    /// Fetch-set tiles derived from finer cached tiles (changelog 40).
+    pub derived: usize,
     pub fetched: usize,
+    /// Entries written for the fetch set: fetched answers, derived tiles and
+    /// their derived intermediates.
     pub written: usize,
     pub parent_hits: usize,
     pub parent_fetched: usize,
@@ -537,12 +587,14 @@ pub(super) struct Summary {
 }
 
 impl Summary {
-    /// The `[Stats]` lines (additive, informational): fetch-set tiles always,
-    /// the parent fill's coarser tiles when it used the cache.
+    /// The `[Stats]` lines (additive, informational): fetch-set tiles always
+    /// — `<hits>` counts the derived ones too, so `<hits> + <fetched>` is
+    /// still the pass total — the parent fill's coarser tiles when it used
+    /// the cache.
     pub(super) fn lines(&self, cache_dir: &Path) -> Vec<String> {
         let mut out = vec![format!(
-            "[Stats] Cache: {} hits, {} fetched, {} written to {}",
-            self.hits, self.fetched, self.written, cache_dir.display()
+            "[Stats] Cache: {} hits ({} derived), {} fetched, {} written to {}",
+            self.hits + self.derived, self.derived, self.fetched, self.written, cache_dir.display()
         )];
         if self.parent_hits + self.parent_fetched > 0 {
             out.push(format!(
@@ -577,6 +629,10 @@ pub(super) struct TileCache {
     counts: Arc<Counts>,
     /// Packs open for reading, most recently used last ([`OPEN_READERS`]).
     readers: Mutex<std::collections::VecDeque<(PackKey, Arc<File>)>>,
+    /// The service's encoding, which derived tiles are written in
+    /// (changelog 40); `None` for an encoding without one — nothing is
+    /// derived then.
+    codec: Option<Codec>,
 }
 
 impl TileCache {
@@ -633,6 +689,7 @@ impl TileCache {
             queue,
             counts,
             readers: Mutex::new(std::collections::VecDeque::new()),
+            codec: Codec::of(&encoding),
         }))
     }
 
@@ -681,30 +738,45 @@ impl TileCache {
         pack_path(&self.root, key)
     }
 
-    /// The index entries that can be hits among `tiles` (`(x, y)` at
-    /// `zoom`), each pack read once — the run's lookup before any request.
-    pub(super) fn index(
-        &self, zoom: u32, tiles: impl IntoIterator<Item = (u32, u32)>,
-    ) -> HashMap<(u32, u32), Entry> {
-        let mut out = HashMap::new();
-        if !self.root.join(format!("z{zoom}")).is_dir() {
-            return out;
-        }
-        let mut by_pack: BTreeMap<(u32, u32), Vec<u32>> = BTreeMap::new();
-        for (x, y) in tiles {
-            by_pack.entry((x, y / SLOTS)).or_default().push(y);
-        }
-        for ((x, yblock), ys) in by_pack {
-            let key = (zoom, x, yblock);
-            let Some((entries, len)) = read_index(&self.pack_path(key), key) else { continue };
-            for y in ys {
-                let e = entries[(y % SLOTS) as usize];
-                if e.usable(len) {
-                    out.insert((x, y), e);
+    /// The run's lookup before any request, over `tiles` (`(x, y)` at
+    /// `zoom`): the index entries that can be hits, each pack read once, and
+    /// — among the rest — the tiles [`Self::derive`] can build from finer
+    /// cached tiles, judged from index entries alone (no body is read or
+    /// decoded; each pack's index is read once).
+    pub(super) fn index(&self, zoom: u32, tiles: impl IntoIterator<Item = (u32, u32)>) -> Index {
+        let tiles: Vec<(u32, u32)> = tiles.into_iter().collect();
+        let mut hits = HashMap::new();
+        if self.root.join(format!("z{zoom}")).is_dir() {
+            let mut by_pack: BTreeMap<(u32, u32), Vec<u32>> = BTreeMap::new();
+            for &(x, y) in &tiles {
+                by_pack.entry((x, y / SLOTS)).or_default().push(y);
+            }
+            for ((x, yblock), ys) in by_pack {
+                let key = (zoom, x, yblock);
+                let Some((entries, len)) = read_index(&self.pack_path(key), key) else { continue };
+                for y in ys {
+                    let e = entries[(y % SLOTS) as usize];
+                    if e.usable(len) {
+                        hits.insert((x, y), e);
+                    }
                 }
             }
         }
-        out
+        let mut derivable = HashSet::new();
+        let finer = (1..=DERIVE_LEVELS)
+            .filter_map(|l| zoom.checked_add(l))
+            .any(|z| self.root.join(format!("z{z}")).is_dir());
+        if let (Some(codec), true) = (self.codec, finer) {
+            let mut packs = Packs::new(self);
+            let mut rest: Vec<(u32, u32)> = tiles.into_iter().filter(|t| !hits.contains_key(t)).collect();
+            rest.sort_unstable();
+            for (x, y) in rest {
+                if packs.derivable(zoom, x, y, DERIVE_LEVELS, codec.void.is_some()).is_some() {
+                    derivable.insert((x, y));
+                }
+            }
+        }
+        Index { hits, derivable }
     }
 
     /// The cached answer of tile `(zoom, x, y)` whose index entry is `e`, or
@@ -712,9 +784,9 @@ impl TileCache {
     pub(super) fn read(&self, zoom: u32, x: u32, y: u32, e: &Entry) -> Option<Cached> {
         match e.status {
             STATUS_NO_TILE => Some(Cached::NoTile),
-            STATUS_PRESENT => {
+            STATUS_PRESENT | STATUS_DERIVED => {
                 let f = self.reader((zoom, x, y / SLOTS))?;
-                read_body_from(&f, e).map(Cached::Body)
+                read_body_from(&f, e).map(|b| as_cached(e.status, b))
             }
             _ => None,
         }
@@ -732,7 +804,7 @@ impl TileCache {
         }
         match e.status {
             STATUS_NO_TILE => Some(Cached::NoTile),
-            _ => read_body_from(&f, &e).map(Cached::Body),
+            _ => read_body_from(&f, &e).map(|b| as_cached(e.status, b)),
         }
     }
 
@@ -740,6 +812,7 @@ impl TileCache {
         let c = &self.counts;
         match u {
             Use::Hit => c.hits.fetch_add(1, Ordering::Relaxed),
+            Use::Derived => c.derived.fetch_add(1, Ordering::Relaxed),
             Use::Fetched => c.fetched.fetch_add(1, Ordering::Relaxed),
             Use::ParentHit => c.parent_hits.fetch_add(1, Ordering::Relaxed),
             Use::ParentFetched => c.parent_fetched.fetch_add(1, Ordering::Relaxed),
@@ -750,11 +823,7 @@ impl TileCache {
     /// coarser tile of the parent fill). Waits while the write queue is full;
     /// after [`Self::finish`] the answer is dropped.
     pub(super) async fn store(&self, zoom: u32, x: u32, y: u32, item: Cached, parent: bool) {
-        let bytes = match &item {
-            Cached::Body(b) => b.len(),
-            Cached::NoTile => 0,
-        }
-        .clamp(1, WRITE_QUEUE_BYTES);
+        let bytes = item.body().map_or(0, <[u8]>::len).clamp(1, WRITE_QUEUE_BYTES);
         let Ok(permit) = self.queue.acquire_many(bytes as u32).await else { return };
         permit.forget();
         let job = Job { key: (zoom, x, y / SLOTS), slot: (y % SLOTS) as usize, item, parent, bytes };
@@ -778,6 +847,7 @@ impl TileCache {
         let n = |a: &AtomicUsize| a.load(Ordering::Relaxed);
         Summary {
             hits: n(&c.hits),
+            derived: n(&c.derived),
             fetched: n(&c.fetched),
             written: n(&c.written),
             parent_hits: n(&c.parent_hits),
@@ -791,6 +861,297 @@ impl TileCache {
 /// `<root>/z<zoom>/x<x>_y<yblock>.pack`.
 pub(super) fn pack_path(root: &Path, (zoom, x, yblock): PackKey) -> PathBuf {
     root.join(format!("z{zoom}")).join(format!("x{x}_y{yblock}.pack"))
+}
+
+/// The [`Cached`] of a body read from an entry of `status` (1 or 3).
+fn as_cached(status: u8, body: Vec<u8>) -> Cached {
+    if status == STATUS_DERIVED { Cached::Derived(body) } else { Cached::Body(body) }
+}
+
+/// What [`TileCache::index`] found before any request.
+#[derive(Debug, Default)]
+pub(super) struct Index {
+    /// Fetch-set tiles (`(x, y)` at the run's zoom) whose entry can be a hit.
+    pub hits: HashMap<(u32, u32), Entry>,
+    /// Fetch-set tiles without one that [`TileCache::derive`] can build from
+    /// the cached tiles of finer zooms (changelog 40).
+    pub derivable: HashSet<(u32, u32)>,
+}
+
+// -- Deriving coarser tiles (changelog 40) ---------------------------------------
+
+/// A service encoding as the cache derives in it: samples to metres and back.
+#[derive(Clone, Copy)]
+pub(super) struct Codec {
+    pub dec: fn(u8, u8, u8) -> f32,
+    pub enc: fn(f64) -> [u8; 3],
+    /// The RGB a void sample is written as, if the encoding has one:
+    /// Terrarium's `0, 0, 0` (−32768 m, below `NODATA_M`). Mapbox has none —
+    /// its lowest value, −10000 m, is terrain — so a Mapbox tile that would
+    /// hold a void (a 404 child beside children with data) is not derived;
+    /// it is fetched.
+    pub void: Option<[u8; 3]>,
+}
+
+impl Codec {
+    /// The codec of `encoding` (any case); `None` for one the converter does
+    /// not know.
+    pub(super) fn of(encoding: &str) -> Option<Self> {
+        match encoding.to_lowercase().as_str() {
+            "terrarium" => Some(Codec { dec: super::dec_terrarium, enc: super::enc_terrarium, void: Some([0, 0, 0]) }),
+            "mapbox" => Some(Codec { dec: super::dec_mapbox, enc: super::enc_mapbox, void: None }),
+            _ => None,
+        }
+    }
+}
+
+/// What a tile resolves to, judged from index entries alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Body,
+    NoTile,
+}
+
+/// A tile's four children `(dx, dy)` at zoom + 1, column by column (a pack is
+/// a column, so its two children in one column share a pack).
+const QUADRANTS: [(u32, u32); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
+
+/// The index entries one lookup reads: each pack's index read once, through
+/// the run's kept pack handles ([`TileCache::reader`]) one at a time, so no
+/// descriptor is held beyond the read; zooms without a directory are never
+/// opened.
+struct Packs<'a> {
+    cache: &'a TileCache,
+    packs: HashMap<PackKey, Option<(Vec<Entry>, u64)>>,
+    dirs: HashMap<u32, bool>,
+}
+
+impl<'a> Packs<'a> {
+    fn new(cache: &'a TileCache) -> Self {
+        Packs { cache, packs: HashMap::new(), dirs: HashMap::new() }
+    }
+
+    /// The usable entry of tile `(zoom, x, y)`, if it has one.
+    fn entry(&mut self, zoom: u32, x: u32, y: u32) -> Option<Entry> {
+        let key = (zoom, x, y / SLOTS);
+        if !self.packs.contains_key(&key) {
+            let root = &self.cache.root;
+            let dir = *self.dirs.entry(zoom).or_insert_with(|| root.join(format!("z{zoom}")).is_dir());
+            let got = if dir { self.cache.reader(key).and_then(|f| read_index_from(&f, key)) } else { None };
+            self.packs.insert(key, got);
+        }
+        let (entries, len) = self.packs.get(&key)?.as_ref()?;
+        let e = entries[(y % SLOTS) as usize];
+        e.usable(*len).then_some(e)
+    }
+
+    /// What tile `(zoom, x, y)` derives to from its children, looking
+    /// `levels` zooms deep at most (a child without a usable entry is itself
+    /// derived), or `None` when it cannot be derived. Entries only — a body
+    /// that then fails its CRC or decode makes [`TileCache::derive`] fail and
+    /// the tile is fetched. `voids`: whether the encoding can write a void
+    /// sample; without one, 404 children beside children with data cannot
+    /// be derived.
+    fn derivable(&mut self, zoom: u32, x: u32, y: u32, levels: u32, voids: bool) -> Option<Kind> {
+        if levels == 0 {
+            return None;
+        }
+        let cz = zoom.checked_add(1)?;
+        let (cx, cy) = (x.checked_mul(2)?, y.checked_mul(2)?);
+        let (mut bodies, mut holes) = (0, 0);
+        for (dx, dy) in QUADRANTS {
+            let kind = match self.entry(cz, cx + dx, cy + dy) {
+                Some(e) if e.status == STATUS_NO_TILE => Kind::NoTile,
+                Some(_) => Kind::Body,
+                None => self.derivable(cz, cx + dx, cy + dy, levels - 1, voids)?,
+            };
+            match kind {
+                Kind::Body => bodies += 1,
+                Kind::NoTile => holes += 1,
+            }
+            if bodies > 0 && holes > 0 && !voids {
+                return None;
+            }
+        }
+        Some(if bodies == 0 { Kind::NoTile } else { Kind::Body })
+    }
+}
+
+/// What [`TileCache::derive`] made of a tile.
+#[derive(Debug, PartialEq)]
+pub(super) enum Derived {
+    /// The tile's samples — exactly what decoding its stored PNG gives — and
+    /// its edge.
+    Body(Vec<f32>, usize),
+    /// None of its four children has a tile, so neither has it (not stored:
+    /// re-deriving it reads index entries only).
+    NoTile,
+}
+
+/// A tile [`TileCache::build`] works with: decoded, or a 404.
+enum Got {
+    Body(Vec<f32>, usize),
+    NoTile,
+}
+
+/// A derived tile being filled quadrant by quadrant: its RGB samples (the
+/// PNG to store) and what they decode to (the samples to hand back).
+struct Parent {
+    edge: usize,
+    rgb: Vec<u8>,
+    grid: Vec<f32>,
+}
+
+impl Parent {
+    fn new(edge: usize) -> Self {
+        Parent { edge, rgb: vec![0; edge * edge * 3], grid: vec![0.0; edge * edge] }
+    }
+
+    /// Quadrant `(dx, dy)` from `child` (of the same edge; `None`: a 404):
+    /// pixel `(i, j)` of the quadrant is the mean of the child's samples
+    /// `(2i + {0, 1}, 2j + {0, 1})` that are not void (`> NODATA_M`, so NaN
+    /// is left out too), encoded with `codec`; void where none is. `None`
+    /// when a void is needed and the encoding has none.
+    fn fill(&mut self, codec: &Codec, dx: u32, dy: u32, child: Option<&[f32]>) -> Option<()> {
+        let (e, h) = (self.edge, self.edge / 2);
+        for j in 0..h {
+            for i in 0..h {
+                let mean = child.and_then(|c| {
+                    let o = 2 * j * e + 2 * i;
+                    let (mut sum, mut n) = (0f64, 0u32);
+                    for v in [c[o], c[o + 1], c[o + e], c[o + e + 1]] {
+                        if v > super::NODATA_M {
+                            sum += v as f64;
+                            n += 1;
+                        }
+                    }
+                    (n > 0).then(|| sum / n as f64)
+                });
+                let rgb = match mean {
+                    Some(m) => (codec.enc)(m),
+                    None => codec.void?,
+                };
+                let p = (dy as usize * h + j) * e + dx as usize * h + i;
+                self.rgb[3 * p..3 * p + 3].copy_from_slice(&rgb);
+                self.grid[p] = (codec.dec)(rgb[0], rgb[1], rgb[2]);
+            }
+        }
+        Some(())
+    }
+}
+
+/// `rgb` (`edge`² 8-bit RGB samples, row-major) as a PNG.
+fn png_rgb(rgb: &[u8], edge: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, edge as u32, edge as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        let mut w = enc.write_header().ok()?;
+        w.write_image_data(rgb).ok()?;
+        w.finish().ok()?;
+    }
+    Some(out)
+}
+
+impl TileCache {
+    /// Derive tile `(zoom, x, y)` — one without a valid entry of its own —
+    /// from the four cached tiles one zoom finer that cover it (changelog
+    /// 40). Each child must be a cached body, a cached 404, or itself
+    /// derivable the same way, [`DERIVE_LEVELS`] zooms below `zoom` at most;
+    /// otherwise `None` and the caller fetches the tile as before. The
+    /// children are decoded in the service's encoding (`dec` of the cache's
+    /// [`Codec`]); output pixel `(i, j)` is the mean of the 2 × 2 samples of
+    /// the matching child quadrant, voids left out (a 404 child's quadrant
+    /// is void), void where all four are; four 404 children make a 404. The
+    /// result is encoded back as an 8-bit RGB PNG in the same encoding and
+    /// stored with status 3 — every derived intermediate too, so a cascade
+    /// (z11 from z15) costs four decodes per level once the level below is
+    /// stored. Nothing is requested; two processes deriving one tile store
+    /// the same bytes.
+    pub(super) async fn derive(&self, zoom: u32, x: u32, y: u32) -> Option<Derived> {
+        let mut made = Vec::new();
+        let got = self.derive_now(zoom, x, y, &mut made);
+        for (z, x, y, item) in made {
+            self.store(z, x, y, item, false).await;
+        }
+        got
+    }
+
+    /// [`Self::derive`] up to the writes, which it lists in `made` (finest
+    /// first, the tile itself last). Even when it fails, what it did derive
+    /// is listed.
+    fn derive_now(&self, zoom: u32, x: u32, y: u32, made: &mut Vec<(u32, u32, u32, Cached)>) -> Option<Derived> {
+        let codec = self.codec?;
+        let mut packs = Packs::new(self);
+        // Structure first, from index entries: nothing is decoded for a tile
+        // that cannot be derived.
+        packs.derivable(zoom, x, y, DERIVE_LEVELS, codec.void.is_some())?;
+        match self.build(&mut packs, &codec, zoom, x, y, DERIVE_LEVELS, made)? {
+            Got::Body(grid, edge) => Some(Derived::Body(grid, edge)),
+            Got::NoTile => Some(Derived::NoTile),
+        }
+    }
+
+    /// Tile `(zoom, x, y)` as its own entry holds it, else built from its
+    /// children while `levels > 0`.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &self, packs: &mut Packs, codec: &Codec, zoom: u32, x: u32, y: u32, levels: u32,
+        made: &mut Vec<(u32, u32, u32, Cached)>,
+    ) -> Option<Got> {
+        if let Some(e) = packs.entry(zoom, x, y) {
+            if e.status == STATUS_NO_TILE {
+                return Some(Got::NoTile);
+            }
+            // A body that fails its CRC or its decode counts as no entry.
+            let body = self.reader((zoom, x, y / SLOTS)).and_then(|f| read_body_from(&f, &e));
+            if let Some(Ok((grid, edge))) = body.map(|b| super::decode_tile(&b, codec.dec)) {
+                return Some(Got::Body(grid, edge));
+            }
+        }
+        if levels == 0 {
+            return None;
+        }
+        self.build(packs, codec, zoom, x, y, levels, made)
+    }
+
+    /// Tile `(zoom, x, y)` built from its four children at `zoom + 1`, each
+    /// resolved at most `levels − 1` zooms deeper (`levels ≥ 1`); a built
+    /// body is listed in `made`.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        &self, packs: &mut Packs, codec: &Codec, zoom: u32, x: u32, y: u32, levels: u32,
+        made: &mut Vec<(u32, u32, u32, Cached)>,
+    ) -> Option<Got> {
+        let cz = zoom.checked_add(1)?;
+        let (cx, cy) = (x.checked_mul(2)?, y.checked_mul(2)?);
+        let mut parent: Option<Parent> = None;
+        let mut holes: Vec<(u32, u32)> = Vec::new();
+        for (dx, dy) in QUADRANTS {
+            match self.resolve(packs, codec, cz, cx + dx, cy + dy, levels - 1, made)? {
+                Got::NoTile => holes.push((dx, dy)),
+                Got::Body(grid, edge) => {
+                    // One service, one tile edge — and it must halve.
+                    if edge < 2 || edge % 2 != 0 || grid.len() != edge * edge {
+                        return None;
+                    }
+                    let p = parent.get_or_insert_with(|| Parent::new(edge));
+                    if p.edge != edge {
+                        return None;
+                    }
+                    p.fill(codec, dx, dy, Some(&grid))?;
+                }
+            }
+        }
+        let Some(mut p) = parent else { return Some(Got::NoTile) };
+        for (dx, dy) in holes {
+            p.fill(codec, dx, dy, None)?;
+        }
+        made.push((zoom, x, y, Cached::Derived(png_rgb(&p.rgb, p.edge)?)));
+        Some(Got::Body(p.grid, p.edge))
+    }
 }
 
 /// What the writer thread works with.
@@ -1282,12 +1643,14 @@ mod tests {
         // A second run over the same directory finds them.
         let again = TileCache::open(dir.path(), tpl, "terrarium").unwrap();
         let idx = again.index(15, [(17043, 11_580), (17043, 11_520), (17043, 11_581), (9, 9)]);
-        assert_eq!(idx.len(), 2);
-        assert_eq!(again.read(15, 17043, 11_580, &idx[&(17043, 11_580)]), Some(Cached::Body(body(5, 64))));
-        assert_eq!(again.read(15, 17043, 11_520, &idx[&(17043, 11_520)]), Some(Cached::NoTile));
+        assert_eq!(idx.hits.len(), 2);
+        assert!(idx.derivable.is_empty(), "nothing finer than z15 is cached");
+        assert_eq!(again.read(15, 17043, 11_580, &idx.hits[&(17043, 11_580)]), Some(Cached::Body(body(5, 64))));
+        assert_eq!(again.read(15, 17043, 11_520, &idx.hits[&(17043, 11_520)]), Some(Cached::NoTile));
         assert_eq!(again.lookup(14, 8521, 5790), Some(Cached::Body(body(6, 64))));
         assert_eq!(again.lookup(14, 8521, 5791), None);
-        assert!(again.index(13, [(1, 1)]).is_empty(), "no z13 directory");
+        let none = again.index(13, [(1, 1)]);
+        assert!(none.hits.is_empty() && none.derivable.is_empty(), "no z13 directory, nothing below (1, 1)");
         assert_eq!(again.finish().written, 0);
     }
 
@@ -1299,5 +1662,516 @@ mod tests {
         let err = TileCache::open(&file.join("cache"), "http://t/{z}/{x}/{y}.png", "terrarium")
             .err().expect("a path under a regular file");
         assert!(!err.is_empty());
+    }
+
+    // -- Deriving (changelog 40) ---------------------------------------------
+
+    use super::super::{dec_mapbox, dec_terrarium, decode_tile, enc_mapbox, enc_terrarium};
+
+    const TPL: &str = "http://t/{z}/{x}/{y}.png";
+
+    /// An 8-bit RGB PNG of `edge`² samples `f(px, py)`, compressed as a
+    /// service would (default level).
+    fn png_of(edge: usize, f: impl Fn(usize, usize) -> [u8; 3]) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(edge * edge * 3);
+        for py in 0..edge {
+            for px in 0..edge {
+                rgb.extend_from_slice(&f(px, py));
+            }
+        }
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, edge as u32, edge as u32);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgb).unwrap();
+        }
+        out
+    }
+
+    /// A Terrarium tile of `f(px, py)` metres (`None`: a void sample).
+    fn terrarium(edge: usize, f: impl Fn(usize, usize) -> Option<f64>) -> Vec<u8> {
+        png_of(edge, |px, py| f(px, py).map_or([0, 0, 0], enc_terrarium))
+    }
+
+    /// Write `tiles` straight into the packs under `root` (no writer thread).
+    fn put_tiles(root: &Path, tiles: &[(u32, u32, u32, Cached)]) {
+        let mut by: BTreeMap<PackKey, Vec<(usize, Cached)>> = BTreeMap::new();
+        for (z, x, y, c) in tiles {
+            by.entry((*z, *x, *y / SLOTS)).or_default().push(((*y % SLOTS) as usize, c.clone()));
+        }
+        for (key, items) in by {
+            fs::create_dir_all(root.join(format!("z{}", key.0))).unwrap();
+            put(&pack_path(root, key), key, &items);
+        }
+    }
+
+    /// The entry of tile `(zoom, x, y)` under `root`, as the pack holds it.
+    fn raw_entry(root: &Path, zoom: u32, x: u32, y: u32) -> Option<Entry> {
+        let raw = fs::read(pack_path(root, (zoom, x, y / SLOTS))).ok()?;
+        Some(entry_at(&raw, (y % SLOTS) as usize))
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().build().unwrap()
+    }
+
+    /// A cache of encoding `enc` under a fresh directory, and its service root.
+    fn fresh(enc: &str) -> (tempfile::TempDir, Arc<TileCache>, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = TileCache::open(dir.path(), TPL, enc).unwrap();
+        let root = dir.path().join(service_key(TPL, enc));
+        (dir, cache, root)
+    }
+
+    /// The children `(zoom + 1, 2x + dx, 2y + dy)` of tile `(zoom, x, y)`.
+    fn child(zoom: u32, x: u32, y: u32, dx: u32, dy: u32) -> (u32, u32, u32) {
+        (zoom + 1, 2 * x + dx, 2 * y + dy)
+    }
+
+    /// The four children of tile `(zoom, x, y)`, child `(dx, dy)` holding
+    /// `f(dx, dy)`.
+    fn kids_of(zoom: u32, x: u32, y: u32, f: impl Fn(u32, u32) -> Cached) -> Vec<(u32, u32, u32, Cached)> {
+        QUADRANTS.iter()
+            .map(|&(dx, dy)| {
+                let (cz, cx, cy) = child(zoom, x, y, dx, dy);
+                (cz, cx, cy, f(dx, dy))
+            })
+            .collect()
+    }
+
+    /// Terrarium's quantisation: the nearest 1/256 m, ties up.
+    fn q256(m: f64) -> f32 {
+        (((m + 32768.0) * 256.0).round() / 256.0 - 32768.0) as f32
+    }
+
+    /// What the parent of `kids[dx][dy]` (decoded samples, `None` = 404)
+    /// must hold, worked out sample by sample from the definition.
+    fn expected_parent(kids: &[[Option<Vec<f32>>; 2]; 2], edge: usize) -> Vec<f32> {
+        let h = edge / 2;
+        let mut out = vec![0.0f32; edge * edge];
+        for py in 0..edge {
+            for px in 0..edge {
+                let (dx, dy, i, j) = (px / h, py / h, px % h, py % h);
+                let vals: Vec<f64> = match &kids[dx][dy] {
+                    None => Vec::new(),
+                    Some(c) => [(2 * i, 2 * j), (2 * i + 1, 2 * j), (2 * i, 2 * j + 1), (2 * i + 1, 2 * j + 1)]
+                        .iter()
+                        .map(|&(sx, sy)| c[sy * edge + sx])
+                        .filter(|&v| v > -11000.0)
+                        .map(f64::from)
+                        .collect(),
+                };
+                out[py * edge + px] = if vals.is_empty() {
+                    -32768.0
+                } else {
+                    q256(vals.iter().sum::<f64>() / vals.len() as f64)
+                };
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_encoders_invert_the_decoders_exactly() {
+        // Terrarium: every one of the 2^24 triples comes back as itself.
+        for k in 0u32..1 << 24 {
+            let t = [(k >> 16) as u8, (k >> 8) as u8, k as u8];
+            assert_eq!(enc_terrarium(dec_terrarium(t[0], t[1], t[2]) as f64), t, "k = {k}");
+        }
+        // Mapbox: every value the decoder gives comes back exactly — as the
+        // same triple below +94 857 m (all of n < 2^20) and as a triple
+        // decoding to the same f32 above (spot checks over the rest; all
+        // 2^24 were checked in a release build).
+        let rgb = |n: u32| [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        for n in (0u32..1 << 20).chain((1 << 20..1 << 24).step_by(97)) {
+            let t = rgb(n);
+            let v = dec_mapbox(t[0], t[1], t[2]);
+            let e = enc_mapbox(v as f64);
+            assert_eq!(dec_mapbox(e[0], e[1], e[2]).to_bits(), v.to_bits(), "n = {n}");
+            if n < 10_485_763 {
+                assert_eq!(e, t, "n = {n}");
+            }
+        }
+        // In-between values go to the nearest step; ties up (Terrarium);
+        // out of range clamps; NaN is 0, 0, 0 (Terrarium's void).
+        assert_eq!(enc_terrarium(100.001), enc_terrarium(100.0));
+        assert_eq!(dec_terrarium_of(enc_terrarium(0.5 / 256.0)), 1.0 / 256.0, "a tie rounds up");
+        assert_eq!(dec_terrarium_of(enc_terrarium(-0.5 / 256.0)), 0.0, "a tie rounds up");
+        assert_eq!(dec_terrarium_of(enc_terrarium(1234.567)), 1234.0 + 145.0 / 256.0, "the nearest 1/256 m");
+        assert_eq!(enc_terrarium(-40_000.0), [0, 0, 0]);
+        assert_eq!(enc_terrarium(40_000.0), [255, 255, 255]);
+        assert_eq!(enc_terrarium(f64::NAN), [0, 0, 0]);
+        let m = enc_mapbox(123.44);
+        assert!((dec_mapbox(m[0], m[1], m[2]) as f64 - 123.4).abs() < 1e-3, "{m:?}");
+        let m = enc_mapbox(123.46);
+        assert!((dec_mapbox(m[0], m[1], m[2]) as f64 - 123.5).abs() < 1e-3, "{m:?}");
+        assert_eq!(enc_mapbox(-20_000.0), [0, 0, 0]);
+        assert_eq!(enc_mapbox(2.0e6), [255, 255, 255]);
+        assert_eq!(enc_mapbox(f64::NAN), [0, 0, 0]);
+    }
+
+    fn dec_terrarium_of(t: [u8; 3]) -> f32 {
+        dec_terrarium(t[0], t[1], t[2])
+    }
+
+    #[test]
+    fn a_derived_tile_is_the_2x2_mean_of_its_children_voids_left_out() {
+        let (_dir, cache, root) = fresh("terrarium");
+        let (z, x, y) = (10, 5, 7);
+        let edge = 256;
+        // Values on Terrarium's 1/256 m grid, different in every child and
+        // sample, so a misplaced quadrant or sample shows. Child (0, 0) has
+        // voids: one sample of the block under parent pixel (3, 4), all four
+        // under (5, 5); child (1, 1) is a 404.
+        let value = |dx: u32, dy: u32, px: usize, py: usize| -> Option<f64> {
+            if (dx, dy) == (0, 0) && ((px, py) == (7, 9) || (px / 2, py / 2) == (5, 5)) {
+                return None;
+            }
+            Some(100.0 + 1000.0 * dx as f64 + 2000.0 * dy as f64 + px as f64 * 0.5 + py as f64 * 0.25
+                 + ((px * 7 + py * 13) % 256) as f64 / 256.0)
+        };
+        let mut kids: [[Option<Vec<f32>>; 2]; 2] = Default::default();
+        let mut tiles = Vec::new();
+        for (dx, dy) in QUADRANTS {
+            let (cz, cx, cy) = child(z, x, y, dx, dy);
+            if (dx, dy) == (1, 1) {
+                tiles.push((cz, cx, cy, Cached::NoTile));
+                continue;
+            }
+            let png = terrarium(edge, |px, py| value(dx, dy, px, py));
+            kids[dx as usize][dy as usize] = Some(decode_tile(&png, dec_terrarium).unwrap().0);
+            tiles.push((cz, cx, cy, Cached::Body(png)));
+        }
+        put_tiles(&root, &tiles);
+
+        let mut made = Vec::new();
+        let got = cache.derive_now(z, x, y, &mut made);
+        let want = expected_parent(&kids, edge);
+        let Some(Derived::Body(grid, e)) = got else { panic!("not derived: {got:?}") };
+        assert_eq!(e, edge);
+        assert!(grid == want, "the parent is not the 2×2 mean");
+        // The spot checks, by hand: a partial void block is the mean of the
+        // other three; an all-void block and the 404 quadrant are void.
+        let (s, h) = (|px: usize, py: usize| value(0, 0, px, py).unwrap(), edge / 2);
+        assert_eq!(grid[4 * edge + 3], q256((s(6, 8) + s(6, 9) + s(7, 8)) / 3.0));
+        assert_eq!(grid[5 * edge + 5], -32768.0);
+        assert!(grid[(h + 3) * edge + h + 3] <= -11000.0 && grid[(edge - 1) * edge + edge - 1] <= -11000.0);
+        // The stored PNG decodes to exactly the samples handed back.
+        assert_eq!(made.len(), 1, "the children were cached: only the tile itself is made");
+        let (mz, mx, my, Cached::Derived(png)) = &made[0] else { panic!("{:?}", made[0].3) };
+        assert_eq!((*mz, *mx, *my), (z, x, y));
+        assert_eq!(decode_tile(png, dec_terrarium).unwrap(), (grid.clone(), edge));
+
+        // Through the writer: one entry, status 3, CRC of the PNG.
+        let rt = rt();
+        assert_eq!(rt.block_on(cache.derive(z, x, y)), Some(Derived::Body(grid, edge)));
+        let s = cache.finish();
+        assert_eq!((s.written, s.derived, s.dropped), (1, 0, 0), "{s:?}");
+        let e = raw_entry(&root, z, x, y).expect("a z10 pack");
+        assert_eq!((e.status, e.len as usize, e.crc), (STATUS_DERIVED, png.len(), crc32(png)));
+    }
+
+    #[test]
+    fn four_404_children_derive_a_404_and_nothing_is_stored() {
+        let (_dir, cache, root) = fresh("terrarium");
+        let (z, x, y) = (12, 100, 200);
+        put_tiles(&root, &kids_of(z, x, y, |_, _| Cached::NoTile));
+        assert!(cache.index(z, [(x, y)]).derivable.contains(&(x, y)));
+        assert_eq!(rt().block_on(cache.derive(z, x, y)), Some(Derived::NoTile));
+        assert_eq!(cache.finish().written, 0);
+        assert!(!root.join("z12").exists(), "a derived 404 is not stored");
+    }
+
+    #[test]
+    fn mapbox_tiles_derive_in_mapbox_and_never_with_a_void() {
+        let (_dir, cache, root) = fresh("mapbox");
+        let (z, x, y) = (9, 3, 4);
+        let edge = 16;
+        let rgb = |n: u32| [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        // Every 2×2 block holds n, n+1, n+2, n+1: its mean is n+1, on the
+        // 0.1 m grid, so the parent holds exactly dec_mapbox(n + 1).
+        let base = |dx: u32, dy: u32, i: usize, j: usize| 100_000 + dx * 5000 + dy * 9000 + (j * 8 + i) as u32 * 7;
+        let kid = |dx: u32, dy: u32| png_of(edge, |px, py| {
+            let n = base(dx, dy, px / 2, py / 2);
+            rgb(n + [[0, 2], [1, 1]][py % 2][px % 2])
+        });
+        put_tiles(&root, &kids_of(z, x, y, |dx, dy| Cached::Body(kid(dx, dy))));
+        let mut made = Vec::new();
+        let Some(Derived::Body(grid, 16)) = cache.derive_now(z, x, y, &mut made) else { panic!("not derived") };
+        for py in 0..edge {
+            for px in 0..edge {
+                let (dx, dy, h) = ((px / 8) as u32, (py / 8) as u32, 8);
+                let n = base(dx, dy, px % h, py % h) + 1;
+                let t = rgb(n);
+                assert_eq!(grid[py * edge + px], dec_mapbox(t[0], t[1], t[2]), "({px}, {py})");
+            }
+        }
+        let Cached::Derived(png) = &made[0].3 else { panic!() };
+        assert_eq!(decode_tile(png, dec_mapbox).unwrap(), (grid, edge), "stored in Mapbox's encoding");
+
+        // A 404 child beside children with data would need a void, which
+        // Mapbox cannot write: not derivable, judged before any decode.
+        let (z2, x2, y2) = (9, 3, 5);
+        put_tiles(&root, &kids_of(z2, x2, y2, |dx, dy| {
+            if (dx, dy) == (1, 1) { Cached::NoTile } else { Cached::Body(kid(dx, dy)) }
+        }));
+        let idx = cache.index(z, [(x, y), (x2, y2)]);
+        assert_eq!(idx.derivable, HashSet::from([(x, y)]));
+        assert_eq!(cache.derive_now(z2, x2, y2, &mut Vec::new()), None);
+        cache.finish();
+    }
+
+    #[test]
+    fn a_cascade_derives_and_stores_every_level_and_the_next_one_reuses_it() {
+        let (dir, cache, root) = fresh("terrarium");
+        let (z, x, y, edge) = (11, 20, 30, 16);
+        // Only zoom + 2 is cached: 16 tiles of integer metres.
+        let mut tiles = Vec::new();
+        for gx in 4 * x..4 * x + 4 {
+            for gy in 4 * y..4 * y + 4 {
+                let png = terrarium(edge, |px, py| Some((gx * 100 + gy * 10) as f64 + (px * 3 + py * 5) as f64));
+                tiles.push((z + 2, gx, gy, Cached::Body(png)));
+            }
+        }
+        put_tiles(&root, &tiles);
+        assert!(cache.index(z, [(x, y)]).derivable.contains(&(x, y)), "two levels deep");
+        let mut made = Vec::new();
+        let first = cache.derive_now(z, x, y, &mut made).expect("derived");
+        let at: Vec<(u32, u32, u32)> = made.iter().map(|(z, x, y, _)| (*z, *x, *y)).collect();
+        assert_eq!(at.len(), 5, "4 intermediates at zoom + 1, then the tile: {at:?}");
+        assert!(at[..4].iter().all(|t| t.0 == z + 1) && at[4] == (z, x, y), "{at:?}");
+        let rt = rt();
+        rt.block_on(cache.derive(z, x, y));
+        assert_eq!(cache.finish().written, 5);
+        for (tz, tx, ty) in &at {
+            assert_eq!(raw_entry(&root, *tz, *tx, *ty).map(|e| e.status), Some(STATUS_DERIVED), "({tz}, {tx}, {ty})");
+        }
+        // A later run: zoom + 1 are hits now, and deriving the tile from them
+        // gives exactly what the cascade gave — one level, four decodes.
+        let again = TileCache::open(dir.path(), TPL, "terrarium").unwrap();
+        let idx = again.index(z + 1, (2 * x..2 * x + 2).flat_map(|cx| (2 * y..2 * y + 2).map(move |cy| (cx, cy))));
+        assert_eq!((idx.hits.len(), idx.derivable.len()), (4, 0));
+        assert!(idx.hits.values().all(|e| e.status == STATUS_DERIVED));
+        assert!(matches!(again.lookup(z + 1, 2 * x, 2 * y), Some(Cached::Derived(_))));
+        let mut made2 = Vec::new();
+        assert_eq!(again.derive_now(z, x, y, &mut made2), Some(first));
+        assert_eq!(made2.len(), 1);
+        again.finish();
+    }
+
+    #[test]
+    fn derivation_looks_four_zooms_deep_and_no_further() {
+        let edge = 4;
+        for (depth, ok) in [(4u32, true), (5, false)] {
+            let (_dir, cache, root) = fresh("terrarium");
+            let (z, x, y) = (6, 1, 2);
+            let n = 1u32 << depth;
+            let mut tiles = Vec::new();
+            for gx in n * x..n * x + n {
+                for gy in n * y..n * y + n {
+                    tiles.push((z + depth, gx, gy, Cached::Body(terrarium(edge, |_, _| Some(gx as f64 + gy as f64)))));
+                }
+            }
+            put_tiles(&root, &tiles);
+            assert_eq!(cache.index(z, [(x, y)]).derivable.contains(&(x, y)), ok, "depth {depth}");
+            let mut made = Vec::new();
+            let got = cache.derive_now(z, x, y, &mut made);
+            assert_eq!(got.is_some(), ok, "depth {depth}");
+            if ok {
+                assert_eq!(made.len(), 64 + 16 + 4 + 1);
+                // Each of the 4 × 4 pixels covers 4 × 4 of the 16 × 16 tiles,
+                // each of one value gx + gy: means of means of means of means
+                // of them, exact on the 1/256 m grid at every level.
+                let Some(Derived::Body(grid, 4)) = got else { panic!("{got:?}") };
+                for py in 0..edge {
+                    for px in 0..edge {
+                        let want = (n * x + 4 * px as u32) as f64 + 1.5 + (n * y + 4 * py as u32) as f64 + 1.5;
+                        assert_eq!(grid[py * edge + px], want as f32, "({px}, {py})");
+                    }
+                }
+            } else {
+                assert!(made.is_empty(), "nothing is decoded for a tile that cannot be derived");
+            }
+            cache.finish();
+        }
+    }
+
+    #[test]
+    fn a_child_that_is_missing_corrupt_or_of_another_size_stops_the_derivation() {
+        let (_dir, cache, root) = fresh("terrarium");
+        let flat = |v: f64, edge: usize| terrarium(edge, move |_, _| Some(v));
+        let kids = |z: u32, x: u32, y: u32, edge_of: &dyn Fn(u32, u32) -> usize| {
+            kids_of(z, x, y, |dx, dy| Cached::Body(flat(50.0, edge_of(dx, dy))))
+        };
+        // Three children only: not derivable.
+        let mut three = kids(8, 1, 1, &|_, _| 8);
+        three.pop();
+        put_tiles(&root, &three);
+        // Children of two sizes: derivable by their entries, not by their samples.
+        put_tiles(&root, &kids(8, 2, 1, &|dx, _| if dx == 0 { 8 } else { 16 }));
+        // A child whose body fails its CRC (one flipped byte), and nothing
+        // below it: the derivation fails when it reads it.
+        put_tiles(&root, &kids(8, 3, 1, &|_, _| 8));
+        let (cz, cx, cy) = child(8, 3, 1, 1, 0);
+        let path = pack_path(&root, (cz, cx, cy / SLOTS));
+        let mut raw = fs::read(&path).unwrap();
+        let e = entry_at(&raw, (cy % SLOTS) as usize);
+        raw[e.offset as usize + 20] ^= 0x10;
+        fs::write(&path, &raw).unwrap();
+
+        let idx = cache.index(8, [(1, 1), (2, 1), (3, 1)]);
+        assert_eq!(idx.derivable, HashSet::from([(2, 1), (3, 1)]));
+        for (x, y) in [(1, 1), (2, 1), (3, 1)] {
+            assert_eq!(cache.derive_now(8, x, y, &mut Vec::new()), None, "({x}, {y})");
+        }
+        // The corrupt child repaired by deriving it from ITS children.
+        let (gz, gx, gy) = (cz + 1, 2 * cx, 2 * cy);
+        let grandkids: Vec<_> = (0..4).map(|i| (gz, gx + i / 2, gy + i % 2, Cached::Body(flat(50.0, 8)))).collect();
+        put_tiles(&root, &grandkids);
+        let mut made = Vec::new();
+        let got = cache.derive_now(8, 3, 1, &mut made);
+        assert!(matches!(got, Some(Derived::Body(ref g, 8)) if g.iter().all(|&v| v == 50.0)), "{got:?}");
+        assert_eq!(made.iter().map(|m| (m.0, m.1, m.2)).collect::<Vec<_>>(), [(cz, cx, cy), (8, 3, 1)]);
+        cache.finish();
+    }
+
+    #[test]
+    fn a_derived_entry_survives_a_reopen_and_is_crc_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(service_key(TPL, "terrarium"));
+        let png = terrarium(8, |px, py| Some(px as f64 + py as f64 / 4.0));
+        let cache = TileCache::open(dir.path(), TPL, "terrarium").unwrap();
+        rt().block_on(cache.store(14, 9000, 6000, Cached::Derived(png.clone()), false));
+        assert_eq!(cache.finish().written, 1);
+
+        // On disk, in the documented layout: status 3, the CRC of the body.
+        let raw = fs::read(pack_path(&root, (14, 9000, 6000 / SLOTS))).unwrap();
+        let e = entry_at(&raw, (6000 % SLOTS) as usize);
+        assert_eq!((e.offset, e.len as usize, e.status, e.crc), (DATA_START, png.len(), 3, crc32(&png)));
+        assert_eq!(&raw[e.offset as usize..], &png[..]);
+
+        // A new run reads it back as a derived body — as a hit, not to derive.
+        let again = TileCache::open(dir.path(), TPL, "terrarium").unwrap();
+        let idx = again.index(14, [(9000, 6000)]);
+        assert!(idx.derivable.is_empty());
+        let he = idx.hits[&(9000, 6000)];
+        assert_eq!(again.read(14, 9000, 6000, &he), Some(Cached::Derived(png.clone())));
+        assert_eq!(again.lookup(14, 9000, 6000), Some(Cached::Derived(png.clone())));
+        again.finish();
+
+        // One flipped bit in the body: a miss, never a wrong tile.
+        let mut bad = raw.clone();
+        bad[DATA_START as usize + png.len() / 2] ^= 0x01;
+        fs::write(pack_path(&root, (14, 9000, 6000 / SLOTS)), &bad).unwrap();
+        let third = TileCache::open(dir.path(), TPL, "terrarium").unwrap();
+        assert_eq!(third.lookup(14, 9000, 6000), None);
+        assert_eq!(third.read(14, 9000, 6000, &he), None);
+        third.finish();
+    }
+
+    #[test]
+    fn deriving_one_256px_tile_from_four_cached_children_takes() {
+        // Terrain-like children (smooth, with Terrarium's fractional blue),
+        // compressed at the default level as AWS serves them.
+        let (_dir, cache, root) = fresh("terrarium");
+        let (z, x, y) = (14, 8600, 5800);
+        let mut tiles = Vec::new();
+        for (dx, dy) in QUADRANTS {
+            let (cz, cx, cy) = child(z, x, y, dx, dy);
+            let png = terrarium(256, |px, py| {
+                let (u, v) = ((dx * 256 + px as u32) as f64, (dy * 256 + py as u32) as f64);
+                Some(1200.0 + 300.0 * (u / 17.0).sin() * (v / 23.0).cos() + 0.37 * u - 0.21 * v)
+            });
+            tiles.push((cz, cx, cy, Cached::Body(png)));
+        }
+        let child_bytes: usize = tiles.iter().map(|t| t.3.body().unwrap().len()).sum();
+        put_tiles(&root, &tiles);
+        let mut times = Vec::new();
+        let mut size = 0;
+        for _ in 0..7 {
+            let mut made = Vec::new();
+            let t0 = Instant::now();
+            let got = cache.derive_now(z, x, y, &mut made);
+            times.push(t0.elapsed());
+            assert!(matches!(got, Some(Derived::Body(_, 256))));
+            size = made[0].3.body().unwrap().len();
+        }
+        times.sort();
+        // The parts: the four decodes alone, and one encode alone.
+        let bodies: Vec<&[u8]> = tiles.iter().map(|t| t.3.body().unwrap()).collect();
+        let codec = Codec::of("terrarium").unwrap();
+        let (mut dec_t, mut enc_t, mut crc_t, mut mean_t) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..7 {
+            let t0 = Instant::now();
+            for b in &bodies {
+                std::hint::black_box(crc32(b));
+            }
+            crc_t.push(t0.elapsed());
+            let t0 = Instant::now();
+            let grids: Vec<Vec<f32>> = bodies.iter().map(|b| decode_tile(b, dec_terrarium).unwrap().0).collect();
+            dec_t.push(t0.elapsed());
+            let t0 = Instant::now();
+            let mut p = Parent::new(256);
+            for (q, (dx, dy)) in QUADRANTS.into_iter().enumerate() {
+                p.fill(&codec, dx, dy, Some(&grids[q])).unwrap();
+            }
+            mean_t.push(t0.elapsed());
+            let t0 = Instant::now();
+            std::hint::black_box(png_rgb(&p.rgb, 256).unwrap());
+            enc_t.push(t0.elapsed());
+        }
+        for t in [&mut dec_t, &mut enc_t, &mut crc_t, &mut mean_t] {
+            t.sort();
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "[derive timing] one 256 px tile from four cached children (decode 4 + 2×2 mean + PNG encode): \
+             min {:.2} ms, median {:.2} ms over {} runs ({}); parts (medians): 4 CRC checks {:.2} ms, \
+             4 decodes {:.2} ms, the means {:.2} ms, 1 encode {:.2} ms; derived PNG {} B, a child {} B on average",
+            ms(times[0]), ms(times[times.len() / 2]), times.len(),
+            if cfg!(debug_assertions) { "debug build" } else { "release build" },
+            ms(crc_t[3]), ms(dec_t[3]), ms(mean_t[3]), ms(enc_t[3]), size, child_bytes / 4,
+        );
+        cache.finish();
+    }
+
+    /// The worst case, four zooms deep (a z11 tile from z15: 256 decodes,
+    /// 85 encodes). Ignored by default — seconds in a debug build; run with
+    /// `cargo test --release -p aether_converter --lib deriving_four -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn deriving_four_zooms_deep_takes() {
+        let (_dir, cache, root) = fresh("terrarium");
+        let (z, x, y) = (11, 1075, 725);
+        let mut tiles = Vec::new();
+        for gx in 16 * x..16 * x + 16 {
+            for gy in 16 * y..16 * y + 16 {
+                let png = terrarium(256, |px, py| {
+                    let (u, v) = (((gx - 16 * x) * 256 + px as u32) as f64, ((gy - 16 * y) * 256 + py as u32) as f64);
+                    let hills = 300.0 * (u / 170.0).sin() * (v / 230.0).cos();
+                    Some(1200.0 + hills + 0.037 * u - 0.021 * v + (u * v).sin() * 0.3)
+                });
+                tiles.push((z + 4, gx, gy, Cached::Body(png)));
+            }
+        }
+        put_tiles(&root, &tiles);
+        let mut times = Vec::new();
+        for _ in 0..3 {
+            let mut made = Vec::new();
+            let t0 = Instant::now();
+            let got = cache.derive_now(z, x, y, &mut made);
+            times.push(t0.elapsed());
+            assert!(matches!(got, Some(Derived::Body(_, 256))));
+            assert_eq!(made.len(), 85);
+        }
+        times.sort();
+        eprintln!(
+            "[derive timing] one 256 px tile four zooms deep (256 decodes, 85 means + encodes): min {:.0} ms, \
+             median {:.0} ms over {} runs ({})",
+            times[0].as_secs_f64() * 1e3, times[times.len() / 2].as_secs_f64() * 1e3, times.len(),
+            if cfg!(debug_assertions) { "debug build" } else { "release build" },
+        );
+        cache.finish();
     }
 }

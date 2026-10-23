@@ -19,16 +19,18 @@ fn version_flag_prints_name_and_semver() {
 /// ships: 0.2.6 brought the `download` repair-job fields, 0.2.7 the `probe`
 /// subcommand, the batch-ingest `[Tile]` line and atomic tile replacement,
 /// 0.2.8 `AETHER_DIAG_FILE` (diagnostic lines to a file) and the `download`
-/// job field `cache_dir`. Bump the crate version — and the §1.5 table — with
-/// the next capability.
+/// job field `cache_dir`, 0.2.9 the `download` pipeline of changelog 39
+/// (RAM budget fixed per run, per-row release, outputs held open — no new
+/// field or parsed line, so no new gate). Bump the crate version — and the
+/// §1.5 table — with the next capability.
 #[test]
 fn version_covers_the_documented_capability_gates() {
     let v: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|p| p.parse().unwrap()).collect();
     assert_eq!(
         v,
-        [0, 2, 8],
+        [0, 2, 9],
         "CONTRACT §1.5 gates AETHER_DIAG_FILE and download `cache_dir` on aether_converter 0.2.8 \
-         (probe/[Tile]/atomic writes on 0.2.7)"
+         (probe/[Tile]/atomic writes on 0.2.7); 0.2.9 is changelog 39"
     );
     let out = Command::new(env!("CARGO_BIN_EXE_aether_converter"))
         .args(["probe", "--help"])

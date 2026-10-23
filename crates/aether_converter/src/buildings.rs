@@ -180,13 +180,90 @@ where
     )
 }
 
-/// One building footprint ring in WGS84, with its height.
+/// One building footprint in WGS84, with its height.
+///
+/// The footprint is the exterior ring **minus** its interior rings: a
+/// courtyard belongs to its building as a hole, never as a building of its
+/// own, so [`rasterize_buildings`] leaves it at the terrain.
 #[derive(Clone, Debug)]
 pub struct Building {
-    /// Ring vertices as (lon, lat).
+    /// Exterior ring vertices as (lon, lat).
     pub coords: Vec<(f64, f64)>,
+    /// Interior rings (courtyards), vertices as (lon, lat). A pixel whose
+    /// centre lies in one is not part of the footprint.
+    pub holes: Vec<Vec<(f64, f64)>>,
     pub height: BuildingHeight,
     pub source: HeightSource,
+}
+
+impl Building {
+    /// This building's identity for the buffer-zone duplicate filter.
+    pub(crate) fn duplicate_key(&self) -> Option<DuplicateKey> {
+        DuplicateKey::new(&self.coords, &self.holes, self.height)
+    }
+}
+
+/// What makes two decoded vector-tile buildings **the same** building: every
+/// vertex of every ring — exterior first, then the holes — rounded to 1e-6°,
+/// in order, plus the height bit for bit.
+///
+/// Neighbouring vector tiles overlap in their buffer zones, so a building near
+/// a tile edge arrives once per tile. This key drops only those true
+/// duplicates. The first vertex alone, which the filter used to key on, also
+/// matched every *distinct* building whose ring merely starts at a corner it
+/// shares with a neighbour — on live OpenFreeMap tiles that deleted 7.3 % of
+/// the footprint in Bern's old town and 4.1 % at Zürich HB.
+///
+/// A building that two tiles clip *differently* is not a duplicate under this
+/// key and is rasterised once per copy. That is harmless: every roof is
+/// resolved against the terrain before any is written, and the `max` write
+/// rule never stacks one copy on the other.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DuplicateKey {
+    rings: Vec<Vec<(i64, i64)>>,
+    /// The datum (0 absolute, 1 above ground) and the metres' bit pattern.
+    height: (u8, u64),
+}
+
+impl DuplicateKey {
+    /// `None` for a building without a single exterior vertex — such a
+    /// building is dropped by [`drop_duplicate_buildings`], as it always was.
+    pub(crate) fn new(
+        exterior: &[(f64, f64)],
+        holes: &[Vec<(f64, f64)>],
+        height: BuildingHeight,
+    ) -> Option<Self> {
+        if exterior.is_empty() {
+            return None;
+        }
+        let quantise = |ring: &[(f64, f64)]| -> Vec<(i64, i64)> {
+            ring.iter()
+                .map(|&(lon, lat)| {
+                    ((lon * 1_000_000.0).round() as i64, (lat * 1_000_000.0).round() as i64)
+                })
+                .collect()
+        };
+        let mut rings = Vec::with_capacity(1 + holes.len());
+        rings.push(quantise(exterior));
+        rings.extend(holes.iter().map(|h| quantise(h)));
+        let height = match height {
+            BuildingHeight::Absolute(v) => (0, v.to_bits()),
+            BuildingHeight::AboveGround(v) => (1, v.to_bits()),
+        };
+        Some(Self { rings, height })
+    }
+}
+
+/// Keep the first of every group of buildings sharing a [`DuplicateKey`], in
+/// order, and drop buildings that have no key. One rule for every place that
+/// merges vector tiles: [`load_pbf_building_dir`], the WASM surface pass and
+/// the GeoJSON export.
+pub(crate) fn drop_duplicate_buildings<T>(
+    buildings: &mut Vec<T>,
+    key: impl Fn(&T) -> Option<DuplicateKey>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    buildings.retain(|b| key(b).is_some_and(|k| seen.insert(k)));
 }
 
 /// Which terrain statistic under a footprint counts as its ground level.
@@ -378,16 +455,29 @@ pub struct RasterizeStats {
     pub median_roof_above_terrain: Option<f64>,
 }
 
-/// Pixels of *grid* whose centre falls inside *ring*, as (x, y).
-fn footprint_pixels<G: ElevGrid>(grid: &G, tile: &TileRef, ring: &[(f64, f64)]) -> Vec<(u32, u32)> {
+/// Pixels of *grid* whose centre falls inside *ring* and outside every one of
+/// *holes*, as (x, y).
+///
+/// Per-pixel point-in-polygon, so a hole is simply subtracted: a centre counts
+/// when it is in the exterior and in no interior ring. The scan stays inside
+/// the exterior's bounding box, and a building without holes takes exactly the
+/// path it always took.
+fn footprint_pixels<G: ElevGrid>(
+    grid: &G,
+    tile: &TileRef,
+    ring: &[(f64, f64)],
+    holes: &[Vec<(f64, f64)>],
+) -> Vec<(u32, u32)> {
     let size = grid.size_px() as f64;
+    let to_px = |&(lon, lat): &(f64, f64)| {
+        ((lon - tile.ul_lon) / tile.scale_x, (tile.ul_lat - lat) / tile.scale_y)
+    };
     let mut verts: Vec<(f64, f64)> = Vec::with_capacity(ring.len());
     let (mut min_x, mut max_x) = (size, 0.0f64);
     let (mut min_y, mut max_y) = (size, 0.0f64);
 
-    for &(lon, lat) in ring {
-        let px = (lon - tile.ul_lon) / tile.scale_x;
-        let py = (tile.ul_lat - lat) / tile.scale_y;
+    for v in ring {
+        let (px, py) = to_px(v);
         min_x = min_x.min(px);
         max_x = max_x.max(px);
         min_y = min_y.min(py);
@@ -399,6 +489,14 @@ fn footprint_pixels<G: ElevGrid>(grid: &G, tile: &TileRef, ring: &[(f64, f64)]) 
         return Vec::new();
     }
 
+    // A ring of fewer than three vertices encloses nothing (and an empty one
+    // would underflow `point_in_poly`'s index).
+    let hole_verts: Vec<Vec<(f64, f64)>> = holes
+        .iter()
+        .filter(|h| h.len() >= 3)
+        .map(|h| h.iter().map(to_px).collect())
+        .collect();
+
     let start_x = min_x.floor().max(0.0) as u32;
     let end_x = max_x.ceil().min(size) as u32;
     let start_y = min_y.floor().max(0.0) as u32;
@@ -408,7 +506,10 @@ fn footprint_pixels<G: ElevGrid>(grid: &G, tile: &TileRef, ring: &[(f64, f64)]) 
     for y in start_y..end_y {
         let cy = y as f64 + 0.5;
         for x in start_x..end_x {
-            if point_in_poly(x as f64 + 0.5, cy, &verts) {
+            let cx = x as f64 + 0.5;
+            if point_in_poly(cx, cy, &verts)
+                && !hole_verts.iter().any(|h| point_in_poly(cx, cy, h))
+            {
                 out.push((x, y));
             }
         }
@@ -433,6 +534,9 @@ fn ground_level(samples: &mut [i16], how: GroundRef) -> Option<i16> {
 }
 
 /// Rasterize *buildings* onto *grid*, compositing each roof with `max`.
+///
+/// A building's footprint is its exterior ring minus its [`Building::holes`]:
+/// a courtyard is neither raised nor sampled as the building's ground.
 ///
 /// Runs in two passes so that overlapping footprints cannot contaminate one
 /// another: every ground reference is read while the surface is still pure
@@ -471,7 +575,7 @@ pub fn rasterize_buildings<G: ElevGrid>(
             resolved.push(None);
             continue;
         }
-        let pixels = footprint_pixels(grid, tile, &bldg.coords);
+        let pixels = footprint_pixels(grid, tile, &bldg.coords, &bldg.holes);
         if pixels.is_empty() {
             stats.buildings_off_tile += 1;
             resolved.push(None);
@@ -521,7 +625,7 @@ pub fn rasterize_buildings<G: ElevGrid>(
     for (bldg, roof) in buildings.iter().zip(resolved) {
         let Some(roof) = roof else { continue };
         let mut any = false;
-        for (x, y) in footprint_pixels(grid, tile, &bldg.coords) {
+        for (x, y) in footprint_pixels(grid, tile, &bldg.coords, &bldg.holes) {
             if let Some(cur) = grid.get(x, y) {
                 if roof > cur {
                     grid.set(x, y, roof);
@@ -608,16 +712,13 @@ pub fn load_pbf_building_dir(pbf_dir: &Path) -> Result<PbfBuildingSet> {
 
     // Tiles overlap in their buffer zones, so the same building arrives more
     // than once. The `max` write rule makes that harmless, but dropping the
-    // duplicates saves rasterizing identical footprints repeatedly.
+    // duplicates saves rasterizing identical footprints repeatedly. Only a
+    // building identical in every ring and in height is one (`DuplicateKey`);
+    // one that two tiles clipped differently is drawn once per copy, which
+    // `max` makes harmless too. `decoded - buildings.len()` is what the
+    // `[Info] buildings_pbf_dir` / `[Buildings]` lines report as dropped.
     set.decoded = set.buildings.len();
-    let mut seen = std::collections::HashSet::new();
-    set.buildings.retain(|b| match b.coords.first() {
-        Some(&(lon, lat)) => seen.insert((
-            (lat * 1_000_000.0).round() as i64,
-            (lon * 1_000_000.0).round() as i64,
-        )),
-        None => false,
-    });
+    drop_duplicate_buildings(&mut set.buildings, Building::duplicate_key);
 
     Ok(set)
 }
@@ -641,6 +742,7 @@ pub(crate) mod tests {
                 (8.25, 47.45),
                 (8.25, 47.75),
             ],
+            holes: Vec::new(),
             height,
             source,
         }
@@ -935,6 +1037,7 @@ pub(crate) mod tests {
             if (max_z * 2.0).trunc() >= 0.0 {
                 let b = Building {
                     coords: ring.clone(),
+                    holes: Vec::new(),
                     height: BuildingHeight::Absolute(max_z),
                     source: HeightSource::AbsoluteZ,
                 };
@@ -1004,8 +1107,65 @@ pub(crate) mod tests {
         .encode_to_vec()
     }
 
+    /// MVT command stream for one polygon feature: every ring, in order.
+    pub(crate) fn poly_geometry(rings: &[Vec<(i32, i32)>]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let (mut cx, mut cy) = (0i32, 0i32);
+        for r in rings {
+            out.extend([(1 << 3) | 1, zz(r[0].0 - cx), zz(r[0].1 - cy)]);
+            (cx, cy) = r[0];
+            out.push((((r.len() - 1) as u32) << 3) | 2);
+            for &(x, y) in &r[1..] {
+                out.extend([zz(x - cx), zz(y - cy)]);
+                (cx, cy) = (x, y);
+            }
+            out.push((1 << 3) | 7);
+        }
+        out
+    }
+
+    /// An exterior ring in tile coordinates: clockwise with y down, i.e. a
+    /// positive surveyor's-formula area, as MVT spec 2.1 defines one.
+    pub(crate) fn exterior(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+        vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    }
+
+    /// An interior ring: the same rectangle wound the other way.
+    pub(crate) fn interior(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+        vec![(x0, y0), (x0, y1), (x1, y1), (x1, y0)]
+    }
+
+    /// A `building` layer tile: one polygon feature per `(render_height, rings)`.
+    pub(crate) fn building_tile(features: &[(f64, Vec<Vec<(i32, i32)>>)]) -> Vec<u8> {
+        use crate::mvt::{Feature, Layer, Tile, Value};
+        use prost::Message;
+
+        let mut values = Vec::new();
+        let mut feats = Vec::new();
+        for (i, (height, rings)) in features.iter().enumerate() {
+            values.push(Value { double_val: Some(*height), ..Default::default() });
+            feats.push(Feature {
+                id: Some(i as u64 + 1),
+                tags: vec![0, i as u32],
+                r#type: Some(3),
+                geometry: poly_geometry(rings),
+            });
+        }
+        Tile {
+            layers: vec![Layer {
+                name: "building".into(),
+                features: feats,
+                keys: vec!["render_height".into()],
+                values,
+                extent: Some(4096),
+                version: Some(2),
+            }],
+        }
+        .encode_to_vec()
+    }
+
     /// A `TileRef` covering exactly the XYZ tile *(z, x, y)*, at `size` px.
-    fn tile_ref_for(z: u32, x: u32, y: u32, size: u32) -> TileRef {
+    pub(crate) fn tile_ref_for(z: u32, x: u32, y: u32, size: u32) -> TileRef {
         use crate::download::{tx2lon, ty2lat};
         let (ul_lon, ul_lat) = (tx2lon(x, z), ty2lat(y, z));
         let (lr_lon, lr_lat) = (tx2lon(x + 1, z), ty2lat(y + 1, z));
@@ -1118,6 +1278,100 @@ pub(crate) mod tests {
             per_tile[0].iter().any(|&v| v != 200),
             "the fixture must actually draw a building, or this proves nothing"
         );
+    }
+
+    // ── The buffer-zone duplicate filter ───────────────────────────────────
+
+    /// A directory holding *tiles*, each `((x, y), its building features)` at z14.
+    fn pbf_dir_of(tiles: &[((u32, u32), Vec<(f64, Vec<Vec<(i32, i32)>>)>)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for ((x, y), features) in tiles {
+            std::fs::write(dir.path().join(format!("14_{x}_{y}.pbf")), building_tile(features))
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn distinct_buildings_sharing_a_first_vertex_both_survive() {
+        // Two neighbours whose rings both start at the corner they share —
+        // ordinary in a block of terraced houses. The filter used to key on
+        // the first vertex alone and deleted the second one (Bern's old town:
+        // -7.3 % of the footprint on live OpenFreeMap tiles).
+        let east = exterior(1000, 1000, 2000, 2000);
+        let west = vec![(1000, 1000), (1000, 2000), (0, 2000), (0, 1000)];
+        let dir = pbf_dir_of(&[((8531, 5752), vec![(12.0, vec![east]), (12.0, vec![west])])]);
+
+        let set = load_pbf_building_dir(dir.path()).unwrap();
+        assert_eq!(set.buildings[0].coords[0], set.buildings[1].coords[0], "fixture: one first vertex");
+        assert_eq!((set.decoded, set.buildings.len(), set.duplicates_dropped()), (2, 2, 0));
+
+        let size = 64u32;
+        let mut buf = vec![200i16; (size * size) as usize];
+        let mut g = I16Grid { buf: &mut buf, size };
+        let stats = rasterize_buildings(
+            &mut g,
+            &tile_ref_for(14, 8531, 5752, size),
+            &set.buildings,
+            &RasterOpts::default(),
+        );
+        assert_eq!(stats.buildings_hit, 2, "both houses are drawn");
+    }
+
+    #[test]
+    fn a_building_arriving_twice_through_the_buffer_is_kept_once() {
+        // The same house near the seam of 8531|8532: x 4000..4090 of the west
+        // tile is x -96..-6 in the east tile's buffer zone — the same ground,
+        // decoded from two tiles.
+        let copy_w = exterior(4000, 1000, 4090, 1090);
+        let copy_e = exterior(-96, 1000, -6, 1090);
+        let dir = pbf_dir_of(&[
+            ((8531, 5752), vec![(12.0, vec![copy_w.clone()])]),
+            ((8532, 5752), vec![(12.0, vec![copy_e.clone()])]),
+        ]);
+        let set = load_pbf_building_dir(dir.path()).unwrap();
+        assert_eq!((set.decoded, set.buildings.len(), set.duplicates_dropped()), (2, 1, 1));
+
+        // Not a duplicate: the same ring with another height, or the same
+        // exterior with a courtyard the other copy lacks.
+        let dir = pbf_dir_of(&[
+            ((8531, 5752), vec![(12.0, vec![copy_w.clone()])]),
+            ((8532, 5752), vec![(15.0, vec![copy_e.clone()])]),
+        ]);
+        assert_eq!(load_pbf_building_dir(dir.path()).unwrap().buildings.len(), 2);
+        let dir = pbf_dir_of(&[
+            ((8531, 5752), vec![(12.0, vec![copy_w])]),
+            ((8532, 5752), vec![(12.0, vec![copy_e, interior(-80, 1020, -20, 1070)])]),
+        ]);
+        assert_eq!(load_pbf_building_dir(dir.path()).unwrap().buildings.len(), 2);
+    }
+
+    #[test]
+    fn the_duplicate_key_is_every_vertex_in_order_and_the_height() {
+        let ring = vec![(7.45, 46.95), (7.46, 46.95), (7.46, 46.94), (7.45, 46.94)];
+        let key = |r: &[(f64, f64)], h: BuildingHeight| DuplicateKey::new(r, &[], h);
+        let h = BuildingHeight::AboveGround(12.0);
+
+        // Below the 1e-6° quantum is the same ring; one quantum off is not.
+        let mut nudged = ring.clone();
+        nudged[2].0 += 2.0e-7;
+        assert_eq!(key(&ring, h), key(&nudged, h));
+        nudged[2].0 += 1.0e-6;
+        assert_ne!(key(&ring, h), key(&nudged, h));
+
+        // Order counts, and so does the datum of the height.
+        let mut rotated = ring.clone();
+        rotated.rotate_left(1);
+        assert_ne!(key(&ring, h), key(&rotated, h));
+        assert_ne!(key(&ring, h), key(&ring, BuildingHeight::Absolute(12.0)));
+
+        // No exterior vertex, no key: such a building is dropped, as before.
+        assert_eq!(key(&[], h), None);
+        let mut v = vec![1, 2, 1, 3];
+        drop_duplicate_buildings(&mut v, |n| {
+            (*n != 3).then(|| key(&ring, BuildingHeight::AboveGround(*n as f64))).flatten()
+        });
+        assert_eq!(v, vec![1, 2], "first of each kept, in order; keyless dropped");
     }
 
     // ── The shared height ladder ────────────────────────────────────────────

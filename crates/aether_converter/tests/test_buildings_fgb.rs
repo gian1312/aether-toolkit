@@ -86,8 +86,11 @@ fn write_fgb(path: &Path, has_z: bool, columns: &[&str], features: &[Bldg]) {
 }
 
 /// A FlatGeobuf whose one feature is a polygon with **two** rings, so the
-/// geometry carries an `ends` array. Both squares are drawn as footprints.
-fn write_two_ring_fgb(path: &Path, a: &Bldg, b: &Bldg) {
+/// geometry carries an `ends` array: *outer* is the exterior, *inner* its
+/// interior ring — a courtyard. Both are written in the same (counter-
+/// clockwise) order on purpose: a FlatGeobuf says which ring is a hole by
+/// position, not by winding.
+fn write_courtyard_fgb(path: &Path, outer: &Bldg, inner: &Bldg) {
     let mut fgb = FgbWriter::create_with_options(
         "buildings",
         GeometryType::Polygon,
@@ -103,7 +106,7 @@ fn write_two_ring_fgb(path: &Path, a: &Bldg, b: &Bldg) {
     fgb.add_column("height", ColumnType::String, |_, _| {});
 
     fgb.polygon_begin(true, 2, 0).unwrap();
-    for ring in [a.ring(), b.ring()] {
+    for ring in [outer.ring(), inner.ring()] {
         fgb.linestring_begin(false, ring.len(), 0).unwrap();
         for (i, &(x, y)) in ring.iter().enumerate() {
             fgb.xy(x, y, i).unwrap();
@@ -363,23 +366,50 @@ fn a_single_type_flatgeobuf_is_not_dropped_for_lacking_a_per_feature_type() {
     assert!(raised_px(&run(job(dir.path(), "typed.abt", Some(&fgb)))) > 100);
 }
 
+/// A 12 m building at (7.4230, 46.9570), ~270 m square, around a ~90 m
+/// square courtyard.
+fn courtyard_fgb(dir: &Path) -> PathBuf {
+    let fgb = dir.join("rings.fgb");
+    write_courtyard_fgb(
+        &fgb,
+        &Bldg { lon: 7.4230, lat: 46.9570, half: 0.0012, z: None, props: &[] },
+        &Bldg { lon: 7.4230, lat: 46.9570, half: 0.0004, z: None, props: &[] },
+    );
+    fgb
+}
+
 #[test]
 fn ring_ends_are_point_counts_not_coordinate_offsets() {
     // A multi-ring polygon stores ring ends as POINT indices. Taking them as
     // `xy` slots halved every ring: with five-point rings each one collapsed
     // to two vertices and was discarded as degenerate, so a building with a
-    // courtyard drew nothing at all.
+    // courtyard drew nothing at all. (This used to be pinned with two
+    // disjoint rings in one polygon — not a valid polygon: its second ring
+    // is an interior ring outside the exterior, which now subtracts nothing
+    // and draws nothing.)
     let dir = tempfile::tempdir().unwrap();
-    let fgb = dir.path().join("rings.fgb");
-    write_two_ring_fgb(
-        &fgb,
-        &Bldg { lon: 7.4230, lat: 46.9570, half: 0.0006, z: None, props: &[] },
-        &Bldg { lon: 7.4245, lat: 46.9570, half: 0.0006, z: None, props: &[] },
-    );
+    let built = run(job(dir.path(), "rings.abt", Some(&courtyard_fgb(dir.path()))));
+    assert_eq!(at(&built, 7.4220, 46.9570), GROUND_M + 12.0, "west side of the ring");
+    assert_eq!(at(&built, 7.4240, 46.9578), GROUND_M + 12.0, "north-east of the ring");
+}
 
-    let built = run(job(dir.path(), "rings.abt", Some(&fgb)));
-    assert_eq!(at(&built, 7.4230, 46.9570), GROUND_M + 12.0, "first ring");
-    assert_eq!(at(&built, 7.4245, 46.9570), GROUND_M + 12.0, "second ring");
+#[test]
+fn a_courtyard_stays_at_the_terrain() {
+    // The first ring of a FlatGeobuf polygon is its exterior, every further
+    // ring a hole. Each ring used to be drawn as a building of its own, so
+    // the courtyard went up to the roof (inside the exterior's fill, and
+    // again as a "building"); the footprint is now the exterior minus it.
+    let dir = tempfile::tempdir().unwrap();
+    let built = run(job(dir.path(), "court.abt", Some(&courtyard_fgb(dir.path()))));
+    assert_eq!(at(&built, 7.4230, 46.9570), GROUND_M, "the courtyard's centre");
+    assert_eq!(at(&built, 7.4220, 46.9570), GROUND_M + 12.0, "the building around it");
+
+    // ~(2.4² - 0.8²)/2.4² of the exterior's pixels: the ring only.
+    let ring_only = raised_px(&built);
+    let pd = RES_M / 111_111.0;
+    let exterior_px = (0.0024 / pd).powi(2);
+    let ratio = ring_only as f64 / exterior_px;
+    assert!((0.84..0.94).contains(&ratio), "raised {ring_only} px of ~{exterior_px:.0}: {ratio:.3}");
 }
 
 // ── Fail loudly, report loudly (CLI surface) ──────────────────────────────

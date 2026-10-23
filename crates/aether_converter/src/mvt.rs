@@ -8,7 +8,8 @@ use anyhow::{anyhow, Result};
 use prost::Message;
 
 use crate::buildings::{
-    parse_leading_metres, resolve_building_height, Building, BuildingHeight, HeightSource,
+    drop_duplicate_buildings, parse_leading_metres, resolve_building_height, Building,
+    BuildingHeight, DuplicateKey, HeightSource,
 };
 
 // ── Protobuf message definitions (MVT spec v2.1) ──────────────
@@ -89,8 +90,10 @@ impl TryFrom<i32> for GeomType {
 // ── Extracted building ─────────────────────────────────────────
 
 pub struct BuildingPolygon {
-    /// Outer ring as (lon, lat) pairs in WGS84.
+    /// Exterior ring as (lon, lat) pairs in WGS84.
     pub coords: Vec<(f64, f64)>,
+    /// The exterior's interior rings (courtyards), as (lon, lat) pairs.
+    pub holes: Vec<Vec<(f64, f64)>>,
     /// Building height above ground in meters.
     pub height_m: f64,
     /// Which rung of the height ladder `height_m` came from.
@@ -105,9 +108,16 @@ impl BuildingPolygon {
     pub fn to_building(&self) -> Building {
         Building {
             coords: self.coords.clone(),
+            holes: self.holes.clone(),
             height: BuildingHeight::AboveGround(self.height_m),
             source: self.source,
         }
+    }
+
+    /// This building's identity for the buffer-zone duplicate filter — the
+    /// same key [`Building::duplicate_key`] gives its converted self.
+    pub(crate) fn duplicate_key(&self) -> Option<DuplicateKey> {
+        DuplicateKey::new(&self.coords, &self.holes, BuildingHeight::AboveGround(self.height_m))
     }
 }
 
@@ -122,6 +132,12 @@ pub struct ExtractStats {
     pub features_empty_geom: usize,
     pub features_no_rings: usize,
     pub features_short_ring: usize,
+    /// Interior rings attached to their exterior as holes (courtyards) —
+    /// before 0.2.9 each of these was drawn as a building of its own.
+    pub rings_interior: usize,
+    /// Rings of zero area in tile coordinates, skipped as degenerate.
+    pub rings_degenerate: usize,
+    /// Buildings out: one per exterior ring, holes included.
     pub buildings_out: usize,
     pub height_min: f64,
     pub height_max: f64,
@@ -146,17 +162,55 @@ fn tile_to_lat(y: u32, z: u32) -> f64 {
 // Coordinates are zigzag-encoded deltas in tile-local space (0..extent).
 
 pub(crate) fn decode_geometry(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u32, z: u32) -> Vec<Vec<(f64, f64)>> {
+    decode_rings(cmds, extent, tile_x, tile_y, z).into_iter().map(|r| r.coords).collect()
+}
+
+/// One decoded ring: its WGS84 vertices and its winding.
+pub(crate) struct DecodedRing {
+    /// Vertices as (lon, lat); the closing vertex is not repeated.
+    pub coords: Vec<(f64, f64)>,
+    /// Twice the signed area by the surveyor's formula over the ring's
+    /// **integer tile coordinates**, closing edge included — exact, and the
+    /// quantity MVT spec 2.1 §4.3.4.4 defines winding by: positive (clockwise
+    /// with y down) is an exterior ring, negative an interior ring, zero
+    /// degenerate.
+    pub area2: i128,
+}
+
+/// [`decode_geometry`], keeping each ring's winding.
+pub(crate) fn decode_rings(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u32, z: u32) -> Vec<DecodedRing> {
     let tile_w = tile_to_lon(tile_x + 1, z) - tile_to_lon(tile_x, z);
     let tile_n = tile_to_lat(tile_y, z);
     let tile_s = tile_to_lat(tile_y + 1, z);
     let tile_origin_lon = tile_to_lon(tile_x, z);
     let ext = extent as f64;
 
-    let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut rings: Vec<DecodedRing> = Vec::new();
     let mut ring: Vec<(f64, f64)> = Vec::new();
+    // The same vertices in tile coordinates, for an exact winding.
+    let mut ring_px: Vec<(i64, i64)> = Vec::new();
     let mut cx: i32 = 0;
     let mut cy: i32 = 0;
     let mut i = 0;
+
+    // A ring of three or more vertices is kept, anything shorter dropped —
+    // on MoveTo, on ClosePath and at the end of the stream, as before.
+    let finish = |rings: &mut Vec<DecodedRing>, ring: &mut Vec<(f64, f64)>, px: &mut Vec<(i64, i64)>| {
+        if ring.len() >= 3 {
+            let n = px.len();
+            let area2 = (0..n)
+                .map(|k| {
+                    let (x0, y0) = px[k];
+                    let (x1, y1) = px[(k + 1) % n];
+                    (x0 as i128) * (y1 as i128) - (x1 as i128) * (y0 as i128)
+                })
+                .sum();
+            rings.push(DecodedRing { coords: std::mem::take(ring), area2 });
+        } else {
+            ring.clear();
+        }
+        px.clear();
+    };
 
     while i < cmds.len() {
         let cmd_int = cmds[i];
@@ -167,8 +221,7 @@ pub(crate) fn decode_geometry(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u3
         match cmd_id {
             1 => {
                 // MoveTo — start new ring
-                if ring.len() >= 3 { rings.push(std::mem::take(&mut ring)); }
-                else { ring.clear(); }
+                finish(&mut rings, &mut ring, &mut ring_px);
 
                 for _ in 0..cmd_count {
                     if i + 1 >= cmds.len() { break; }
@@ -182,6 +235,7 @@ pub(crate) fn decode_geometry(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u3
                     // Latitude: linear interpolation in tile space between N and S edges
                     let lat = tile_n + (cy as f64 / ext) * (tile_s - tile_n);
                     ring.push((lon, lat));
+                    ring_px.push((cx as i64, cy as i64));
                 }
             }
             2 => {
@@ -197,20 +251,17 @@ pub(crate) fn decode_geometry(cmds: &[u32], extent: u32, tile_x: u32, tile_y: u3
                     let lon = tile_origin_lon + (cx as f64 / ext) * tile_w;
                     let lat = tile_n + (cy as f64 / ext) * (tile_s - tile_n);
                     ring.push((lon, lat));
+                    ring_px.push((cx as i64, cy as i64));
                 }
             }
             7 => {
                 // ClosePath — close current ring
-                if ring.len() >= 3 {
-                    rings.push(std::mem::take(&mut ring));
-                } else {
-                    ring.clear();
-                }
+                finish(&mut rings, &mut ring, &mut ring_px);
             }
             _ => { i += cmd_count * 2; } // skip unknown
         }
     }
-    if ring.len() >= 3 { rings.push(ring); }
+    finish(&mut rings, &mut ring, &mut ring_px);
 
     rings
 }
@@ -395,12 +446,21 @@ pub fn extract_buildings_from_tile(
             stats.features_polygon += 1;
 
             let (height, height_source) = resolve_height_detailed(feature, layer);
-            let rings = decode_geometry(&feature.geometry, extent, tile_x, tile_y, z);
+            let rings = decode_rings(&feature.geometry, extent, tile_x, tile_y, z);
 
-            // Each feature can be a multi-polygon: Planetiler merges individual
-            // buildings into single features. Each ring is a separate building.
-            // Outer rings (clockwise in tile space) are buildings; counter-clockwise
-            // rings are holes (courtyards). At z14, most rings are outer = buildings.
+            // A feature can be a multipolygon — Planetiler merges buildings into
+            // single features — and a polygon can have courtyards. MVT spec 2.1
+            // §4.3.4.4: every exterior ring begins a new polygon and its interior
+            // rings follow it, and winding tells them apart (exterior: positive
+            // area in tile coordinates, clockwise with y down). Each exterior is
+            // one building; each interior ring is a hole of the exterior before
+            // it, never a building of its own — drawing it as one raised every
+            // courtyard to its building's roof. Classified the way the reference
+            // decoder (vector-tile-js / MapLibre `classifyRings`) does it: the
+            // first ring's winding is the exterior winding, which on a
+            // spec-conformant tile is the positive one, and a tile written with
+            // the opposite convention still keeps its courtyards with their
+            // buildings.
             if rings.is_empty() {
                 stats.features_no_rings += 1;
             } else {
@@ -409,27 +469,36 @@ pub fn extract_buildings_from_tile(
                 } else {
                     stats.height_explicit_count += 1;
                 }
-                let mut ring_count = 0;
+                let mut exterior_positive: Option<bool> = None;
+                let first_out = buildings.len();
                 for ring in rings {
-                    if ring.len() < 3 {
+                    if ring.coords.len() < 3 {
                         stats.features_short_ring += 1;
                         continue;
                     }
-                    // Check winding: signed area > 0 = CCW in WGS84 = outer ring
-                    // (MVT CW in tile-space becomes CCW after lat-flip to WGS84)
-                    let signed_area: f64 = ring.windows(2)
-                        .map(|w| w[0].0 * w[1].1 - w[1].0 * w[0].1)
-                        .sum();
-                    if signed_area.abs() < 1e-14 { continue; } // degenerate
-                    // Take all rings as buildings — holes are rare at z14
-                    // and their small negative area is harmless for LOS
-                    stats.height_sum += height;
-                    if height < stats.height_min { stats.height_min = height; }
-                    if height > stats.height_max { stats.height_max = height; }
-                    buildings.push(BuildingPolygon { coords: ring, height_m: height, source: height_source });
-                    ring_count += 1;
+                    if ring.area2 == 0 {
+                        stats.rings_degenerate += 1;
+                        continue;
+                    }
+                    let positive = ring.area2 > 0;
+                    if *exterior_positive.get_or_insert(positive) == positive {
+                        stats.height_sum += height;
+                        if height < stats.height_min { stats.height_min = height; }
+                        if height > stats.height_max { stats.height_max = height; }
+                        buildings.push(BuildingPolygon {
+                            coords: ring.coords,
+                            holes: Vec::new(),
+                            height_m: height,
+                            source: height_source,
+                        });
+                    } else if let Some(owner) = buildings[first_out..].last_mut() {
+                        // Always taken: the first kept ring set the exterior
+                        // winding, so this feature has an exterior by now.
+                        owner.holes.push(ring.coords);
+                        stats.rings_interior += 1;
+                    }
                 }
-                if ring_count == 0 { stats.features_short_ring += 1; }
+                if buildings.len() == first_out { stats.features_short_ring += 1; }
             }
         }
     }
@@ -441,7 +510,6 @@ pub fn extract_buildings_from_tile(
 // ── Batch building application to .abt tiles ──────────────────────
 
 use crate::canopy::{apply_surface_to_abt_tiles, SurfaceOpts};
-use std::collections::HashSet;
 
 /// Result of applying buildings to a set of .abt tiles.
 pub struct ApplyBuildingsResult {
@@ -525,32 +593,146 @@ pub fn decode_buildings_to_geojson(
         }
     }
 
-    // Dedup
-    {
-        let mut seen = HashSet::new();
-        all_buildings.retain(|b| {
-            if b.coords.is_empty() { return false; }
-            let (lon, lat) = b.coords[0];
-            let key = ((lat * 1_000_000.0).round() as i64, (lon * 1_000_000.0).round() as i64);
-            seen.insert(key)
-        });
-    }
+    // Buffer-zone duplicates: the same whole-ring rule as the rasterising paths.
+    drop_duplicate_buildings(&mut all_buildings, BuildingPolygon::duplicate_key);
+
+    // One closed GeoJSON ring: the first vertex repeated at the end.
+    let push_ring = |out: &mut String, ring: &[(f64, f64)]| {
+        out.push('[');
+        for (j, &(lon, lat)) in ring.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            out.push_str(&format!("[{:.7},{:.7}]", lon, lat));
+        }
+        if let Some(&(lon, lat)) = ring.first() {
+            out.push_str(&format!(",[{:.7},{:.7}]", lon, lat));
+        }
+        out.push(']');
+    };
 
     let mut features = String::from("[");
     for (i, b) in all_buildings.iter().enumerate() {
         if i > 0 { features.push(','); }
         features.push_str("{\"type\":\"Feature\",\"properties\":{\"height\":");
         features.push_str(&format!("{:.1}", b.height_m));
-        features.push_str("},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[");
-        for (j, &(lon, lat)) in b.coords.iter().enumerate() {
-            if j > 0 { features.push(','); }
-            features.push_str(&format!("[{:.7},{:.7}]", lon, lat));
+        features.push_str("},\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[");
+        // The exterior first, then its courtyards as the Polygon's interior
+        // rings (RFC 7946 §3.1.6) — no longer as buildings of their own.
+        push_ring(&mut features, &b.coords);
+        for hole in &b.holes {
+            features.push(',');
+            push_ring(&mut features, hole);
         }
-        if let Some(&(lon, lat)) = b.coords.first() {
-            features.push_str(&format!(",[{:.7},{:.7}]", lon, lat));
-        }
-        features.push_str("]]}}");
+        features.push_str("]}}");
     }
     features.push(']');
     Ok(format!("{{\"type\":\"FeatureCollection\",\"features\":{}}}", features))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buildings::tests::{building_tile, exterior, interior, tile_ref_for};
+    use crate::buildings::{rasterize_buildings, I16Grid, RasterOpts};
+
+    const SIZE: u32 = 64;
+    const GROUND: i16 = 200; // 100 m in half-metres
+    const ROOF: i16 = 224; // + 12 m
+
+    /// Extract one z14 tile's buildings and burn them into flat terrain.
+    /// Tile space 0..4096 maps to 0..64 px, so `/64` converts.
+    fn burn(features: &[(f64, Vec<Vec<(i32, i32)>>)]) -> (Vec<BuildingPolygon>, ExtractStats, Vec<i16>, u32) {
+        let (polys, stats) = extract_buildings_from_pbf(&building_tile(features), 8531, 5752, 14).unwrap();
+        let model: Vec<Building> = polys.iter().map(|p| p.to_building()).collect();
+        let mut buf = vec![GROUND; (SIZE * SIZE) as usize];
+        let mut g = I16Grid { buf: &mut buf, size: SIZE };
+        let rs = rasterize_buildings(&mut g, &tile_ref_for(14, 8531, 5752, SIZE), &model, &RasterOpts::default());
+        (polys, stats, buf, rs.pixels_modified)
+    }
+
+    fn px(buf: &[i16], x: u32, y: u32) -> i16 {
+        buf[(y * SIZE + x) as usize]
+    }
+
+    #[test]
+    fn a_square_with_a_square_hole_raises_the_ring_not_the_courtyard() {
+        // Exterior px 16..48, courtyard px 24..40. Every ring used to be drawn
+        // as a building of its own, so the courtyard went up to the roof too:
+        // 1024 px raised instead of 32² - 16² = 768.
+        let (polys, stats, buf, raised) = burn(&[(
+            12.0,
+            vec![exterior(1024, 1024, 3072, 3072), interior(1536, 1536, 2560, 2560)],
+        )]);
+        assert_eq!(polys.len(), 1, "one building, not two");
+        assert_eq!(polys[0].holes.len(), 1);
+        assert_eq!((stats.buildings_out, stats.rings_interior), (1, 1));
+
+        assert_eq!(px(&buf, 20, 20), ROOF, "the ring is the building");
+        assert_eq!(px(&buf, 32, 32), GROUND, "the courtyard stays at the terrain");
+        assert_eq!(px(&buf, 24, 24), GROUND, "the hole's low edge is the hole's");
+        assert_eq!(px(&buf, 40, 40), ROOF, "its high edge is the building's");
+        assert_eq!(raised, 768);
+    }
+
+    #[test]
+    fn a_feature_with_two_exteriors_and_one_interior_is_two_buildings() {
+        // A: px 4..20 with a courtyard px 8..16; B: px 32..48, whole.
+        let a = exterior(256, 256, 1280, 1280);
+        let hole = interior(512, 512, 1024, 1024);
+        let b = exterior(2048, 2048, 3072, 3072);
+        let check = |polys: &[BuildingPolygon], buf: &[i16], raised: u32, holed: usize| {
+            assert_eq!(polys.len(), 2);
+            assert_eq!(polys[holed].holes.len(), 1, "the hole belongs to the exterior before it");
+            assert_eq!(polys[1 - holed].holes.len(), 0);
+            assert_eq!(raised, (16 * 16 - 8 * 8) + 16 * 16);
+            assert_eq!((px(buf, 5, 5), px(buf, 12, 12), px(buf, 40, 40)), (ROOF, GROUND, ROOF));
+        };
+
+        // Spec order: each exterior followed by its own interior rings.
+        let (polys, _, buf, raised) = burn(&[(12.0, vec![a.clone(), hole.clone(), b.clone()])]);
+        check(&polys, &buf, raised, 0);
+
+        // A writer with the opposite winding convention: the first ring sets
+        // what an exterior looks like, so the courtyard still pairs up.
+        let rev = |r: &Vec<(i32, i32)>| r.iter().rev().copied().collect::<Vec<_>>();
+        let (polys, _, buf, raised) = burn(&[(12.0, vec![rev(&a), rev(&hole), rev(&b)])]);
+        check(&polys, &buf, raised, 0);
+
+        // With the interior ring after B it is B's: the spec pairs a hole with
+        // the exterior before it, not with the one it happens to lie in.
+        let (polys, _, _, _) = burn(&[(12.0, vec![a, b, hole])]);
+        assert_eq!((polys[0].holes.len(), polys[1].holes.len()), (0, 1));
+    }
+
+    #[test]
+    fn a_degenerate_ring_is_skipped_and_sets_no_winding() {
+        // A zero-area first ring must neither become a building nor decide
+        // which winding is "exterior" for the rings after it.
+        let flat = vec![(100, 100), (300, 100), (200, 100)];
+        let (polys, stats, buf, _) = burn(&[(
+            12.0,
+            vec![flat, exterior(1024, 1024, 3072, 3072), interior(1536, 1536, 2560, 2560)],
+        )]);
+        assert_eq!(stats.rings_degenerate, 1);
+        assert_eq!((polys.len(), polys[0].holes.len()), (1, 1));
+        assert_eq!((px(&buf, 20, 20), px(&buf, 32, 32)), (ROOF, GROUND));
+    }
+
+    #[test]
+    fn the_geojson_export_carries_a_courtyard_as_an_interior_ring() {
+        let tile = building_tile(&[(
+            12.0,
+            vec![exterior(1024, 1024, 3072, 3072), interior(1536, 1536, 2560, 2560)],
+        )]);
+        let json = decode_buildings_to_geojson(&[tile], &[8531], &[5752], 14).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let features = doc["features"].as_array().unwrap();
+        assert_eq!(features.len(), 1, "the courtyard is no feature of its own");
+        let rings = features[0]["geometry"]["coordinates"].as_array().unwrap();
+        assert_eq!(rings.len(), 2, "exterior, then the interior ring");
+        for ring in rings {
+            let ring = ring.as_array().unwrap();
+            assert_eq!(ring.len(), 5, "four corners, closed");
+            assert_eq!(ring[0], ring[4]);
+        }
+    }
 }

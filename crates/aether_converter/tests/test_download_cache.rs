@@ -7,10 +7,15 @@
 //! and `[Stats] Tiles:` must be identical whether a tile came from the cache
 //! or the network.
 //!
+//! Since changelog 40 a tile without an entry is DERIVED from the cached
+//! tiles of up to four finer zooms when they cover it — the 2 × 2 means of
+//! their samples, stored with status 3 — so a job never fetches ground the
+//! cache holds at a finer zoom (section 7 below).
+//!
 //! Contract surface: `docs/CONTRACT.md` §9b (`cache_dir`, the pack format),
-//! changelog 38 (`[Download] cache:`, `[Stats] Cache:`). The tile source is
-//! a loopback HTTP server that counts every request, so these tests assert
-//! on what went over the wire.
+//! changelog 38 (`[Download] cache:`, `[Stats] Cache:`) and 40. The tile
+//! source is a loopback HTTP server that counts every request, so these
+//! tests assert on what went over the wire.
 
 mod common;
 
@@ -223,9 +228,9 @@ fn a_second_run_fetches_nothing_and_writes_the_same_bytes() {
     assert_eq!(n, 12, "the 3 × 4 block");
     assert_eq!(requests(&counts), n);
     assert!(counts.lock().unwrap().values().all(|&c| c == 1), "each tile once");
-    assert_eq!(line(&err_a, "[Download] cache:"), format!("[Download] cache: 0 of {n} source tiles from cache"));
+    assert_eq!(line(&err_a, "[Download] cache:"), format!("[Download] cache: 0 of {n} source tiles from cache (0 derived)"));
     assert_eq!(line(&err_a, "[Stats] Cache:"),
-               format!("[Stats] Cache: 0 hits, {n} fetched, {n} written to {}", cache.display()));
+               format!("[Stats] Cache: 0 hits (0 derived), {n} fetched, {n} written to {}", cache.display()));
     assert_eq!(line(&err_a, "[Stats] Tiles:"), format!("[Stats] Tiles: {n}/{n} OK (100.0% success)"));
     // The `[Stats] Cache:` line is the block's last [Stats] line.
     let last_stats = err_a.lines().filter(|l| l.starts_with("[Stats] ")).last().unwrap();
@@ -259,9 +264,9 @@ fn a_second_run_fetches_nothing_and_writes_the_same_bytes() {
     let err_b = run_ok(&job_b, dir.path());
     assert_eq!(requests(&counts), n, "the cached run made no request:\n{err_b}");
     assert_eq!(fetch_total(&err_b), n);
-    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache"));
+    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
     assert_eq!(line(&err_b, "[Stats] Cache:"),
-               format!("[Stats] Cache: {n} hits, 0 fetched, 0 written to {}", cache.display()));
+               format!("[Stats] Cache: {n} hits (0 derived), 0 fetched, 0 written to {}", cache.display()));
     assert_eq!(line(&err_b, "[Stats] Tiles:"), line(&err_a, "[Stats] Tiles:"));
     assert_eq!(progress(&err_b), progress(&err_a), "the same progress lines");
     assert!(!err_b.contains("[Warn]"), "{err_b}");
@@ -293,7 +298,7 @@ fn another_zoom_and_another_service_get_their_own_directories() {
     let (j13, _) = write_job(dir.path(), port1, "s1z13", 13, &specs, cache_field(&cache));
     let e13 = run_ok(&j13, dir.path());
     assert_eq!(line(&e13, "[Download] cache:"),
-               format!("[Download] cache: 0 of {} source tiles from cache", fetch_total(&e13)),
+               format!("[Download] cache: 0 of {} source tiles from cache (0 derived)", fetch_total(&e13)),
                "z12 tiles are no z13 tiles");
     assert_eq!(requests_at(&counts1, 12), fetch_total(&e12));
     assert_eq!(requests_at(&counts1, 13), fetch_total(&e13));
@@ -302,7 +307,7 @@ fn another_zoom_and_another_service_get_their_own_directories() {
     let (j2, _) = write_job(dir.path(), port2, "s2z12", 12, &specs, cache_field(&cache));
     let e2 = run_ok(&j2, dir.path());
     assert_eq!(line(&e2, "[Download] cache:"),
-               format!("[Download] cache: 0 of {} source tiles from cache", fetch_total(&e2)));
+               format!("[Download] cache: 0 of {} source tiles from cache (0 derived)", fetch_total(&e2)));
     assert_eq!(requests(&counts2), fetch_total(&e2));
 
     let svc = services(&cache);
@@ -334,7 +339,7 @@ fn another_zoom_and_another_service_get_their_own_directories() {
     let (j12b, _) = write_job(dir.path(), port1, "s1z12b", 12, &specs, cache_field(&cache));
     let n = fetch_total(&e12);
     assert_eq!(line(&run_ok(&j12b, dir.path()), "[Download] cache:"),
-               format!("[Download] cache: {n} of {n} source tiles from cache"));
+               format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
 }
 
 // ── 3. A 404 is remembered — and so are the parents that filled it ──────────
@@ -359,7 +364,7 @@ fn not_found_tiles_and_their_parent_fill_are_remembered() {
     assert_eq!(line(&err_a, "[Stats] Repaired from coarser parent tiles:"),
                format!("[Stats] Repaired from coarser parent tiles: {gaps} (missing at this zoom, present at a lower one)"));
     assert_eq!(line(&err_a, "[Stats] Cache:"),
-               format!("[Stats] Cache: 0 hits, {n} fetched, {n} written to {}", cache.display()),
+               format!("[Stats] Cache: 0 hits (0 derived), {n} fetched, {n} written to {}", cache.display()),
                "a 404 is written as well");
     let parents_a = requests(&counts) - requests_at(&counts, 12);
     assert!(parents_a > 0);
@@ -376,7 +381,7 @@ fn not_found_tiles_and_their_parent_fill_are_remembered() {
     let (job_b, out_b) = write_job(dir.path(), port, "b", Z, &specs, cache_field(&cache));
     let err_b = run_ok(&job_b, dir.path());
     assert_eq!(requests(&counts), before, "the cached run made requests:\n{err_b}");
-    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache"));
+    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
     assert_eq!(line(&err_b, "[Stats] Cache, coarser parents:"),
                format!("[Stats] Cache, coarser parents: {parents_a} hits, 0 fetched, 0 written"));
     for p in ["[Stats] Tiles:", "[Stats] Repaired from coarser parent tiles:"] {
@@ -458,9 +463,9 @@ fn a_corrupt_or_undecodable_entry_is_refetched_and_repaired() {
     want.sort();
     assert_eq!(asked, want, "only the three bad entries went to the server");
     // All three were found in the index; they failed when read.
-    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache"));
+    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
     assert_eq!(line(&err_b, "[Stats] Cache:"),
-               format!("[Stats] Cache: {} hits, 3 fetched, 3 written to {}", n - 3, cache.display()));
+               format!("[Stats] Cache: {} hits (0 derived), 3 fetched, 3 written to {}", n - 3, cache.display()));
     assert_eq!(line(&err_b, "[Stats] Tiles:"), format!("[Stats] Tiles: {n}/{n} OK (100.0% success)"));
     assert!(read_dir_bytes(&out_a) == read_dir_bytes(&out_b));
 
@@ -477,7 +482,7 @@ fn a_corrupt_or_undecodable_entry_is_refetched_and_repaired() {
     let err_c = run_ok(&job_c, dir.path());
     assert_eq!(*counts.lock().unwrap(), after, "{err_c}");
     assert_eq!(line(&err_c, "[Stats] Cache:"),
-               format!("[Stats] Cache: {n} hits, 0 fetched, 0 written to {}", cache.display()));
+               format!("[Stats] Cache: {n} hits (0 derived), 0 fetched, 0 written to {}", cache.display()));
     assert!(read_dir_bytes(&out_c) == read_dir_bytes(&out_a));
 }
 
@@ -514,7 +519,7 @@ fn two_concurrent_downloads_share_one_cache_cleanly() {
     let err_c = run_ok(&job_c, dir.path());
     assert_eq!(requests(&counts), fetched, "{err_c}");
     assert_eq!(line(&err_c, "[Stats] Cache:"),
-               format!("[Stats] Cache: {n} hits, 0 fetched, 0 written to {}", cache.display()));
+               format!("[Stats] Cache: {n} hits (0 derived), 0 fetched, 0 written to {}", cache.display()));
     assert!(read_dir_bytes(&out_c) == read_dir_bytes(&out_a));
 
     // Control without a cache.
@@ -543,13 +548,13 @@ fn every_query_gets_its_own_directory_and_no_key_reaches_the_disk() {
     let (job_b, out_b) = write_job(dir.path(), port, "b", Z, &specs, keyed("second-secret"));
     let err_b = run_ok(&job_b, dir.path());
     assert_eq!(requests(&counts), 2 * n, "{err_b}");
-    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: 0 of {n} source tiles from cache"));
+    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: 0 of {n} source tiles from cache (0 derived)"));
     assert!(read_dir_bytes(&out_a) == read_dir_bytes(&out_b));
     // The first query again: its own directory is whole.
     let (job_c, out_c) = write_job(dir.path(), port, "c", Z, &specs, keyed("first-secret"));
     let err_c = run_ok(&job_c, dir.path());
     assert_eq!(requests(&counts), 2 * n, "{err_c}");
-    assert_eq!(line(&err_c, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache"));
+    assert_eq!(line(&err_c, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
     assert!(read_dir_bytes(&out_c) == read_dir_bytes(&out_a));
 
     // Two directories; each service.json records the template without its
@@ -657,7 +662,7 @@ fn a_repair_refetches_its_listed_tile_and_replaces_the_cached_answer() {
     assert_eq!(line(&err_r, "[Download] cache:"),
                "[Download] cache: 0 of 1 source tiles from cache (a repair refetches every listed tile)");
     assert_eq!(line(&err_r, "[Stats] Cache:"),
-               format!("[Stats] Cache: 0 hits, 1 fetched, 1 written to {}", cache.display()));
+               format!("[Stats] Cache: 0 hits (0 derived), 1 fetched, 1 written to {}", cache.display()));
     let new = entry(&std::fs::read(&pack_path).unwrap(), ty);
     assert_ne!(new.3, old.3, "the entry holds the fresh body now");
     assert!(new.0 > old.0, "appended");
@@ -668,7 +673,7 @@ fn a_repair_refetches_its_listed_tile_and_replaces_the_cached_answer() {
     let (job_b, out_b) = write_job(dir.path(), port, "b", Z, &specs, cache_field(&cache));
     let err_b = run_ok(&job_b, dir.path());
     assert_eq!(requests(&counts), before, "{err_b}");
-    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache"));
+    assert_eq!(line(&err_b, "[Download] cache:"), format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
     let (job_c, out_c) = write_job(dir.path(), port, "c", Z, &specs, serde_json::json!({}));
     run_ok(&job_c, dir.path());
     assert!(read_dir_bytes(&out_b) == read_dir_bytes(&out_c));
@@ -707,4 +712,290 @@ fn a_cached_run_needs_no_slot_and_any_strip_size_writes_the_same_bytes() {
     assert_eq!((report.tiles_fetched, report.strips, report.max_strip_rows), (n, 4, 1));
     assert_eq!(requests(&counts), n);
     assert!(read_dir_bytes(&out_c) == read_dir_bytes(&out_a));
+}
+
+// ── 7. Deriving a tile from the finer tiles the cache holds (changelog 40) ──
+
+/// `(north, south, west, east)` of tile `(x, y)` at zoom `z`.
+fn tile_box_at(z: u32, x: u32, y: u32) -> (f64, f64, f64, f64) {
+    (ty2lat(y, z), ty2lat(y + 1, z), tx2lon(x, z), tx2lon(x + 1, z))
+}
+
+/// One 16 px spec inside each of `tiles` (at zoom `z`): a job at `z` over
+/// them fetches exactly `tiles`.
+fn inner_specs(z: u32, tiles: &[(u32, u32)]) -> Vec<serde_json::Value> {
+    tiles.iter().map(|&(x, y)| {
+        let (n, s, w, e) = tile_box_at(z, x, y);
+        spec(&format!("z{z}_{x}_{y}.abt"), n - (n - s) * 0.25, w + (e - w) * 0.25, (e - w) * 0.25, 16)
+    }).collect()
+}
+
+/// The z12 tiles of the `cols × rows` block from (`TX0`, `TY0`).
+fn block(cols: u32, rows: u32) -> Vec<(u32, u32)> {
+    (TX0..TX0 + cols).flat_map(|x| (TY0..TY0 + rows).map(move |y| (x, y))).collect()
+}
+
+/// The tiles `k` zooms below `tiles`, each tile's in one go.
+fn under(tiles: &[(u32, u32)], k: u32) -> Vec<(u32, u32)> {
+    let n = 1 << k;
+    tiles.iter()
+        .flat_map(|&(x, y)| (0..n).flat_map(move |dx| (0..n).map(move |dy| (x * n + dx, y * n + dy))))
+        .collect()
+}
+
+/// The samples (metres, row-major 256 × 256) a server whose finest zoom is
+/// `fine` (that zoom: [`tile_ground`]) serves at zoom `z <= fine`: above
+/// `fine`, each sample the mean of the 2 × 2 samples under it one zoom finer
+/// — exactly what the cache derives (no voids here, and every mean of these
+/// integers lands on Terrarium's 1/256 m grid, so no rounding is involved).
+fn averaged(fine: u32, z: u32, x: u32, y: u32) -> Vec<f64> {
+    if z == fine {
+        let g = tile_ground(z, x, y);
+        return (0..256 * 256).map(|i| g(i % 256, i / 256) as f64).collect();
+    }
+    let kids: Vec<Vec<f64>> = [(0, 0), (1, 0), (0, 1), (1, 1)].iter()
+        .map(|&(dx, dy)| averaged(fine, z + 1, 2 * x + dx, 2 * y + dy))
+        .collect();
+    (0..256 * 256).map(|i| {
+        let (px, py) = (i % 256, i / 256);
+        let c = &kids[(px / 128) + 2 * (py / 128)];
+        let (sx, sy) = (2 * (px % 128), 2 * (py % 128));
+        (c[sy * 256 + sx] + c[sy * 256 + sx + 1] + c[(sy + 1) * 256 + sx] + c[(sy + 1) * 256 + sx + 1]) / 4.0
+    }).collect()
+}
+
+/// A 256 px Terrarium PNG of `v` (metres on the 1/256 m grid — asserted).
+fn terrarium_png_exact(v: &[f64]) -> Vec<u8> {
+    let mut px = Vec::with_capacity(256 * 256 * 3);
+    for &m in v {
+        let k = (m + 32768.0) * 256.0;
+        assert_eq!(k.fract(), 0.0, "{m} m is not on Terrarium's grid");
+        let k = k as u32;
+        px.extend_from_slice(&[(k >> 16) as u8, (k >> 8) as u8, k as u8]);
+    }
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, 256, 256);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&px).unwrap();
+    }
+    out
+}
+
+/// A server whose finest zoom is `fine` and whose coarser zooms down to
+/// `coarsest` hold the 2 × 2 averages of it ([`averaged`]); nothing else.
+fn averaging_server(fine: u32, coarsest: u32) -> (u16, TileCounts) {
+    serve_tiles(memo(move |z, x, y| (coarsest..=fine).contains(&z).then(|| {
+        if z == fine { terrarium_png(tile_ground(z, x, y)) } else { terrarium_png_exact(&averaged(fine, z, x, y)) }
+    })))
+}
+
+/// The requests made since `before`, by tile.
+fn asked_since(c: &TileCounts, before: &HashMap<(u32, u32, u32), usize>) -> Vec<(u32, u32, u32)> {
+    let mut v: Vec<_> = c.lock().unwrap().iter()
+        .filter(|(k, n)| before.get(k).copied().unwrap_or(0) < **n).map(|(k, _)| *k).collect();
+    v.sort();
+    v
+}
+
+/// Every entry of `tiles` at zoom `z` under service directory `svc` has
+/// status `want`; for a body, its CRC is that of a PNG.
+fn assert_entries(svc: &Path, z: u32, tiles: &[(u32, u32)], want: u8) {
+    for &(x, y) in tiles {
+        let pack = std::fs::read(svc.join(format!("z{z}")).join(format!("x{x}_y{}.pack", y / 256))).unwrap();
+        let (off, len, status, crc) = entry(&pack, y);
+        assert_eq!(status, want, "z{z} ({x}, {y})");
+        if want != 2 {
+            let body = &pack[off as usize..off as usize + len as usize];
+            assert_eq!(crc, crc32(body), "z{z} ({x}, {y})");
+            assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "z{z} ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn a_tile_cached_one_zoom_finer_is_derived_without_a_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let (port, counts) = averaging_server(13, 12);
+    let tiles = block(3, 4);
+    let fine = under(&tiles, 1);
+
+    // Run P: a z13 job over the block's 48 children caches them (rows
+    // 3068..3075 straddle the z13 pack boundary at 3072 = 12 · 256).
+    let (job_p, _) = write_job(dir.path(), port, "p", 13, &inner_specs(13, &fine), cache_field(&cache));
+    let err_p = run_ok(&job_p, dir.path());
+    assert_eq!(fetch_total(&err_p), 48);
+    assert_eq!(requests_at(&counts, 13), 48);
+
+    // Run D: the z12 job asks for nothing — every tile is derived.
+    let specs = block_specs(TX0, TY0, 3, 4);
+    let before = requests(&counts);
+    let (job_d, out_d) = write_job(dir.path(), port, "d", Z, &specs, cache_field(&cache));
+    let err_d = run_ok(&job_d, dir.path());
+    assert_eq!(requests(&counts), before, "the derived run made requests:\n{err_d}");
+    let n = fetch_total(&err_d);
+    assert_eq!(n, 12);
+    assert_eq!(line(&err_d, "[Download] cache:"),
+               format!("[Download] cache: {n} of {n} source tiles from cache ({n} derived)"));
+    assert_eq!(line(&err_d, "[Stats] Cache:"),
+               format!("[Stats] Cache: {n} hits ({n} derived), 0 fetched, {n} written to {}", cache.display()));
+    assert_eq!(line(&err_d, "[Stats] Tiles:"), format!("[Stats] Tiles: {n}/{n} OK (100.0% success)"));
+    assert!(!err_d.contains("[Warn]") && !has_line(&err_d, "[Stats] Cache, coarser parents:"), "{err_d}");
+
+    // Run R: the same job served by the server's own z12 tiles, which hold
+    // those very 2 × 2 means — the same bytes, the same progress.
+    let (job_r, out_r) = write_job(dir.path(), port, "r", Z, &specs, serde_json::json!({}));
+    let err_r = run_ok(&job_r, dir.path());
+    assert_eq!(requests_at(&counts, 12), n);
+    let (d, r) = (read_dir_bytes(&out_d), read_dir_bytes(&out_r));
+    assert_eq!(d.len(), specs.len());
+    assert!(d == r, "the derived tiles wrote other .abt bytes than the served ones");
+    assert_eq!(progress(&err_d), progress(&err_r));
+    assert_eq!(line(&err_d, "[Stats] Tiles:"), line(&err_r, "[Stats] Tiles:"));
+
+    // Stored with status 3, CRC-checked PNGs; the z13 entries untouched.
+    let svc = services(&cache).remove(0).0;
+    assert_entries(&svc, 12, &tiles, 3);
+    assert_entries(&svc, 13, &fine, 1);
+
+    // Run D2: a later z12 job reads them back — hits, nothing derived.
+    let (job_d2, out_d2) = write_job(dir.path(), port, "d2", Z, &specs, cache_field(&cache));
+    let err_d2 = run_ok(&job_d2, dir.path());
+    assert_eq!(requests(&counts), before + n, "{err_d2}");
+    assert_eq!(line(&err_d2, "[Download] cache:"),
+               format!("[Download] cache: {n} of {n} source tiles from cache (0 derived)"));
+    assert_eq!(line(&err_d2, "[Stats] Cache:"),
+               format!("[Stats] Cache: {n} hits (0 derived), 0 fetched, 0 written to {}", cache.display()));
+    assert!(read_dir_bytes(&out_d2) == r);
+}
+
+#[test]
+fn a_cascade_derives_two_zooms_up_stores_the_middle_one_and_a_later_run_reuses_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let (port, counts) = averaging_server(14, 12);
+    let tiles = block(3, 4);
+    let mid = under(&tiles, 1);
+    let fine = under(&tiles, 2);
+
+    // Run P: z14 only — 192 tiles.
+    let (job_p, _) = write_job(dir.path(), port, "p", 14, &inner_specs(14, &fine), cache_field(&cache));
+    assert_eq!(fetch_total(&run_ok(&job_p, dir.path())), 192);
+    assert_eq!(requests(&counts), 192);
+
+    // Run D: z12 from z14 through 48 derived z13 tiles, no request.
+    let specs = block_specs(TX0, TY0, 3, 4);
+    let (job_d, out_d) = write_job(dir.path(), port, "d", Z, &specs, cache_field(&cache));
+    let err_d = run_ok(&job_d, dir.path());
+    assert_eq!(requests(&counts), 192, "the derived run made requests:\n{err_d}");
+    assert_eq!(line(&err_d, "[Download] cache:"), "[Download] cache: 12 of 12 source tiles from cache (12 derived)");
+    assert_eq!(line(&err_d, "[Stats] Cache:"),
+               format!("[Stats] Cache: 12 hits (12 derived), 0 fetched, 60 written to {}", cache.display()),
+               "12 z12 tiles and their 48 z13 intermediates");
+    let svc = services(&cache).remove(0).0;
+    assert_entries(&svc, 12, &tiles, 3);
+    assert_entries(&svc, 13, &mid, 3);
+    let (job_r, out_r) = write_job(dir.path(), port, "r", Z, &specs, serde_json::json!({}));
+    run_ok(&job_r, dir.path());
+    assert!(read_dir_bytes(&out_d) == read_dir_bytes(&out_r), "means of means differ from the served z12");
+
+    // Run L: a z13 job over the middle zoom finds the intermediates as hits.
+    let before = requests(&counts);
+    let specs13 = inner_specs(13, &mid);
+    let (job_l, out_l) = write_job(dir.path(), port, "l", 13, &specs13, cache_field(&cache));
+    let err_l = run_ok(&job_l, dir.path());
+    assert_eq!(requests(&counts), before, "{err_l}");
+    assert_eq!(line(&err_l, "[Download] cache:"), "[Download] cache: 48 of 48 source tiles from cache (0 derived)");
+    let (job_l2, out_l2) = write_job(dir.path(), port, "l2", 13, &specs13, serde_json::json!({}));
+    run_ok(&job_l2, dir.path());
+    assert_eq!(requests_at(&counts, 13), 48);
+    assert!(read_dir_bytes(&out_l) == read_dir_bytes(&out_l2), "the stored z13 tiles differ from the served ones");
+}
+
+#[test]
+fn only_the_tiles_the_finer_cache_does_not_cover_are_requested() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let (port, counts) = averaging_server(13, 12);
+    let tiles = block(3, 4);
+    // The first two columns' children all cached; of the third column only
+    // three children of its first tile.
+    let covered = block(2, 4);
+    let mut fine = under(&covered, 1);
+    fine.extend(under(&[(TX0 + 2, TY0)], 1).into_iter().take(3));
+    let (job_p, _) = write_job(dir.path(), port, "p", 13, &inner_specs(13, &fine), cache_field(&cache));
+    run_ok(&job_p, dir.path());
+
+    let before = counts.lock().unwrap().clone();
+    let specs = block_specs(TX0, TY0, 3, 4);
+    let (job_d, out_d) = write_job(dir.path(), port, "d", Z, &specs, cache_field(&cache));
+    let err_d = run_ok(&job_d, dir.path());
+    let want: Vec<(u32, u32, u32)> = (TY0..TY0 + 4).map(|y| (Z, TX0 + 2, y)).collect();
+    assert_eq!(asked_since(&counts, &before), want, "exactly the third column, nothing finer:\n{err_d}");
+    assert_eq!(line(&err_d, "[Download] cache:"), "[Download] cache: 8 of 12 source tiles from cache (8 derived)");
+    assert_eq!(line(&err_d, "[Stats] Cache:"),
+               format!("[Stats] Cache: 8 hits (8 derived), 4 fetched, 12 written to {}", cache.display()));
+    let svc = services(&cache).remove(0).0;
+    assert_entries(&svc, 12, &covered, 3);
+    assert_entries(&svc, 12, &[(TX0 + 2, TY0), (TX0 + 2, TY0 + 3)], 1);
+    let (job_r, out_r) = write_job(dir.path(), port, "r", Z, &specs, serde_json::json!({}));
+    run_ok(&job_r, dir.path());
+    assert!(read_dir_bytes(&out_d) == read_dir_bytes(&out_r));
+    assert_eq!(tiles.len(), 12);
+}
+
+#[test]
+fn a_derived_404_goes_to_the_parent_fill_like_a_cached_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    // Tile T has no data at z13 (its four children 404) nor at z12; z11
+    // has. While `live` is false every zoom but z13 answers 200 with bytes
+    // that decode as nothing, so the z13 run's parent fill caches no
+    // ancestor of T — the z12 run must derive T's 404 from its children.
+    let t = (TX0 + 1, TY0 + 1);
+    let live = Arc::new(AtomicBool::new(false));
+    let l2 = live.clone();
+    let fine = memo(move |z, x, y| (z == 13 && (x / 2, y / 2) != t).then(|| terrarium_png(tile_ground(z, x, y))));
+    let coarse = memo(move |z, x, y| match z {
+        12 if (x, y) != t => Some(terrarium_png_exact(&averaged(13, 12, x, y))),
+        11 => Some(terrarium_png(tile_ground(z, x, y))),
+        _ => None,
+    });
+    let (port, counts) = serve_tiles(move |z, x, y| match z {
+        13 => fine(z, x, y),
+        _ if !l2.load(Ordering::SeqCst) => Some(b"not a tile".to_vec()),
+        _ => coarse(z, x, y),
+    });
+    let tiles = block(3, 4);
+    let (job_p, _) = write_job(dir.path(), port, "p", 13, &inner_specs(13, &under(&tiles, 1)), cache_field(&cache));
+    let err_p = run_ok(&job_p, dir.path());
+    assert!(line(&err_p, "[Stats] Cache, coarser parents:").ends_with(" fetched, 0 written"), "{err_p}");
+    live.store(true, Ordering::SeqCst);
+
+    let before = counts.lock().unwrap().clone();
+    let specs = block_specs(TX0, TY0, 3, 4);
+    let (job_d, out_d) = write_job(dir.path(), port, "d", Z, &specs, cache_field(&cache));
+    let err_d = run_ok(&job_d, dir.path());
+    let asked = asked_since(&counts, &before);
+    assert!(asked.iter().all(|k| k.0 < Z), "no z12 or z13 request: {asked:?}\n{err_d}");
+    assert!(asked.contains(&(11, t.0 / 2, t.1 / 2)), "T's z11 parent was fetched for the fill: {asked:?}");
+    assert_eq!(line(&err_d, "[Download] cache:"), "[Download] cache: 12 of 12 source tiles from cache (12 derived)");
+    assert_eq!(line(&err_d, "[Stats] Cache:"),
+               format!("[Stats] Cache: 12 hits (12 derived), 0 fetched, 11 written to {}", cache.display()),
+               "a derived 404 is not stored");
+    assert_eq!(line(&err_d, "[Stats] Repaired from coarser parent tiles:"),
+               "[Stats] Repaired from coarser parent tiles: 1 (missing at this zoom, present at a lower one)");
+    assert_eq!(line(&err_d, "[Stats] Cache, coarser parents:"),
+               "[Stats] Cache, coarser parents: 0 hits, 6 fetched, 6 written", "z11 with data, z10..z6 404");
+
+    // The same job from the server's z12 tiles — T's a 404 there — writes
+    // the same bytes and the same parsed lines.
+    let (job_r, out_r) = write_job(dir.path(), port, "r", Z, &specs, serde_json::json!({}));
+    let err_r = run_ok(&job_r, dir.path());
+    for p in ["[Stats] Tiles:", "[Stats] Repaired from coarser parent tiles:"] {
+        assert_eq!(line(&err_d, p), line(&err_r, p));
+    }
+    assert!(read_dir_bytes(&out_d) == read_dir_bytes(&out_r));
 }

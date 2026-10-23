@@ -690,6 +690,231 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    cache, a strip hands its tiles out column by column (a pack is a column;
 >    order never changes a byte). Older converters ignore `cache_dir`: gate
 >    on `aether_converter` 0.2.8 (§1.5).
+> 39. **CLI `download`: the RAM budget is fixed per run, tile memory is
+>    released per tile-row, outputs are opened once (§1.2, §9b;
+>    `aether_converter` 0.2.9; 2026-10-23).** No job-JSON change; `.abt`
+>    bytes are identical (the byte-identity tests of items 30, 36 and 38 —
+>    32-, 3- and 1-row strips, the whole-rectangle fetch, cached runs, a
+>    lost or slow first tile — pass unchanged; the new row-block writer is
+>    tested byte for byte against the per-row writer it replaces, and
+>    outputs held open against outputs reopened for each write). Motivation:
+>    a z15 pass on Windows downloaded in pulses — "available" RAM sank with
+>    the run's own unflushed output writes, the budget re-read before every
+>    strip sank with it, strips shrank to one tile-row of 611 tiles, and with
+>    two strips assembling only one could download, so the 256 connections
+>    drained to zero between strips. (a) **Budget fixed per run.** The
+>    budget (min(available / 4, 2 GiB), ≥ 256 MiB, as before) is read once,
+>    after the run's first tile (item 36b), and never again; the line reads
+>    `[Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available at
+>    start; fixed for the run)` (was `(<a> GB available; re-evaluated before
+>    every strip)`). The rows can still change once, when the tile edge is
+>    learnt only after the first strip was sized for 512 px: `[Download] RAM
+>    budget: <mb> MB, strip rows: <r> (re-sized for <e> px source tiles)`
+>    (was `(<a> GB available)`, on every change of the rows). Both keep the
+>    `[Download] RAM budget: ` prefix; they are informational. (b)
+>    **Per-row release.** An assembly owns each tile-row's decoded tiles
+>    apart and frees them as soon as it has copied that row into its grid,
+>    before the row is sampled and written. The row's share of the strip's
+>    bytes — the bytes reckoned at launch (with the edge known then),
+>    apportioned by tile count, the last row taking the rounding remainder —
+>    leaves the launch gate's count at that moment; whatever is left when an
+>    assembly ends (a failure part-way) leaves then, so exactly what a launch
+>    added comes back (tested: the count is 0 at the end of every run). The
+>    next strip therefore launches as soon as enough rows have drained, not
+>    once a whole strip is assembled. The launch rules are otherwise
+>    unchanged (≤ 5 strips ahead, 2 assembling at once, one tile-row of grid
+>    per assembly on top of the budget — 152.75 MiB for 611 tiles of
+>    256 px). (c) **Outputs opened once.** The output files are created with
+>    their headers before the first request, as before, and now stay open
+>    for the run: each (output, tile-row) block — every row's samples and
+>    the stride's zero padding, the same bytes as before — is one positional
+>    write (`pwrite` on unix, `WriteFile` at an offset on Windows) through
+>    that handle, so two assemblies writing rows of one file share no cursor
+>    and take no lock. Before, every block opened, seeked, wrote and closed
+>    its file. The tail fill uses the same handles, which close before the
+>    buildings post-pass. On unix the open-file raise (item 36g) asks for one
+>    descriptor per output on top of `2 × max_connections + 96`; where the
+>    outputs do not fit beside the connections, the connections keep their
+>    descriptors (never fewer connections than 0.2.8 runs) and each write
+>    opens its file as before, said once: `[Download] open-file limit <l>:
+>    <n> output tiles are opened for each write instead of held open (<d>
+>    descriptors would not fit)` (informational). (d) **New diagnostic,**
+>    once per run after the last assembly: `[Download] launch gate closed
+>    for <s> s (assembly behind the network)` — the time the run waited with
+>    no strip downloading because the next one did not fit the budget. It
+>    goes to `AETHER_DIAG_FILE` when that is set (item 37), else to stderr;
+>    no consumer may parse it. Unchanged: every parsed line, exit codes,
+>    retries, deadlines, the parent fill, the raw source-tile cache, repair
+>    jobs (they patch one file at a time and have no strips) and the
+>    in-memory and browser downloaders. Nothing to gate on: a consumer can
+>    tell this build by `--version` (0.2.9). Throughput on the Windows pass
+>    that motivated it is not yet measured.
+> 40. **CLI `download`: the raw source-tile cache derives a tile from the
+>    finer tiles it holds (§9b; additive; `aether_converter` 0.2.9;
+>    2026-10-23).** No job-JSON change. A fetch-set tile without a valid
+>    cache entry is no longer fetched when the cache holds the ground it
+>    covers at a finer zoom: it is **derived** from its four children one
+>    zoom finer, `(z+1, 2x+dx, 2y+dy)`, each of which must be a cached body,
+>    a cached 404, or itself derivable the same way — **four zooms deep at
+>    most** (tiles at `z+4` must be cached as they are; a z11 tile from z15
+>    reads 4 + 16 + 64 + 256 child entries). So after a 2 m/5 m run cached
+>    z15, a 10 m job (z14) over the same ground requests only the z14 tiles
+>    whose four z15 children are not all cached (at the edges of the ground
+>    the z15 run covered), and 30 m (z12) and 90 m (z11) jobs likewise derive
+>    where the fine cache reaches and fetch only where it does not. A
+>    partly covered tile is fetched whole — a missing child is never
+>    replaced by a void. Output pixel `(i, j)` is the mean of the 2 × 2
+>    samples `(2i + {0,1}, 2j + {0,1})` of the matching child quadrant,
+>    voids — samples at or below −11000 m, and a 404 child's whole quadrant —
+>    left out, void where all four are; four 404 children make a 404. The
+>    tile is encoded back in the service's own encoding as an 8-bit RGB PNG
+>    (Terrarium: `R·65536 + G·256 + B = round((v + 32768)·256)`, ties up,
+>    void = `0,0,0`; Mapbox: the triple whose **decoded** value is nearest
+>    `v`, so every value the decoder produces round-trips exactly — all 2²⁴
+>    triples checked for both encodings) and stored with the new index
+>    entry **status 3 = derived body** (validated and read like status 1),
+>    and so is every derived intermediate: a cascade costs four decodes per
+>    level once the level below is stored. A derived 404 is not stored
+>    (re-deriving it reads index entries only). Mapbox has no void value
+>    (its lowest, −10000 m, is terrain), so a Mapbox tile that would hold a
+>    void — a 404 child beside children with data — is not derived but
+>    fetched. Nothing is ever requested for a child. Whether a tile can be
+>    derived is judged before the first request from index entries alone (no
+>    body read); a derivation that then fails (a child body that fails its
+>    CRC or decode, children of different sizes) fetches the tile as before,
+>    and a tile whose own entry fails its CRC or decode is derived when it
+>    can be. A derived tile is a hit in every respect: no connection slot,
+>    no request, the same `[Download] <pct>%`, `[Stats] Tiles:`,
+>    `NO-DATA (HTTP 404):`, `Repaired …` and `DEGRADED:` counting, and a
+>    derived 404 goes to the parent fill exactly like a cached one. The
+>    parent fill itself never derives (a derived ancestor of a hole holds
+>    that hole) but reads status-3 entries like any other; repair jobs never
+>    derive their listed tiles. **Not bit-identical to the service:** a
+>    derived tile is our 2 × 2 average of the service's finer tiles, not the
+>    service's own coarser tile (a service builds its pyramid its own way —
+>    other resampling, other sources per zoom), so `.abt` bytes of a job
+>    that derives can differ from those of a run that fetched the coarse
+>    tiles; they are byte-identical to a run served coarse tiles that hold
+>    those very means (tested, one and two zooms deep, with a partly covered
+>    area and a derived 404). Pack version stays 1: a converter before 0.2.9
+>    reads status 3 as unknown — a miss — and refetches the tile, rewriting
+>    the entry as status 1; harmless. **Line changes** (informational, not
+>    parsed): `[Download] cache: <n> of <total> source tiles from cache
+>    (<derived> derived)` — `<n>` counts the derivable tiles too — and
+>    `[Stats] Cache: <hits> hits (<derived> derived), <fetched> fetched,
+>    <written> written to <cache_dir>` — `<hits>` counts the derived tiles
+>    too, so `<hits> + <fetched>` is still the pass total, and `<written>`
+>    counts derived tiles and intermediates; both always carry the
+>    parenthesis, `(0 derived)` included. Unchanged: every parsed line, exit
+>    codes, `.abt` bytes of every tile that is not derived, the parent
+>    fill, repair jobs, the in-memory and browser downloaders. Measured:
+>    deriving one 256 px tile from four cached children takes 8–9 ms on one
+>    core (release build, synthetic 157 KB children: CRC checks 1.4 ms, 4
+>    decodes 3.5–4.0 ms, the means 1.2 ms, the PNG encode 0.9 ms; the
+>    derived PNG is ~8 % larger than the default-compressed children), one
+>    four zooms deep (256 decodes, 85 encodes) ~0.38 s; a derived tile is
+>    worked out on the tile's worker thread like a hit's decode. Nothing to
+>    gate on: a consumer can tell this build by `--version` (0.2.9).
+> 41. **Vector-tile buildings: the duplicate filter keys on the whole
+>    footprint (§9a, §9b; `aether_converter` 0.2.9; 2026-10-23).** No
+>    job-JSON change. Merging vector tiles drops the buildings that arrive
+>    twice through neighbouring tiles' buffer zones — in `buildings_pbf_dir`
+>    (`ingest`, the `download` post-pass and repairs) and in the WASM
+>    building, surface and GeoJSON functions. The filter kept one building
+>    per **first vertex** (rounded to 1e-6°), so it also deleted every
+>    distinct building whose ring merely starts at a corner it shares with
+>    an earlier one: measured on live OpenFreeMap tiles, −7.3 % of the
+>    building footprint in Bern's old town and −4.1 % at Zürich HB; on the
+>    z14 tile 8651/5782 (Zernez) in this repository, 5 of 470 buildings within
+>    the one tile. A building is now dropped only when **every vertex of every
+>    ring** (exterior, then its holes — item 42 — in order, each rounded to
+>    1e-6°) **and its height** equal an earlier one's. A building two tiles
+>    clip differently is no duplicate under that rule and is drawn once per
+>    copy, which the `max` write rule makes harmless (every roof is resolved
+>    against the bare terrain before any is written; nothing stacks).
+>    **`.abt` bytes change** wherever the old filter had dropped a building:
+>    more buildings are drawn, more pixels raised; elsewhere byte-identical.
+>    The informational counts move with it (`[Info] buildings_pbf_dir: … (<n>
+>    after dedup)`, `[Buildings] … (<n> dup dropped)`, the WASM console's
+>    `after dedup`); none is parsed. FlatGeobuf (`buildings_file`) never had
+>    the filter. Nothing to gate on: a consumer can tell this build by
+>    `--version` (0.2.9).
+> 42. **Buildings: an interior ring is a courtyard, not a building (§9a, §9b;
+>    `aether_converter` 0.2.9; 2026-10-23).** No job-JSON change. Every ring
+>    of a polygon used to be drawn as a building of its own, so every
+>    courtyard went up to its building's roof — inside the exterior's fill
+>    and again as a "building". A building is now its **exterior ring minus
+>    its interior rings**: a pixel belongs to it when its centre is inside the
+>    exterior and inside none of the holes (point-in-polygon, half-open edges
+>    as before). The holes are left out of the roof's ground reference too
+>    (the P10 of the terrain under the footprint); `max` between buildings is
+>    unchanged. **Vector tiles** (`buildings_pbf_dir`, the WASM functions):
+>    rings are paired as MVT spec 2.1 §4.3.4.4 lays them out — each exterior
+>    ring begins a polygon, the interior rings after it are its holes — with
+>    the winding taken exactly from the integer tile coordinates (positive
+>    surveyor's-formula area, clockwise with y down, is exterior; zero area
+>    is degenerate and skipped) and, as the reference decoder (vector-tile-js
+>    / MapLibre `classifyRings`) does, the first ring's winding standing for
+>    "exterior", so a tile written with the opposite convention pairs up
+>    alike. (The area computed before omitted the closing edge and was taken
+>    in absolute lon/lat, so its sign was meaningless; it only ever served to
+>    skip "degenerate" rings.) **FlatGeobuf** (`buildings_file`) had the same
+>    defect and is fixed the same way: the first ring of each polygon — of
+>    each part of a MultiPolygon, PolyhedralSurface or TIN — is its exterior,
+>    the rest its holes, by position as OGC Simple Features defines it
+>    (winding is not consulted). **`.abt` bytes change** under every building
+>    with a courtyard (the courtyard stays at the terrain; the roof can move
+>    by the changed ground reference); buildings without holes are
+>    byte-identical, FlatGeobuf's legacy byte-equivalence test included. An
+>    invalid polygon whose interior ring lies outside its exterior no longer
+>    draws that ring. Interior rings no longer count as buildings in the
+>    informational counts (`[Buildings] … <n> footprint(s)`, `after dedup`).
+>    The WASM `decode_buildings_geojson` writes a courtyard as an interior
+>    ring of its building's `Polygon` (`coordinates: [exterior, hole, …]`,
+>    RFC 7946) instead of as a `Feature` of its own. Nothing to gate on: a
+>    consumer can tell this build by `--version` (0.2.9).
+> 43. **`plan`: no row or column outside the area from float artefacts
+>    (§1.2; `aether_converter` 0.2.9; 2026-10-23).** No CLI or schema change
+>    (`aether-plan/1`, same fields); the tile set changes for about one bbox
+>    in four. The grid is now, with `finest` the smallest sub-tile extent of
+>    the requested resolutions and `sub` each one's own:
+>
+>    ```text
+>    idx_south = floor(south / finest + 1e-9)    idx_north = ceil(north / finest - 1e-9)
+>    idx_west  = floor(west  / finest + 1e-9)    idx_east  = ceil(east  / finest - 1e-9)
+>    edge      = round(idx * finest, 9)          # Rust: (idx * finest * 1e9).round() / 1e9
+>    lat start = floor(edge_south / sub + 1e-9) * sub   (lon start: edge_west alike)
+>    step      = round(x + sub, 6) while x < edge_north (lon: x < edge_east)   # unchanged
+>    ```
+>
+>    Before (≤ 0.2.8): `edge = floor/ceil(x / finest) * finest` and `start =
+>    floor(edge / sub) * sub`. Each change removes one artefact, and all
+>    three are needed: (1) an edge **on** the grid whose quotient lands a
+>    hair past its line (S 47.3 / 0.1 = 472.99999999999994) was snapped a
+>    whole step out; (2) the bare product can land a hair past the line the
+>    6-decimal steps arrive at (E 11.6466 → 117 · 0.1 = 11.700000000000001,
+>    the steps reach 11.7, and `lon < east` held once more); (3) with the
+>    edge rounded, a resolution's start `floor(edge / sub)` is taken a step
+>    out wherever that quotient lands a hair short (47.3 / 0.1 again) — the
+>    rounding without the start term still adds a row or column on the
+>    south/west side of about one bbox in eight (761 of 6,000 in the sweep
+>    below). `round(idx * finest, 9)` is Python's correctly rounded
+>    `round()`; the Rust form gives the same double on every grid line
+>    within ±180° for every extent (checked exhaustively: such a product is
+>    within ~1e-14 of a multiple of 0.1, 0.25, 0.5, 1 or 2, never near a
+>    tie). Effect: the owner's bbox S45.7161 N48.1913 W4.9482 E11.6466 at
+>    2, 5, 10, 30, 90 m plans **2,438** tiles (1,700 + 308 + 308 + 90 + 32,
+>    68 columns of 2 m) instead of 2,463 — the 25-tile E11.70 column lay
+>    wholly east of the area (all VOID, 1.56 GB); S47.3 N47.6 W8.3 E8.6 at
+>    2 m plans 9 tiles instead of 12. Tested against exact decimal
+>    arithmetic over 6,000 bboxes — half with 4-decimal edges anywhere,
+>    half with edges on the 0.1° grid, five resolution sets: no difference
+>    (the same sweep over the ≤ 0.2.8 formulas: 1,373 differ; the 1e-9 snap
+>    alone: 995; snap and rounding without the start term: 761). **Gate
+>    (consumers that cross-check `plan`):** for this build and later,
+>    enumerate with exactly the formulas above — the snap, the rounding
+>    **and** the start term; for older builds, the old ones. Any other mix
+>    makes the tile lists differ and a cross-check abort (§1.5).
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -878,7 +1103,8 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
 
   **`AETHER_DIAG_FILE` (≥ 0.2.8, changelog 37).** When this environment
   variable names a path, the `[Rust] tile …` lines (and `download`'s
-  `[Strip …]` / `[StripMem …]` lines, changelog 36) are appended to that
+  `[Strip …]` / `[StripMem …]` lines, changelog 36, and — 0.2.9, changelog
+  39 — its `[Download] launch gate closed for …` line) are appended to that
   file — created if missing, never truncated, each line flushed as written
   — and not printed on the console. Unset or empty: the console, as before.
   A file that cannot be opened costs one stderr line, `[Warn]
@@ -964,7 +1190,10 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   The geometry reproduces the Waveshed plugin's Python tile enumeration
   **exactly** (extent ladder, u16-stride guard, outward snap on the finest
   sub-tile grid, 6-decimal stepping); the plugin cross-checks its own
-  enumeration against this output and aborts on mismatch. Validation is
+  enumeration against this output and aborts on mismatch. Since 0.2.9 the
+  snap tolerates 1e-9 grid steps, its edges are rounded to 9 decimals and
+  each resolution's start tolerates 1e-9 steps too (changelog 43 gives the
+  formulas) — a cross-checking consumer gates on that version. Validation is
   strict: non-finite coordinates, `south >= north`, `west >= east`, a bbox
   reaching outside `[-180, 180] x [-90, 90]` (`longitude out of range` /
   `latitude out of range` — the grid wraps nowhere, so an antimeridian
@@ -1084,31 +1313,41 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   timeout/reset/429/503 burst or a slow median body and collapsed a
   250 Mbit/s link to a trickle.)
 
-  Additive lines (CLI `download`, changelog 30; informational, match the
+  Additive lines (CLI `download`, changelog 30, 39; informational, match the
   prefix):
 
   ```
-  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available; re-evaluated before every strip)
-  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available)
+  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available at start; fixed for the run)
+  [Download] RAM budget: <mb> MB, strip rows: <r> (re-sized for <e> px source tiles)
   ```
 
   The first replaces `[Download] RAM: <a> GB available, ~<m> MB/strip,
-  prefetch depth: <d>`; the second appears whenever a re-evaluation changes
-  the strip rows. Decoded source tiles (`edge² × 4` bytes each) are held from
-  arrival until their strip is assembled, so the run budgets them: before
-  every strip launch, budget = min(available RAM / 4, 2 GiB), at least
-  256 MiB; strip rows = clamp(budget / 2 / (`<nx>` × edge² × 4 B), 1, 32),
-  so two strips fit (edge = that of the run's first tile, fetched alone
-  before any strip is sized — changelog 36; 512 only while that tile has
-  failed or is out for more than 5 s); a strip
-  starts only when its bytes plus those of every launched, not yet
-  assembled strip fit the budget (or none is outstanding), and only once
-  the strips in flight have fewer unstarted tiles than the connection
-  window. Each output row samples exactly one tile-row, so strip size never
-  changes a byte. `[Download] <s> strips, <r> tile-rows/strip, …` reports
-  the initial plan; `[Strip i/n]` lines count against the current estimate
+  prefetch depth: <d>`; the second appears at most once, when the source
+  tile edge `<e>` is learnt only after the first strip was sized for 512 px
+  (its first tile failed or was out for more than 5 s) and that changes the
+  strip rows. Builds before 0.2.9 (changelog 39) re-read the budget before
+  every strip and printed `(<a> GB available; re-evaluated before every
+  strip)` and, on every change of the rows, `(<a> GB available)`. Decoded
+  source tiles (`edge² × 4` bytes each) are held from arrival until the
+  assembly has copied their tile-row into its grid, so the run budgets them:
+  budget = min(available RAM / 4, 2 GiB), at least 256 MiB, taken once —
+  after the run's first tile, before any strip is sized — and fixed for the
+  run; strip rows = clamp(budget / 2 / (`<nx>` × edge² × 4 B), 1, 32), so
+  two strips fit (edge = that of the run's first tile, fetched alone before
+  any strip is sized — changelog 36; 512 only while that tile has failed or
+  is out for more than 5 s); a strip starts only when its bytes plus those
+  launched strips still hold fit the budget (or none is outstanding), and
+  only once the strips in flight have fewer unstarted tiles than the
+  connection window. A strip's bytes leave the count tile-row by tile-row as
+  its assembly drops each row's tiles (shares by tile count, changelog 39).
+  Each output row samples exactly one tile-row, so strip size never changes
+  a byte. `[Download] <s> strips, <r> tile-rows/strip, …` reports the
+  initial plan; `[Strip i/n]` lines count against the current estimate
   (they are diagnostics and go to `AETHER_DIAG_FILE` when it is set —
-  changelog 36, 37).
+  changelog 36, 37). So does, once per run after the last assembly
+  (changelog 39), `[Download] launch gate closed for <s> s (assembly behind
+  the network)`: the time the run waited with no strip downloading because
+  the next one did not fit the budget.
 * **Disk-space failure — `[MPT-critical]` / QGIS-critical.** When the estimated
   `.abt` output exceeds free space, `download` **fails** (`anyhow::bail!`, non-zero
   exit). The exact and only emitted string (`crates/aether_converter/src/download.rs`,
@@ -1437,6 +1676,7 @@ Known capability gates consumers rely on:
 | Atomic tile replacement in `ingest` (temp file + rename; §1.2, §6) | `aether_converter 0.2.7` |
 | `AETHER_DIAG_FILE` — `ingest`'s `[Rust] tile` and `download`'s `[Strip …]` diagnostic lines to a file (§1.2; older builds ignore the variable and keep printing them on the console) | `aether_converter 0.2.8` |
 | `download` job field `cache_dir` (§9b; older builds ignore it — nothing is cached and every job fetches everything) | `aether_converter 0.2.8` |
+| `plan` grid of changelog 43 — 1e-9-step snap, edges rounded to 9 decimals, tolerant start per resolution (§1.2; a consumer that cross-checks `plan` must enumerate this way for this build and later and the old way for older ones, or its check aborts) | `aether_converter 0.2.9` |
 
 ---
 
@@ -1446,7 +1686,7 @@ Known capability gates consumers rely on:
 |----------|---------|---------|
 | `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key — **v1 or v2** (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
 | `RUST_LOG` | `aether_core`, toolkit CLIs | `env_logger` level filter. **Must be `info` (or lower)** for the log-line progress diagnostics of §1.1(b) to appear. Markers in §1.1(a) do not depend on it. |
-| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move. |
+| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines (and, ≥ 0.2.9, `download`'s once-per-run `[Download] launch gate closed for …`, changelog 39) are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move. |
 | `AETHER_BIN_DIR` | consumers only | Convention for locating the engine binaries. **Not read by any engine/toolkit code** — it is purely a consumer-side discovery hint. Do not add engine logic that depends on it. |
 | `PYTHONUNBUFFERED` | consumers only | Set by Python consumers so a child process's stdout markers/log lines arrive line-by-line rather than block-buffered. Not read by Rust code. |
 
@@ -2143,8 +2383,9 @@ edge tile legitimately has none, so it is reported and its terrain written.
 burned; anything else is skipped per feature (points/lines are not
 footprints). TIN and PolyhedralSurface — the shape GDAL's FlatGeobuf driver
 writes for swissBUILDINGS3D 3.0 solids/roofs — walk exactly like a
-MultiPolygon: parts recurse, rings split on `ends`, and each part takes its
-own max Z as the absolute roof. They were previously skipped silently, so a
+MultiPolygon: parts recurse, rings split on `ends` — the first ring of each
+part its exterior, the rest its holes (since 0.2.9, changelog 42) — and each
+part takes its own max Z as the absolute roof. They were previously skipped silently, so a
 whole TIN dataset burned nothing with only the "no footprint to draw" line as
 a trace.
 The message keeps the phrase **`failed to apply buildings`** that the earlier
@@ -2252,7 +2493,13 @@ callers can rely on:
 
 * a roof is **flat**, even where the terrain under the footprint slopes;
 * overlapping footprints do **not** accumulate;
-* re-applying an *absolute*-height source is a no-op.
+* re-applying an *absolute*-height source is a no-op;
+* a footprint is its exterior ring **minus its interior rings**: a courtyard
+  stays at the terrain (since 0.2.9, changelog 42);
+* a vector-tile building that arrives through two tiles' buffer zones is drawn
+  once — a duplicate is identical in every vertex of every ring (1e-6°) and
+  in height; anything less is drawn per copy, harmlessly (since 0.2.9,
+  changelog 41).
 
 **Precondition.** Buildings must be burned into building-free terrain. An
 above-ground height is measured against the surface it is written onto, so
@@ -2270,13 +2517,13 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `encoding` | string | **required** | `"terrarium"` or `"mapbox"` (case-insensitive). Any other value fails: `Unknown encoding '<x>'`. |
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
-| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). |
+| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). A full run (not a repair) also keeps its output files open for the run, so the raise asks for one descriptor per output tile on top; where they do not fit beside the connections' descriptors, the connections keep theirs and each write opens its file instead, printing `[Download] open-file limit <l>: <n> output tiles are opened for each write instead of held open (<d> descriptors would not fit)` (changelog 39). |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 | `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **20** (changelog 30; was 60). At expiry the tile stops as a `timeout` failure and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
 | `repair_source_tiles` | array of `[z, x, y]`? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6 (gate on `--version`, §1.5: older builds ignore the field and download the whole job). Fetch **only** these source tiles and patch them into the job's **existing** `.abt` files — see *Repair jobs* below. |
-| `cache_dir` | string? | optional | Additive, changelog 38, `aether_converter` ≥ 0.2.8 (older builds ignore it). Directory of the raw source-tile cache, shared by every job, service and zoom that names it and by concurrent converter processes; absent, `null` or `""` → no cache. Every source tile is looked up there before any request and every HTTP 200 body that decoded and every 404 the run fetches is written there — see *Raw source-tile cache* below. A directory that cannot be used is one `[Warn]` line, never an error. CLI `download` only (repair jobs refetch their listed tiles and rewrite their entries); the in-memory downloaders ignore it. |
+| `cache_dir` | string? | optional | Additive, changelog 38, `aether_converter` ≥ 0.2.8 (older builds ignore it). Directory of the raw source-tile cache, shared by every job, service and zoom that names it and by concurrent converter processes; absent, `null` or `""` → no cache. Every source tile is looked up there before any request and every HTTP 200 body that decoded and every 404 the run fetches is written there; since 0.2.9 (changelog 40) a tile without an entry is derived from the cached tiles of up to four finer zooms when they cover it, without a request — see *Raw source-tile cache* below. A directory that cannot be used is one `[Warn]` line, never an error. CLI `download` only (repair jobs refetch their listed tiles and rewrite their entries); the in-memory downloaders ignore it. |
 
 `SubTileSpec`:
 
@@ -2401,8 +2648,10 @@ exactly as it arrived (PNG/WebP bytes, before any decode) and each HTTP 404
 set up before any request (one index read per pack), decodes a hit from the
 cached bytes when its turn comes — without a connection slot and without a
 request — and writes every answer it fetches into the cache, so a later job
-fetches only what the cache lacks. The parent fill (§1.2) looks its coarser
-tiles up and writes them the same way. **Never cached:** a tile that failed
+fetches only what the cache lacks. A tile the cache has no entry for, but
+holds at a finer zoom, is derived instead of fetched (*Deriving* below,
+≥ 0.2.9). The parent fill (§1.2) looks its coarser tiles up and writes them
+the same way. **Never cached:** a tile that failed
 (any class of the `[Stats] ERRORS` tally but 404), timed out, did not decode,
 or was filled from a coarser zoom (a `[Degraded]` tile is fetched again by
 the next job; what the fill made of a tile is never stored, only the raw
@@ -2445,7 +2694,7 @@ integers little-endian:
 | 6 | 4 | u32 zoom |
 | 10 | 4 | u32 x |
 | 14 | 4 | u32 yblock |
-| 18 | 256 × 20 | index, entry `i` = tile `y = yblock·256 + i`: u64 offset of the body, u32 length, u8 status (0 unknown, 1 present, 2 no tile = HTTP 404), 3 reserved bytes (0), u32 CRC-32 (IEEE, zlib's) of the body |
+| 18 | 256 × 20 | index, entry `i` = tile `y = yblock·256 + i`: u64 offset of the body, u32 length, u8 status (0 unknown, 1 present, 2 no tile = HTTP 404, 3 derived body — ≥ 0.2.9, changelog 40), 3 reserved bytes (0), u32 CRC-32 (IEEE, zlib's) of the body |
 | 5138 | … | data region: bodies, appended |
 
 A full pack of AWS z15 tiles is ~256 × 73 KB ≈ 19 MB. **Writing:** the
@@ -2458,8 +2707,9 @@ outlives its writer). A pack another writer holds for 10 s is not written by
 this run (one `[Warn] cache_dir …` line per run); the run goes on. Several
 converter processes may use one cache at once. **Reading** takes no lock and
 validates every entry: the header must name this very zoom/column/yblock
-and version 1, a present body must lie past the index and inside the file
-and match its CRC, a 404 entry must have length and CRC 0. Any entry that
+and version 1, a present or derived body must lie past the index and inside
+the file and match its CRC, a 404 entry must have length and CRC 0 (any
+other status is a miss). Any entry that
 fails — a torn or interrupted write, a damaged byte, a body that no longer
 decodes — is a miss: the tile is fetched and the entry rewritten (appended
 again and repointed; the old bytes become garbage). Nothing compacts a
@@ -2469,32 +2719,75 @@ run keeps at most 16 packs open for reading (a most-recently-used set) plus
 one transient open per worker thread and the writer's handle, never one
 descriptor per pack; the CLI's open-file reserve (changelog 36) counts them.
 
+**Deriving (changelog 40, `aether_converter` ≥ 0.2.9).** A fetch-set tile
+`(z, x, y)` without a valid entry is built from its four children
+`(z+1, 2x+dx, 2y+dy)` when each of them is a cached body (status 1 or 3), a
+cached 404, or itself derivable the same way — **at most four zooms deep**:
+the tiles at `z+4` must be cached as they are (a z11 tile from z15 reads
+4 + 16 + 64 + 256 child entries); a tile with a child the cache lacks is
+fetched whole — a missing child never becomes a void. Output pixel `(i, j)`
+is the mean of the child quadrant's 2 × 2 samples `(2i + {0,1}, 2j + {0,1})`
+that are not void (a sample at or below −11000 m is void, and so is a 404
+child's whole quadrant); void where all four are; four 404 children make a
+404, which is not stored. All children must have one even tile edge, which the result
+keeps. The result is encoded in the service's own encoding as an 8-bit RGB
+PNG — Terrarium `R·65536 + G·256 + B = round((v + 32768)·256)` (ties up;
+void = `0,0,0`), Mapbox the triple whose decoded value is nearest `v` (every
+value either decoder produces round-trips exactly) — and stored with
+**status 3**, as is every tile derived on the way (a cascade costs four
+decodes per level once the level below is stored). Mapbox has no void value
+(its lowest value, −10000 m, is terrain), so a Mapbox tile that would hold a
+void — a 404 child beside children with data — is not derived but fetched.
+Nothing is ever requested for a child. Whether a tile can be derived is
+judged before the first request, from index entries alone; a derivation
+that then fails (a child body that fails its CRC or decode, children of
+different sizes) fetches the tile as before, and a tile whose own entry
+fails is derived when it can be. A derived tile counts as a hit in every
+respect (no connection slot, the same progress and `[Stats]` counting; a
+derived 404 goes to the parent fill like a cached one). The parent fill
+never derives (a derived ancestor of a hole holds that hole) but reads
+status-3 entries like any other; repair jobs never derive their listed
+tiles. **A derived tile is not the service's tile:** it is our 2 × 2 average
+of the service's finer tiles, not the coarser tile the service would have
+sent (services build their pyramids their own way), so the `.abt` bytes of
+a job that derives can differ from a run that fetched; they equal those of
+a run served coarser tiles that hold those very means. The pack version
+stays 1: a converter before 0.2.9 reads status 3 as unknown, a miss, and
+refetches the tile (rewriting the entry as status 1).
+
 What a run prints (stderr, informational, **not parsed** — consumers may log
 them): after the pass header and before the first request,
 
 ```
-[Download] cache: <hits> of <total> source tiles from cache
+[Download] cache: <n> of <total> source tiles from cache (<derived> derived)
 ```
 
-once, `<hits>` = the fetch-set tiles whose entry the lookup found (an entry
-whose bytes then fail their CRC or decode is fetched after all); as the last
-lines of the `[Stats]` block,
+once, `<n>` = the fetch-set tiles whose entry the lookup found plus the
+`<derived>` ones it found derivable (an entry whose bytes then fail their
+CRC or decode, or a derivation that then fails, is fetched after all); as
+the last lines of the `[Stats]` block,
 
 ```
-[Stats] Cache: <hits> hits, <fetched> fetched, <written> written to <cache_dir>
+[Stats] Cache: <hits> hits (<derived> derived), <fetched> fetched, <written> written to <cache_dir>
 [Stats] Cache, coarser parents: <hits> hits, <fetched> fetched, <written> written
 ```
 
-(the first always, `<hits> + <fetched>` = the pass `<total>`; the second only
-when the parent fill asked for coarser tiles), and a directory that cannot be
+(the first always, `<hits>` counting the derived tiles too, so `<hits> +
+<fetched>` = the pass `<total>`, and `<written>` counting derived tiles and
+their intermediates; the second only when the parent fill asked for coarser
+tiles). Before 0.2.9 neither `[Download] cache:` nor `[Stats] Cache:` had
+the `(… derived)` part; both always carry it now, `(0 derived)` included. A
+directory that cannot be
 created or used:
 `[Warn] cache_dir <dir> cannot be used (<reason>); downloading without cache`
 — once, never fatal. A repair job prints `[Download] cache: 0 of <n> source
-tiles from cache (a repair refetches every listed tile)`. A hit counts in
-every parsed line exactly like the fetched tile it stands for —
+tiles from cache (a repair refetches every listed tile)`. A hit — a derived
+tile included — counts in every parsed line exactly like the fetched tile
+it stands for —
 `[Download] <pct>% (<done>/<total>)`, `[Stats] Tiles:`, `NO-DATA (HTTP 404):`,
 `Repaired …`, `DEGRADED:` — and the `.abt` bytes are identical whether a tile
-came from the cache or the network; `[Stats] Downloaded:` and the progress
+came from the cache or the network (a derived tile is the cache's own
+average, see *Deriving* above); `[Stats] Downloaded:` and the progress
 line's MB/s count network bytes only.
 
 ---

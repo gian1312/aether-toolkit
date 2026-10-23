@@ -4,7 +4,9 @@
 //! vectors below were computed by running the authority's formulas
 //! (`_subtile_degrees` / `_tile_params` / the enumeration loop) in Python.
 
-use aether_converter::plan::{build_plan, subtile_degrees};
+use std::collections::BTreeSet;
+
+use aether_converter::plan::{build_plan, subtile_degrees, PlanOutput};
 
 #[test]
 fn golden_single_resolution_bbox() {
@@ -157,4 +159,136 @@ fn an_absurd_bbox_fails_as_too_large_instead_of_hanging() {
     // The whole globe at 2 m: ~ (180/0.1)*(360/0.1) = 6.48M tiles > 2M.
     let err = build_plan(-90.0, 90.0, -180.0, 180.0, &[2]).unwrap_err().to_string();
     assert!(err.contains("bbox too large"), "got {err:?}");
+}
+
+// ── The snap and start tolerance (0.2.9, changelog 43) ────────────────────
+//
+// Expected values below are the decimal grid each bbox calls for — and what
+// the plugin's formulas give for converters >= 0.2.9 (`_snap_bbox` with the
+// 1e-9 tolerance and `round(idx * finest, 9)`, `_enumerate_tiles` starting at
+// `floor(edge / ext + 1e-9)`).
+
+/// Every tile of *p* as (resolution, row of its south edge, column of its
+/// west edge), in grid steps of its own extent.
+fn tile_ids(p: &PlanOutput) -> BTreeSet<(u32, i64, i64)> {
+    p.tiles
+        .iter()
+        .map(|t| {
+            let sub = subtile_degrees(t.resolution_m);
+            (t.resolution_m, (t.ul_lat / sub).round() as i64 - 1, (t.ul_lon / sub).round() as i64)
+        })
+        .collect()
+}
+
+/// The tiles the DECIMAL bbox calls for, in exact integer arithmetic: edges
+/// in units of 1e-4°, of which every extent is a whole number.
+fn decimal_grid(s: i64, n: i64, w: i64, e: i64, res: &[u32]) -> BTreeSet<(u32, i64, i64)> {
+    let unit = |deg: f64| (deg * 10_000.0).round() as i64;
+    let fl = |a: i64, b: i64| a.div_euclid(b);
+    let ce = |a: i64, b: i64| -(-a).div_euclid(b);
+    let finest = res.iter().map(|&r| unit(subtile_degrees(r))).min().unwrap();
+    let (s, n) = (fl(s, finest) * finest, ce(n, finest) * finest);
+    let (w, e) = (fl(w, finest) * finest, ce(e, finest) * finest);
+    let mut out = BTreeSet::new();
+    for &r in res {
+        let ext = unit(subtile_degrees(r));
+        for row in fl(s, ext)..ce(n, ext) {
+            for col in fl(w, ext)..ce(e, ext) {
+                out.insert((r, row, col));
+            }
+        }
+    }
+    out
+}
+
+fn distinct(values: impl Iterator<Item = f64>) -> Vec<f64> {
+    let mut v: Vec<f64> = values.collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.dedup();
+    v
+}
+
+#[test]
+fn the_owner_bbox_plans_no_column_east_of_the_area() {
+    // The owner's run (2026-10-23): S45.7161 N48.1913 W4.9482 E11.6466 at
+    // 2, 5, 10, 30, 90 m. Up to 0.2.8 the east edge snapped to the bare
+    // product 117 * 0.1 = 11.700000000000001, a hair past the 11.7 the
+    // 6-decimal steps reach, so `lon < east` held once more: a 69th 2 m
+    // column (E11.70, 25 tiles wholly east of the area, all VOID, 1.56 GB)
+    // and 2,463 tiles.
+    let p = build_plan(45.7161, 48.1913, 4.9482, 11.6466, &[2, 5, 10, 30, 90]).unwrap();
+    let per_res = |r: u32| p.tiles.iter().filter(|t| t.resolution_m == r).count();
+    assert_eq!(
+        [per_res(2), per_res(5), per_res(10), per_res(30), per_res(90)],
+        [1_700, 308, 308, 90, 32]
+    );
+    assert_eq!(p.tile_count, 2_438);
+
+    let cols = distinct(p.tiles.iter().filter(|t| t.resolution_m == 2).map(|t| t.ul_lon));
+    assert_eq!(cols.len(), 68, "2 m columns");
+    assert_eq!((cols[0], cols[67]), (4.9, 11.6), "W4.90 … E11.60, nothing at E11.70");
+    assert_eq!(tile_ids(&p), decimal_grid(457_161, 481_913, 49_482, 116_466, &[2, 5, 10, 30, 90]));
+}
+
+#[test]
+fn an_edge_given_on_the_grid_is_not_moved() {
+    // E 11.7 given as 11.7 must end the plan at 11.7: seven 2 m columns,
+    // E11.00 … E11.60. (Up to 0.2.8: eight, the same product artefact as the
+    // owner's bbox.) S 47.3 is on the grid too, and 47.3 / 0.1 =
+    // 472.99999999999994 — the bare floor of the snap, and then of the
+    // enumeration start, took it one row south (N47.30, wholly outside).
+    let p = build_plan(47.3, 47.6, 11.0, 11.7, &[2]).unwrap();
+    assert_eq!(
+        distinct(p.tiles.iter().map(|t| t.ul_lon)),
+        vec![11.0, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6]
+    );
+    assert_eq!(distinct(p.tiles.iter().map(|t| t.ul_lat)), vec![47.4, 47.5, 47.6]);
+    assert_eq!(p.tile_count, 21, "was 32");
+
+    // The plugin's own on-grid case (EpsilonSnap.ON_GRID): 9 tiles, was 12.
+    assert_eq!(build_plan(47.3, 47.6, 8.3, 8.6, &[2]).unwrap().tile_count, 9);
+
+    // West of Greenwich the CEIL side is the one a quotient overshoots:
+    // -69.8 / 0.1 = -697.9999999999999 took the bare ceil to -697, a column
+    // east of the area. 15 tiles, was 24.
+    let p = build_plan(24.7, 25.0, -70.3, -69.8, &[2]).unwrap();
+    assert_eq!(distinct(p.tiles.iter().map(|t| t.ul_lon)), vec![-70.3, -70.2, -70.1, -70.0, -69.9]);
+    assert_eq!(distinct(p.tiles.iter().map(|t| t.ul_lat)), vec![24.8, 24.9, 25.0]);
+    assert_eq!(p.tile_count, 15);
+}
+
+#[test]
+fn the_plan_is_the_decimal_grid_for_six_thousand_bboxes() {
+    // Measured over this very sweep with the older formulas swapped in: up to
+    // 0.2.8, 1,373 of the 6,000 plans had a row or column wholly outside the
+    // area (or one missing); the 1e-9 snap alone, 995; snap and rounded edge
+    // without the tolerant enumeration start, 761. All three together: none.
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move |lo: i64, hi: i64| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        lo + ((seed >> 33) as i64).rem_euclid(hi - lo + 1)
+    };
+    let sets: [&[u32]; 5] = [&[2], &[2, 5, 10, 30, 90], &[5, 30], &[10], &[30, 90]];
+    for case in 0..6_000 {
+        // Half with 4-decimal edges anywhere, half with edges on the 0.1° grid.
+        let (s, n, w, e) = if case % 2 == 0 {
+            let (s, w) = (next(-800_000, 790_000), next(-1_790_000, 1_780_000));
+            (s, s + next(100, 10_000), w, w + next(100, 10_000))
+        } else {
+            let (s, w) = (1_000 * next(-800, 790), 1_000 * next(-1_790, 1_780));
+            (s, s + 1_000 * next(1, 5), w, w + 1_000 * next(1, 5))
+        };
+        let res = sets[next(0, 4) as usize];
+        let deg = |v: i64| v as f64 / 10_000.0;
+        let p = build_plan(deg(s), deg(n), deg(w), deg(e), res).unwrap();
+        assert_eq!(
+            tile_ids(&p),
+            decimal_grid(s, n, w, e, res),
+            "case {case}: S{} N{} W{} E{} at {res:?}",
+            deg(s),
+            deg(n),
+            deg(w),
+            deg(e)
+        );
+    }
 }

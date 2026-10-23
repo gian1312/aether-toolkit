@@ -10,13 +10,14 @@
 //! | | buildings | canopy |
 //! |---|---|---|
 //! | write rule | one flat roof per footprint | `ground + h·α`, draped per pixel |
-//! | rings | every ring is its own footprint | all rings of a feature, **even-odd** |
+//! | rings | each exterior minus its interior rings | all rings of a feature, **even-odd** |
 //! | fill | point-in-polygon per pixel | scanline spans |
 //!
 //! Neither difference is cosmetic. A forest feature is routinely a multipolygon
 //! whose inner rings are the clearings, the village and the lake inside it;
-//! filling each ring on its own — which is what the building path does, and is
-//! right for buildings — would plant trees in all of them. And forest polygons
+//! filling each ring on its own would plant trees in all of them (the building
+//! path did exactly that to courtyards before 0.2.9 and now subtracts each
+//! exterior ring's interior rings instead). And forest polygons
 //! are valley-sized with thousands of vertices, of which a 30 km run sees six
 //! figures, so the per-pixel point-in-polygon loop that suits a 12 m house is
 //! orders of magnitude too slow here.
@@ -30,8 +31,8 @@ use prost::Message;
 use serde::Deserialize;
 
 use crate::buildings::{
-    parse_abt_header, rasterize_buildings, AbtGrid, Building, ElevGrid, RasterOpts, Rounding,
-    TileRef,
+    drop_duplicate_buildings, parse_abt_header, rasterize_buildings, AbtGrid, Building, ElevGrid,
+    RasterOpts, Rounding, TileRef,
 };
 use crate::ingest::VOID_ELEV;
 use crate::mvt::{
@@ -670,21 +671,13 @@ pub fn apply_surface_to_abt_tiles(
     let buildings_decoded = all_buildings.len();
 
     // ── 2. Drop buffer-zone duplicate buildings ──────────────────
+    // The whole-ring rule of `buildings::DuplicateKey`, shared with the native
+    // PBF loader: only a building identical in every ring and in height goes.
     // Canopy gets no equivalent pass on purpose: a forest clipped by two tile
-    // buffers arrives as two *different* polygons, so keying on the first
-    // vertex would not match them anyway — and `max` makes the overlap a no-op
-    // rather than a double raise, which is what the dedup buys for buildings.
-    {
-        let mut seen = std::collections::HashSet::new();
-        all_buildings.retain(|b| {
-            if b.coords.is_empty() {
-                return false;
-            }
-            let (lon, lat) = b.coords[0];
-            let key = ((lat * 1_000_000.0).round() as i64, (lon * 1_000_000.0).round() as i64);
-            seen.insert(key)
-        });
-    }
+    // buffers arrives as two *different* polygons, so no such key would match
+    // them anyway — and `max` makes the overlap a no-op rather than a double
+    // raise, which is what the dedup buys for buildings.
+    drop_duplicate_buildings(&mut all_buildings, BuildingPolygon::duplicate_key);
 
     let buildings_after_dedup = all_buildings.len();
     let canopy_rings: usize = all_canopy.iter().map(|p| p.rings.len()).sum();
@@ -1249,6 +1242,31 @@ mod tests {
         assert_eq!(b.per_tile, vec![(a.per_tile[0].buildings_hit, a.per_tile[0].building_pixels)]);
         assert_eq!(abt_get(&via_surface[0], 26, 26), 212, "the house is still drawn");
         assert_eq!(abt_get(&via_surface[0], 40, 40), 200, "and the wood is not");
+    }
+
+    #[test]
+    fn the_surface_pass_drops_only_true_duplicate_buildings() {
+        // The WASM path merges vector tiles with the native loader's whole-ring
+        // rule. Two houses whose rings start at the corner they share are two
+        // houses (the first-vertex key kept one); the same tile fed twice is
+        // every house arriving twice, and each is kept once.
+        let east = tile_rect(1000, 1000, 2000, 2000);
+        let west = vec![(1000, 1000), (1000, 2000), (0, 2000), (0, 1000)];
+        let vt = Tile { layers: vec![building_layer(&[(6.0, vec![east]), (6.0, vec![west])])] };
+        let pbf = prost::Message::encode_to_vec(&vt);
+
+        let mut bufs = vec![abt_for(14, 8531, 5752, 64, 200)];
+        let o = SurfaceOpts { buildings: true, canopy: None };
+        let r = apply_surface_to_abt_tiles(
+            &mut bufs,
+            &[pbf.clone(), pbf],
+            &[8531, 8531],
+            &[5752, 5752],
+            14,
+            &o,
+        );
+        assert_eq!((r.buildings_decoded, r.buildings_after_dedup), (4, 2));
+        assert_eq!(r.per_tile[0].buildings_hit, 2);
     }
 
     #[test]

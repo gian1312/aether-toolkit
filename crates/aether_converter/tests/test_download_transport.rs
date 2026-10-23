@@ -270,6 +270,9 @@ fn strip_lines_go_to_the_diag_file_and_the_parsed_lines_stay_on_stderr() {
     assert!(err.lines().any(|l| l.starts_with("[Download] 100% (4/4) — ")), "{err}");
     assert!(err.lines().any(|l| l == "[Stats] Tiles: 4/4 OK (100.0% success)"), "{err}");
     assert!(err.lines().any(|l| l.starts_with("[Download] RAM budget: ")), "{err}");
+    // Changelog 39: the once-per-run launch-gate time is a diagnostic too.
+    assert!(file.lines().any(|l| l.starts_with("[Download] launch gate closed for ")), "diag file:\n{file}");
+    assert!(!err.contains("launch gate closed"), "{err}");
 }
 
 #[cfg(unix)]
@@ -279,18 +282,24 @@ fn a_low_open_file_limit_is_raised_or_the_connections_are_fitted_under_it() {
     // sockets open at once. (1) Soft limit 64, hard limit as it is: the
     // converter raises its own soft limit and runs clean — no retries (each
     // EMFILE would have been a failed connect, retried). (2) Hard limit 100
-    // as well, so nothing can be raised: it runs (100 - 64) / 2 = 18
+    // as well, so nothing can be raised: it runs (100 - 96) / 2 = 2
     // connections, says so, and still runs clean. (Kept small: this test's
     // own server holds a socket per connection, and macOS starts a test
-    // process at a soft limit of 256.)
+    // process at a soft limit of 256.) Changelog 39: a full run holds its
+    // output files open where they fit beside the connections — in (1) —
+    // and in (2), where they do not, opens a file for each write and says
+    // so; the bytes are the same either way.
     let dir = tempfile::tempdir().unwrap();
     let (cols, rows) = (10u32, 15u32);
     let (tx0, ty0) = (lon2tx(8.0, Z), lat2ty(47.0, Z));
     for x in tx0..tx0 + cols { for y in ty0..ty0 + rows { tile(elev(x, y)); } }
     let port = serve(|x, y, _| Reply::Png(tile(elev(x, y)), 300));
-    let (job, _, _, _) = stacked_job(dir.path(), port, cols, rows, 100);
+    let (job, out_dir, _, _) = stacked_job(dir.path(), port, cols, rows, 100);
     let capped = "[Download] open-file limit 100: 2 connections instead of max_connections 100 \
                   (296 descriptors would not fit)";
+    let reopened = |l: &str| l.starts_with("[Download] open-file limit 100: ")
+        && l.contains(" output tiles are opened for each write instead of held open (");
+    let mut outputs = Vec::new();
     for (ulimit, want_cap) in [("-S -n 64", false), ("-n 100", true)] {
         let out = std::process::Command::new("sh")
             .arg("-c").arg(format!("ulimit {ulimit} && exec \"$0\" download --job-file \"$1\""))
@@ -304,5 +313,14 @@ fn a_low_open_file_limit_is_raised_or_the_connections_are_fitted_under_it() {
         let start = if want_cap { 2 } else { 100 };
         assert!(err.lines().any(|l| l.starts_with(&format!("[Stats] Connection window: start {start}, "))),
                 "ulimit {ulimit}: {err}");
+        assert_eq!(err.lines().any(reopened), want_cap, "ulimit {ulimit}: {err}");
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&out_dir).unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+            .collect();
+        files.sort();
+        outputs.push(files);
     }
+    assert!(outputs[0].len() > 100, "{} outputs", outputs[0].len());
+    assert!(outputs[0] == outputs[1], "held-open and reopened outputs differ");
 }

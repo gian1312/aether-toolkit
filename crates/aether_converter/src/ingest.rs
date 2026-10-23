@@ -4908,7 +4908,9 @@ fn apply_buildings_pbf(
     );
 }
 
-/// Collect building rings from a FlatGeobuf geometry into the shared model.
+/// Collect the buildings of a FlatGeobuf geometry into the shared model: one
+/// per polygon (per part of a multi-part geometry), its first ring the
+/// exterior and the rest its holes.
 ///
 /// The roof comes off the geometry Z when there is one — an **absolute**
 /// elevation, which is what this path has always used and still the top rung
@@ -4954,32 +4956,47 @@ fn collect_fgb_buildings(
         None => fallback,
     };
 
-    let mut push_ring = |stop_idx: usize, start_idx: usize, out: &mut Vec<Building>| {
-        let count = (stop_idx - start_idx) / 2;
-        if count < 3 { return; }
+    // The ring over `xy[start_idx..stop_idx]`, or `None` when it has fewer
+    // than three points and so encloses nothing.
+    let ring_at = |start_idx: usize, stop_idx: usize| -> Option<Vec<(f64, f64)>> {
+        let count = stop_idx.saturating_sub(start_idx) / 2;
+        if count < 3 { return None; }
         let mut coords: Vec<(f64, f64)> = Vec::with_capacity(count);
         let mut i = start_idx;
         while i < stop_idx {
             coords.push((xy.get(i), xy.get(i + 1)));
             i += 2;
         }
-        out.push(Building { coords, height, source });
+        Some(coords)
     };
 
     // `ends` counts POINTS, not `xy` slots — the format's own reader shifts
     // each entry left by one to index `xy` (`geometry_reader::read_polygon`).
     // Taking them as `xy` offsets, as this did, read the first half of each
     // ring and closed the footprint through the middle of the building.
+    let mut rings: Vec<Option<Vec<(f64, f64)>>> = Vec::new();
     if let Some(ends_vec) = geo.ends() {
         let mut start = 0;
         for end in ends_vec {
             let stop = (end as usize) * 2;
-            push_ring(stop, start, out);
+            rings.push(ring_at(start, stop));
             start = stop;
         }
     } else {
-        push_ring(xy.len(), 0, out);
+        rings.push(ring_at(0, xy.len()));
     }
+
+    // A polygon's first ring is its exterior and every further ring one of its
+    // interior rings (OGC Simple Features, which FlatGeobuf follows; each part
+    // of a multi-part geometry arrives here as its own polygon). The building
+    // is the exterior minus the holes. Every ring used to be pushed as a
+    // building of its own, so a courtyard was raised to the roof twice over —
+    // inside the exterior's fill, and as a "building" in its own right. An
+    // exterior too short to enclose anything takes its holes with it.
+    let mut rings = rings.into_iter();
+    let Some(Some(coords)) = rings.next() else { return };
+    let holes: Vec<Vec<(f64, f64)>> = rings.flatten().collect();
+    out.push(Building { coords, holes, height, source });
 }
 
 pub fn point_in_poly(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {

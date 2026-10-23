@@ -98,11 +98,13 @@ pub struct DownloadJob {
     /// up in `<cache_dir>/<service_key>/z<zoom>/x<x>_y<y/256>.pack` before any
     /// request, and every answer the run fetches that is worth keeping — an
     /// HTTP 200 body that decoded, or a 404 — is written into it, so later
-    /// jobs (any zoom, any service) fetch only what it lacks. A directory
-    /// that cannot be used is a warning, never an error. CLI `download` only
-    /// (incl. repair jobs, which refetch their listed tiles and rewrite their
-    /// entries); the in-memory and browser downloaders ignore it. See
-    /// `download/tile_cache.rs`.
+    /// jobs (any zoom, any service) fetch only what it lacks; since 0.2.9 a
+    /// tile without an entry is derived from the cached tiles of up to four
+    /// finer zooms when they cover it (changelog 40, `TileCache::derive`).
+    /// A directory that cannot be used is a warning, never an error. CLI
+    /// `download` only (incl. repair jobs, which refetch their listed tiles
+    /// and rewrite their entries); the in-memory and browser downloaders
+    /// ignore it. See `download/tile_cache.rs`.
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
 }
@@ -157,6 +159,52 @@ pub fn dec_terrarium(r: u8, g: u8, b: u8) -> f32 {
 #[inline]
 pub fn dec_mapbox(r: u8, g: u8, b: u8) -> f32 {
     -10000.0 + (r as f32 * 6553.6 + g as f32 * 25.6 + b as f32 * 0.1)
+}
+
+/// The Terrarium RGB of `v` metres, the inverse of [`dec_terrarium`]:
+/// `v = (R·256 + G + B/256) − 32768`, i.e. `k = R·65536 + G·256 + B =
+/// (v + 32768)·256` rounded to the nearest integer (ties up) and clamped to
+/// `0 ..= 2²⁴ − 1`. [`dec_terrarium`] is exact in f32 (every `k / 256 −
+/// 32768` is representable), so the round trip is exact:
+/// `enc_terrarium(dec_terrarium(r, g, b) as f64) == [r, g, b]` for every
+/// triple. NaN encodes as `0, 0, 0` (−32768 m, Terrarium's void). Used by the
+/// raw source-tile cache to store the tiles it derives (changelog 40).
+pub fn enc_terrarium(v: f64) -> [u8; 3] {
+    let k = ((v + 32768.0) * 256.0).round().clamp(0.0, 16_777_215.0);
+    let k = if k.is_nan() { 0 } else { k as u32 };
+    [(k >> 16) as u8, (k >> 8) as u8, k as u8]
+}
+
+/// The Mapbox Terrain-RGB of `v` metres, the inverse of [`dec_mapbox`]:
+/// `v = −10000 + (R·65536 + G·256 + B)·0.1`. [`dec_mapbox`] rounds in f32,
+/// so its value for `n = R·65536 + G·256 + B` can sit a little off
+/// `−10000 + n/10`; of `n = round((v + 10000)·10)` (clamped to
+/// `0 ..= 2²⁴ − 1`) and its neighbours within ±4 the one whose DECODED value
+/// is nearest `v` wins (on a tie the lower `n`). Every value the decoder
+/// produces therefore comes back exactly: `dec_mapbox(enc_mapbox(v)) == v`
+/// for `v = dec_mapbox(r, g, b)`, checked for all 2²⁴ triples (the f32
+/// rounding moves `n` by at most 2) — and as the same triple for every
+/// `n < 10 485 763` (below +1 038 576 m; above, the decoder maps some
+/// neighbouring `n` to one f32 and any of them is returned). NaN encodes as
+/// `0, 0, 0` (−10000 m; Mapbox has no void value). Used by the raw
+/// source-tile cache to store the tiles it derives (changelog 40).
+pub fn enc_mapbox(v: f64) -> [u8; 3] {
+    const MAX: i64 = (1 << 24) - 1;
+    let rgb = |n: i64| [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+    let n0 = ((v + 10000.0) * 10.0).round().clamp(0.0, MAX as f64);
+    if n0.is_nan() {
+        return [0, 0, 0];
+    }
+    let n0 = n0 as i64;
+    let mut best = (f64::INFINITY, n0);
+    for n in (n0 - 4).max(0)..=(n0 + 4).min(MAX) {
+        let [r, g, b] = rgb(n);
+        let err = (dec_mapbox(r, g, b) as f64 - v).abs();
+        if err < best.0 {
+            best = (err, n);
+        }
+    }
+    rgb(best.1)
 }
 
 /// Marks a decode failure that condemns the whole run rather than one tile.
@@ -601,13 +649,15 @@ impl AncestorCache {
         use tile_cache::Use;
         let tc = self.tile_cache.as_deref();
         if let Some(tc) = tc {
+            // A derived tile (status 3, changelog 40) is used like the
+            // service's own; the parent fill never derives one itself.
             match tc.lookup(z, x, y) {
                 Some(Cached::NoTile) => {
                     tc.count(Use::ParentHit);
                     return None;
                 }
-                Some(Cached::Body(body)) => {
-                    if let Ok(grid) = decode_tile(&body, self.dec) {
+                Some(c) => {
+                    if let Some(Ok(grid)) = c.body().map(|b| decode_tile(b, self.dec)) {
                         tc.count(Use::ParentHit);
                         return Some(grid);
                     }
@@ -1305,12 +1355,25 @@ fn available_disk_space(path: &Path) -> Option<u64> {
 }
 
 /// Descriptors kept free beside the connections: the `.abt` files the (up
-/// to two concurrent) assemblies open, the job file, the runtime's own,
-/// stdio, and the raw source-tile cache (changelog 38): up to 16 kept pack
-/// readers (`tile_cache::OPEN_READERS`), one transient pack open per worker
-/// thread, and the cache writer's handle.
+/// to two concurrent) assemblies open where the outputs are not held open
+/// ([`hold_outputs_open`]; held outputs are counted on their own), the job
+/// file, the runtime's own, stdio, and the raw source-tile cache (changelog
+/// 38): up to 16 kept pack readers (`tile_cache::OPEN_READERS`), one
+/// transient pack open per worker thread, and the cache writer's handle.
 #[cfg(feature = "native")]
 const FD_RESERVE: u64 = 96;
+
+/// Whether a CLI `download` keeps its `outputs` output files open for the
+/// whole run (changelog 39) beside `conns` connections under an open-file
+/// limit of `limit` descriptors (`None`: no such limit): when
+/// [`fds_needed`]`(conns) + outputs` fits. Otherwise every row block opens
+/// its file for that one write, as all writes did before — the connections
+/// keep their descriptors either way. Platforms without positional writes
+/// never share a handle between writers, so they always reopen.
+#[cfg(feature = "native")]
+fn hold_outputs_open(conns: usize, outputs: usize, limit: Option<u64>) -> bool {
+    cfg!(any(unix, windows)) && limit.is_none_or(|l| fds_needed(conns) + outputs as u64 <= l)
+}
 
 /// Descriptors a CLI `download` with `conns` connections may hold at once:
 /// up to `conns` sockets in use, up to as many again idle in the client's
@@ -1343,7 +1406,7 @@ fn connections_within(conns: usize, limit: Option<u64>) -> usize {
 /// macOS starts every process at a soft limit of 256 and many Linux systems
 /// at 1 024; a run at the default 256 connections exceeds the first (see
 /// [`fds_needed`]), and at the limit `socket()` fails with EMFILE — and so
-/// does the assembly's `open()` of an output tile, which fails the run.
+/// does the `open()` of an output tile, which fails the run.
 /// macOS refuses (EINVAL) a soft limit above `kern.maxfilesperproc`, so the
 /// target is clamped to that there; a refused raise falls back to `need`.
 #[cfg(feature = "native")]
@@ -1415,21 +1478,74 @@ fn estimate_abt_bytes(tiles: &[SubTileSpec]) -> u64 {
 
 // -- .abt writer --------------------------------------------------------------
 
-/// Open `path`, write consecutive rows (first row's `y` gives the offset), close.
+/// Write consecutive output rows of `file` (`path` names it in errors; the
+/// first row's `y` gives the offset) as one block — each row's `size_px`
+/// samples, then the stride's zero padding, exactly the bytes the per-row
+/// writes before changelog 39 produced — in one positional write.
+///
+/// A positional write moves no cursor another writer relies on, so two
+/// assemblies may write different rows of one file through one handle at
+/// once, without a lock (changelog 39).
 #[cfg(feature = "native")]
-fn write_rows_at(path: &Path, size_px: usize, stride: usize, rows: &[(u32, Vec<i16>)]) -> Result<()> {
-    const PAD: [u8; 256] = [0u8; 256];
-    let f = fs::OpenOptions::new().write(true).open(path)
-        .with_context(|| format!("open {} for strip rows", path.display()))?;
-    let mut w = BufWriter::with_capacity(1 << 20, f);
-    w.seek(SeekFrom::Start(44 + rows[0].0 as u64 * stride as u64))?;
-    let pad = stride - size_px * 2;
-    for (_, row_data) in rows {
-        w.write_all(bytemuck::cast_slice(row_data))?;
-        if pad > 0 { w.write_all(&PAD[..pad])?; }
+fn write_rows_at(file: &File, path: &Path, size_px: usize, stride: usize, rows: &[(u32, Vec<i16>)]) -> Result<()> {
+    let Some(&(y0, _)) = rows.first() else { return Ok(()) };
+    debug_assert!(rows.windows(2).all(|w| w[1].0 == w[0].0 + 1), "rows are consecutive");
+    let mut block = vec![0u8; rows.len() * stride];
+    for (k, (_, row_data)) in rows.iter().enumerate() {
+        block[k * stride..k * stride + size_px * 2].copy_from_slice(bytemuck::cast_slice(row_data));
     }
-    w.flush()?;
+    write_all_at(file, &block, 44 + y0 as u64 * stride as u64).with_context(|| {
+        format!("write rows {}..{} of {}", y0, y0 as usize + rows.len(), path.display())
+    })
+}
+
+/// All of `buf` at byte `offset` of `file`: positional writes (unix `pwrite`,
+/// Windows `WriteFile` at an offset), retried until every byte is written.
+/// Elsewhere through the handle's own cursor — such a handle is never shared
+/// there ([`hold_outputs_open`]).
+#[cfg(feature = "native")]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let at = offset + done as u64;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::write_at(file, &buf[done..], at);
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_write(file, &buf[done..], at);
+        #[cfg(not(any(unix, windows)))]
+        let n = {
+            let mut f = file;
+            f.seek(SeekFrom::Start(at)).and_then(|_| f.write(&buf[done..]))
+        };
+        match n {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
+}
+
+/// Run `write` on output `path`'s file: `held`, the handle kept open for the
+/// run (changelog 39), or — where the open-file limit could not hold every
+/// output ([`hold_outputs_open`]) — the file opened now for this write
+/// only, as every write did before.
+#[cfg(feature = "native")]
+fn with_output<T>(
+    held: Option<&File>,
+    path: &Path,
+    purpose: &str,
+    write: impl FnOnce(&File) -> Result<T>,
+) -> Result<T> {
+    match held {
+        Some(f) => write(f),
+        None => {
+            let f = fs::OpenOptions::new().write(true).open(path)
+                .with_context(|| format!("open {} for {purpose}", path.display()))?;
+            write(&f)
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -1487,6 +1603,12 @@ impl AbtWriter {
     }
 
     fn finish(mut self) -> Result<()> { self.writer.flush()?; Ok(()) }
+
+    /// Flush and hand over the open file (the CLI `download` keeps every
+    /// output open for its run, changelog 39).
+    fn into_file(self) -> Result<File> {
+        self.writer.into_inner().map_err(|e| e.into_error().into())
+    }
 }
 
 // -- Tile fetch: typed failures, idle timeouts, stall timing ------------------
@@ -1969,6 +2091,9 @@ struct CacheUse {
     /// The fetch set's index entries that can be hits, looked up once before
     /// any request (`(x, y)` at the run's zoom).
     index: Arc<std::collections::HashMap<(u32, u32), tile_cache::Entry>>,
+    /// The fetch-set tiles without such an entry that the cache can derive
+    /// from finer cached tiles (changelog 40), found by the same lookup.
+    derivable: Arc<std::collections::HashSet<(u32, u32)>>,
     /// Whether the run's own tiles are read from the cache. A repair job's
     /// are not — it refetches its listed tiles on purpose — but their fresh
     /// answers are still written, replacing the cached ones.
@@ -1988,7 +2113,24 @@ impl CacheUse {
         let e = self.index.get(&(x, y))?;
         match self.cache.read(zoom, x, y, e)? {
             Cached::NoTile => Some(Err(HttpStatus { code: 404, retry_after: None }.into())),
-            Cached::Body(body) => decode_tile(&body, dec).ok().map(Ok),
+            Cached::Body(body) | Cached::Derived(body) => decode_tile(&body, dec).ok().map(Ok),
+        }
+    }
+
+    /// Tile `(x, y)` derived from the finer tiles the cache holds
+    /// (changelog 40) when [`Self::hit`] had none: `Ok` the derived samples,
+    /// `Err` an HTTP 404 when none of its children has a tile, `None` when
+    /// it cannot be derived after all — the tile is then fetched (nothing is
+    /// ever requested for a child). Tried for the tiles the run-start lookup
+    /// found derivable and for those whose own entry failed its CRC or
+    /// decode; never for a repair job's tiles.
+    async fn derive(&self, zoom: u32, x: u32, y: u32) -> Option<Result<(Vec<f32>, usize)>> {
+        if !self.read || !(self.derivable.contains(&(x, y)) || self.index.contains_key(&(x, y))) {
+            return None;
+        }
+        match self.cache.derive(zoom, x, y).await? {
+            tile_cache::Derived::NoTile => Some(Err(HttpStatus { code: 404, retry_after: None }.into())),
+            tile_cache::Derived::Body(grid, edge) => Some(Ok((grid, edge))),
         }
     }
 }
@@ -2172,13 +2314,24 @@ async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
     // which the strip launcher watches) and is decoded from the cached
     // bytes. From the parent fill on, a hit and a fetched tile are the same
     // tile — same pixels, same counts, same progress line. A cached 404 is
-    // the 404 the service gave, and goes to the parent fill as one.
+    // the 404 the service gave, and goes to the parent fill as one. A tile
+    // the cache does not hold but can derive from the finer tiles it does
+    // (changelog 40) is the same kind of hit — no slot, no request, derived
+    // here on the tile's worker — and a derived 404 (none of its children
+    // has a tile) goes to the parent fill like a cached one.
     let t_hit = Instant::now();
-    let hit = ctx.cache.as_ref().and_then(|c| c.hit(zoom, tx, ty, dec));
+    let mut used = tile_cache::Use::Hit;
+    let mut hit = ctx.cache.as_ref().and_then(|c| c.hit(zoom, tx, ty, dec));
+    if hit.is_none() {
+        if let Some(c) = &ctx.cache {
+            hit = c.derive(zoom, tx, ty).await;
+            used = tile_cache::Use::Derived;
+        }
+    }
     let (t0, mut result, stall) = match hit {
         Some(r) => {
             if let Some(c) = &ctx.cache {
-                c.cache.count(tile_cache::Use::Hit);
+                c.cache.count(used);
             }
             if let Some(u) = &ctx.unstarted {
                 u.fetch_sub(1, Ordering::Relaxed);
@@ -2963,6 +3116,10 @@ pub struct DownloadReport {
     /// Tile-rows of the first strip — sized from the probed tile edge, or
     /// for 512 px tiles when the probe failed or was slow (changelog 36).
     pub first_strip_rows: u32,
+    /// Bytes the launch gate still counted as held when the run ended:
+    /// always 0 — every strip hands back exactly what its launch added,
+    /// tile-row by tile-row (changelog 39).
+    pub held_at_end: usize,
 }
 
 #[cfg(feature = "native")]
@@ -2979,8 +3136,13 @@ pub fn run_download_tuned(job_file: &Path, tuning: DownloadTuning) -> Result<Dow
     // Make room for the connections under the open-file limit (unix: raise
     // the soft limit, best effort); where even the raised limit cannot hold
     // them, run fewer connections rather than fail on EMFILE (changelog 36).
+    // A full run also holds every output file open (changelog 39; a repair
+    // opens one at a time), so the raise makes room for those too — but
+    // they never take descriptors from the connections: where they do not
+    // fit beside them, each write opens its file, as before.
     let want = job.max_connections.unwrap_or(256);
-    let limit = open_file_limit(fds_needed(want));
+    let outputs = if job.repair_source_tiles.is_some() { 0 } else { job.tiles.len() };
+    let limit = open_file_limit(fds_needed(want) + outputs as u64);
     let conns = connections_within(want, limit);
     if conns < want {
         eprintln!(
@@ -2989,6 +3151,15 @@ pub fn run_download_tuned(job_file: &Path, tuning: DownloadTuning) -> Result<Dow
             limit.unwrap_or(0), conns, want, fds_needed(want)
         );
         job.max_connections = Some(conns);
+    }
+    let hold_outputs = hold_outputs_open(conns, outputs, limit);
+    match limit {
+        Some(l) if !hold_outputs && outputs > 0 => eprintln!(
+            "[Download] open-file limit {}: {} output tiles are opened for each write instead \
+             of held open ({} descriptors would not fit)",
+            l, outputs, fds_needed(conns) + outputs as u64
+        ),
+        _ => {}
     }
 
     // The file-based path seek-writes sparse .abt files ("file grows as
@@ -3010,7 +3181,7 @@ pub fn run_download_tuned(job_file: &Path, tuning: DownloadTuning) -> Result<Dow
 
     match job.repair_source_tiles.clone() {
         Some(list) => rt.block_on(run_repair_async(job, list)).map(|_| DownloadReport::default()),
-        None => rt.block_on(run_download_async(job, tuning)),
+        None => rt.block_on(run_download_async(job, tuning, hold_outputs)),
     }
 }
 
@@ -3103,8 +3274,9 @@ fn tiles_to_fetch(
         .collect()
 }
 
-/// The download's RAM budget from the RAM available now (changelog 30):
-/// a quarter of it, at most 2 GiB, at least 256 MiB.
+/// The download's RAM budget from the RAM available at the start of the run
+/// (changelog 30; read once and fixed for the run since changelog 39): a
+/// quarter of it, at most 2 GiB, at least 256 MiB.
 #[cfg(feature = "native")]
 fn download_ram_budget(available: u64) -> usize {
     const CAP: u64 = 2 << 30;
@@ -3120,6 +3292,60 @@ fn strip_rows_for(budget: usize, nx: usize, edge: usize, cap: Option<u32>) -> u3
     let row = (nx * edge * edge * 4).max(1);
     let rows = (budget / 2 / row).clamp(1, 32) as u32;
     cap.map_or(rows, |c| rows.min(c.max(1)))
+}
+
+/// A strip's accounted `bytes` apportioned over its tile-rows by their tile
+/// counts (`tiles_per_row`, in row order), the last row taking the rounding
+/// remainder: the shares always sum to exactly `bytes` (changelog 39).
+#[cfg(feature = "native")]
+fn row_shares(bytes: usize, tiles_per_row: &[usize]) -> Vec<usize> {
+    let n: u128 = tiles_per_row.iter().map(|&k| k as u128).sum();
+    let mut shares: Vec<usize> = tiles_per_row.iter()
+        .map(|&k| if n == 0 { 0 } else { (bytes as u128 * k as u128 / n) as usize })
+        .collect();
+    if let Some(last) = shares.len().checked_sub(1) {
+        let rest: usize = shares[..last].iter().sum();
+        shares[last] = bytes - rest;
+    }
+    shares
+}
+
+/// One launched strip's bytes in the launch gate's count of decoded tiles
+/// (`held`, step 5 of `run_download_async`): added at launch, handed back
+/// tile-row by tile-row as the assembly drops each row's tiles (changelog
+/// 39), and whatever is left — every row of a strip that failed, part-way
+/// or before its assembly started — when it drops. In total it always hands
+/// back exactly what its launch added.
+#[cfg(feature = "native")]
+struct StripHold {
+    held: Arc<AtomicUsize>,
+    /// Each tile-row's share not yet handed back ([`row_shares`]).
+    rows: Vec<usize>,
+    /// Bytes not yet handed back.
+    left: usize,
+}
+
+#[cfg(feature = "native")]
+impl StripHold {
+    fn new(held: &Arc<AtomicUsize>, bytes: usize, tiles_per_row: &[usize]) -> Self {
+        held.fetch_add(bytes, Ordering::AcqRel);
+        StripHold { held: held.clone(), rows: row_shares(bytes, tiles_per_row), left: bytes }
+    }
+
+    /// Tile-row `tr` of the strip (0-based) holds no tiles any more: hand
+    /// its share back. A second call for the same row hands back nothing.
+    fn release_row(&mut self, tr: usize) {
+        let n = self.rows.get_mut(tr).map_or(0, std::mem::take).min(self.left);
+        self.left -= n;
+        self.held.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for StripHold {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.left, Ordering::AcqRel);
+    }
 }
 
 /// `download` with `repair_source_tiles` (CONTRACT §9b, changelog 28): fetch
@@ -3216,7 +3442,9 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
         client, url_template: job.url_template.as_str().into(), zoom, dec, concurrency: conns,
         progress: Arc::new(AtomicUsize::new(0)), total, stats: stats.clone(), start_time: start,
         gate: gate.clone(), unstarted: None, ancestors, tile_deadline,
-        cache: tile_cache.as_ref().map(|c| CacheUse { cache: c.clone(), index: Arc::default(), read: false }),
+        cache: tile_cache.as_ref().map(|c| CacheUse {
+            cache: c.clone(), index: Arc::default(), derivable: Arc::default(), read: false,
+        }),
         #[cfg(test)]
         on_decode: None,
     };
@@ -3456,8 +3684,10 @@ impl Drop for AbtCleanup {
     }
 }
 
+/// The CLI `download` of a full job. `hold_outputs`: keep every output file
+/// open for the run ([`hold_outputs_open`]), else open it for each write.
 #[cfg(feature = "native")]
-async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<DownloadReport> {
+async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outputs: bool) -> Result<DownloadReport> {
     let start = Instant::now();
     let conns = job.max_connections.unwrap_or(256);
 
@@ -3541,15 +3771,22 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     // 2c. The raw source-tile cache (`cache_dir`, changelog 38): every tile of
     //     the fetch set is looked up before any request — one index read per
     //     pack — and a hit is decoded from the cached bytes when its turn
-    //     comes, without a connection slot (`fetch_tile`). `<hits>` counts
-    //     the entries found; one whose bytes then fail their CRC or decode is
-    //     fetched after all, which `[Stats] Cache:` reports.
+    //     comes, without a connection slot (`fetch_tile`). A tile without an
+    //     entry that the cache can derive from the finer tiles it holds
+    //     (changelog 40; judged from their index entries here, built when its
+    //     turn comes) is a hit the same way. `<n>` counts both, `<derived>`
+    //     the latter; an entry whose bytes then fail their CRC or decode, or
+    //     a derivation that fails after all, is fetched, which `[Stats]
+    //     Cache:` reports.
     let tile_cache = open_tile_cache(&job);
     let cache_use = tile_cache.as_ref().map(|c| {
         let tiles = row_tiles.iter().zip(y0..).flat_map(|(cols, ty)| cols.iter().map(move |&tx| (tx, ty)));
         let index = c.index(job.zoom, tiles);
-        eprintln!("[Download] cache: {} of {} source tiles from cache", index.len(), total);
-        CacheUse { cache: c.clone(), index: Arc::new(index), read: true }
+        eprintln!("[Download] cache: {} of {} source tiles from cache ({} derived)",
+                  index.hits.len() + index.derivable.len(), total, index.derivable.len());
+        CacheUse {
+            cache: c.clone(), index: Arc::new(index.hits), derivable: Arc::new(index.derivable), read: true,
+        }
     });
 
     // 3. Single HTTP client — reqwest handles connection pooling internally.
@@ -3557,12 +3794,20 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     //    `tile_client` / READ_IDLE_TIMEOUT.
     let client = tile_client(conns)?;
 
-    // 4. Prepare .abt files (write headers, then close — assembly reopens per-strip).
+    // 4. Prepare .abt files: write each header and keep the file open for the
+    //    whole run (changelog 39). Assembly writes each (output, tile-row)
+    //    block through that one handle with one positional write, so two
+    //    assemblies writing rows of one file need no lock and no shared
+    //    cursor. Before, every such block opened, seeked, wrote and closed its
+    //    file. Where the open-file limit cannot hold every output beside the
+    //    connections (`hold_outputs` false, see `hold_outputs_open`), each
+    //    write still opens its file. The handles close after the tail fill.
     //    Everything created from here on is provisional: until `cleanup.keep()`
     //    at the end of a successful run, any exit removes these files again
     //    rather than leaving flat 0 m tiles for the next run to pool as a hit.
     fs::create_dir_all(&job.output_dir)?;
     let mut cleanup = AbtCleanup::default();
+    let mut files: Vec<Option<File>> = Vec::with_capacity(job.tiles.len());
     let abt_specs: Vec<(SubTileSpec, PathBuf)> = {
         let mut specs = Vec::new();
         for spec in &job.tiles {
@@ -3570,11 +3815,17 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
             let path = job.output_dir.join(&spec.filename);
             cleanup.track(path.clone());
             let writer = AbtWriter::create(&path, spec.size_px, spec.ul_lat, spec.ul_lon, pd)?;
-            writer.finish()?;
+            files.push(if hold_outputs {
+                Some(writer.into_file().with_context(|| format!("write {}", path.display()))?)
+            } else {
+                writer.finish()?;
+                None
+            });
             specs.push((spec.clone(), path));
         }
         specs
     };
+    let outputs: Arc<Vec<Option<File>>> = Arc::new(files);
 
     // 4b. Assembly thread pool. One strip at a time on a quarter of the CPUs
     //     assembled ~450 tiles/s on 16 CPUs — the limit once the download
@@ -3592,32 +3843,33 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     );
 
     // 5. Process in strips sized from a RAM budget (changelog 30). A strip's
-    //    tiles are held decoded (f32) from arrival until the strip has been
-    //    assembled, so a strip costs `tiles × edge² × 4 B` — proportional to
-    //    the area's WIDTH: at 32 tile-rows × full width a wide z15 pass held
-    //    several GB per strip, three strips at once. Before every launch the
-    //    budget is re-read from the RAM available NOW (`download_ram_budget`:
-    //    min(available / 4, 2 GiB), at least 256 MiB) and the strip gets the
-    //    rows two strips fit in (`strip_rows_for`, 1..=32): one finishing its
-    //    last tiles or being assembled, the next downloading. A strip launches
-    //    only when its bytes and those of every launched, not yet assembled
-    //    strip fit the budget (or nothing is outstanding), and only once the
-    //    strips in flight have fewer unstarted tiles than the connection
-    //    window — so the pool is kept fed without strips piling up in memory.
-    //    Each output row samples exactly one tile-row, so strip boundaries
-    //    never change a byte. Two strips may assemble at once
-    //    (MAX_CONCURRENT_ASM, changelog 36) inside the same budget: a strip's
-    //    bytes stay in `held` until its assembly ends, so the launch gate
-    //    already counts both; each assembly adds its one tile-row of grid
-    //    (`nx × edge² × 4 B`) on top, as the single one did.
+    //    tiles are held decoded (f32) from arrival until the assembly has
+    //    copied their tile-row into its grid, so a strip costs
+    //    `tiles × edge² × 4 B` — proportional to the area's WIDTH: at 32
+    //    tile-rows × full width a wide z15 pass held several GB per strip,
+    //    three strips at once. The budget (`download_ram_budget`:
+    //    min(available / 4, 2 GiB), at least 256 MiB) is read ONCE, after the
+    //    edge probe (5a), and fixed for the run (changelog 39): re-read before
+    //    every launch, it sank with the RAM the run's own unflushed output
+    //    writes took from "available" — on Windows strips shrank to one
+    //    tile-row of 611 tiles, and with two strips assembling only one could
+    //    download, so the connections drained to zero between strips. Each
+    //    strip gets the rows two strips fit in (`strip_rows_for`, 1..=32):
+    //    one finishing its last tiles or being assembled, the next
+    //    downloading. A strip launches only when its bytes and those still
+    //    held by every launched strip fit the budget (or nothing is
+    //    outstanding), and only once the strips in flight have fewer
+    //    unstarted tiles than the connection window — so the pool is kept fed
+    //    without strips piling up in memory. Each output row samples exactly
+    //    one tile-row, so strip boundaries never change a byte. Two strips may
+    //    assemble at once (MAX_CONCURRENT_ASM, changelog 36) inside the same
+    //    budget: a strip's bytes leave `held` tile-row by tile-row as its
+    //    assembly drops each row's tiles (`StripHold`, changelog 39), so the
+    //    next strip launches as soon as enough rows have drained; each
+    //    assembly adds its one tile-row of grid (`nx × edge² × 4 B`) on top,
+    //    as the single one did.
     const MAX_PREFETCH: usize = 5;
     const MAX_CONCURRENT_ASM: usize = 2;
-    let mut sys = System::new();
-    let mut ram_now = move || -> (u64, usize) {
-        sys.refresh_memory();
-        let avail = sys.available_memory();
-        (avail, tuning.ram_budget.unwrap_or_else(|| download_ram_budget(avail)))
-    };
 
     let zoom = job.zoom;
     let stats = Arc::new(DownloadStats::new());
@@ -3625,7 +3877,8 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     let asm_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_ASM));
     // Tiles of launched strips the gate has not admitted yet.
     let unstarted = Arc::new(AtomicUsize::new(0));
-    // Bytes of launched strips not yet assembled (in flight, queued, assembling).
+    // Bytes of launched strips' tiles not yet dropped by their assembly (in
+    // flight, queued, or in tile-rows not yet assembled) — see `StripHold`.
     let held = Arc::new(AtomicUsize::new(0));
     // One window decision per second (see `throttle_step`).
     let ticker = {
@@ -3696,11 +3949,18 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
         known => known,
     };
 
-    let (avail0, budget0) = ram_now();
-    let rows0 = strip_rows_for(budget0, nx, edge_now(), tuning.max_strip_rows);
-    eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available; \
-               re-evaluated before every strip)",
-        budget0 >> 20, rows0, avail0 as f64 / 1e9);
+    // The RAM budget: read here, once, and fixed for the run (changelog 39;
+    // see 5.). Only the tile edge can still change the strip rows.
+    let avail0 = {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.available_memory()
+    };
+    let budget = tuning.ram_budget.unwrap_or_else(|| download_ram_budget(avail0));
+    let rows0 = strip_rows_for(budget, nx, edge_now(), tuning.max_strip_rows);
+    eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available at start; \
+               fixed for the run)",
+        budget >> 20, rows0, avail0 as f64 / 1e9);
     eprintln!("[Download] {} strips, {} tile-rows/strip, assembly {}/{} threads (max {} concurrent)",
         (ny as u32).div_ceil(rows0), rows0, asm_threads, num_cpus, MAX_CONCURRENT_ASM);
 
@@ -3717,6 +3977,9 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     let mut max_rows = 0u32;
     let mut first_rows = 0u32;
     let mut edge_known = false;
+    // Time the launcher waited with nothing in flight because the next strip
+    // did not fit (the sleep below): the network idle behind the assembly.
+    let mut gate_closed = std::time::Duration::ZERO;
 
     loop {
         // A failed assembly stops the run as soon as it ends.
@@ -3741,11 +4004,11 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
             }
             let known = stats.tile_edge.load(Ordering::Relaxed);
             let edge = edge_now();
-            let (avail, budget) = ram_now();
             let rows = strip_rows_for(budget, nx, edge, tuning.max_strip_rows);
             let (sy0, sy1) = (next_row, (next_row + (rows - 1)).min(y1));
-            let n_tiles: usize =
-                (sy0..=sy1).map(|ty| row_tiles[(ty - y0) as usize].len()).sum();
+            let tiles_per_row: Vec<usize> =
+                (sy0..=sy1).map(|ty| row_tiles[(ty - y0) as usize].len()).collect();
+            let n_tiles: usize = tiles_per_row.iter().sum();
             let bytes = n_tiles * edge * edge * 4;
             let depth = (budget / bytes.max(1)).clamp(1, MAX_PREFETCH);
             if known != 0 && !edge_known {
@@ -3759,10 +4022,13 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
             if !(fits && hungry) {
                 break;
             }
+            // The budget is fixed, so only the tile edge changes the rows:
+            // once, when it is learnt after the first strip was sized for
+            // MAX_TILE_PX (the probe failed or was slow).
             if rows != shown_rows {
                 shown_rows = rows;
-                eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available)",
-                    budget >> 20, rows, avail as f64 / 1e9);
+                eprintln!("[Download] RAM budget: {} MB, strip rows: {} (re-sized for {} px source tiles)",
+                    budget >> 20, rows, edge);
             }
             let mut coords: Vec<(u32, u32)> = (sy0..=sy1)
                 .flat_map(|ty| row_tiles[(ty - y0) as usize].iter().map(move |&tx| (tx, ty)))
@@ -3784,10 +4050,11 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
             }
             // Strips this run will have if the rows stay as they are now.
             let of = launched + 1 + ((y1 - sy1) as usize).div_ceil(rows as usize);
-            held.fetch_add(bytes, Ordering::AcqRel);
+            // Its bytes enter `held` now and leave it row by row (StripHold).
+            let hold = StripHold::new(&held, bytes, &tiles_per_row);
             unstarted.fetch_add(coords.len(), Ordering::Relaxed);
             let h = spawn_strip(coords);
-            let meta = (launched, of, sy0, sy1, bytes);
+            let meta = (launched, of, sy0, sy1, hold);
             pipeline.push(async move {
                 let mut joined = h.await;
                 if let Some((_, got)) = taken {
@@ -3820,13 +4087,15 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                 break; // every strip launched and collected
             }
             // Nothing in flight and the next strip does not fit yet: queued
-            // assemblies still hold the budget. Let them finish.
+            // assemblies still hold the budget. Let them drain rows.
+            let closed_at = Instant::now();
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            gate_closed += closed_at.elapsed();
             continue;
         }
         // Wake at least every 50 ms to re-check the launch conditions (the
-        // strips in flight running low on unstarted tiles, RAM freed).
-        let ((strip_idx, of, sy0, sy1, bytes), joined) =
+        // strips in flight running low on unstarted tiles, rows drained).
+        let ((strip_idx, of, sy0, sy1, hold), joined) =
             match tokio::time::timeout(std::time::Duration::from_millis(50), pipeline.next()).await {
                 Ok(Some(done)) => done,
                 Ok(None) | Err(_) => continue,
@@ -3855,28 +4124,31 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                 strip_idx + 1, of, strip_total, strip_ok, strip_err));
         }
 
-        // Spawn assembly — process one tile-row at a time. Its bytes leave
-        // the budget when it ends, success or not.
+        // Spawn assembly — process one tile-row at a time. Each row's bytes
+        // leave the budget as soon as its tiles are in the grid; whatever is
+        // left when the assembly ends (a failure part-way) leaves with
+        // `hold`, success or not.
         assembly_handles.push(tokio::spawn({
             let specs = abt_specs.clone();
+            let outputs = outputs.clone();
             let pool = asm_pool.clone();
             let asm_sem = asm_semaphore.clone();
-            let held = held.clone();
             let si = strip_idx + 1;
             let ns = of;
             async move {
                 let _permit = asm_sem.acquire().await.unwrap();
-                let done = tokio::task::spawn_blocking(move || -> Result<()> {
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut hold = hold;
                     let asm_start = Instant::now();
                     let sny = (sy1 - sy0 + 1) as usize;
 
-                    // Setup: group tiles by row, pre-compute x_luts, open writers.
+                    // Setup: move each tile's samples into its tile-row's own
+                    // vector (in arrival order, as before), pre-compute x_luts.
                     let t_setup = Instant::now();
-                    let mut tiles_by_row: Vec<Vec<(u32, &[f32])>> = vec![Vec::new(); sny];
-                    for (tx, ty, r) in &results {
+                    let mut tiles_by_row: Vec<Vec<(u32, Vec<f32>)>> = (0..sny).map(|_| Vec::new()).collect();
+                    for (tx, ty, r) in results {
                         if let Ok((elev, _)) = r {
-                            tiles_by_row[(*ty - sy0) as usize]
-                                .push((*tx, elev.as_slice()));
+                            tiles_by_row[(ty - sy0) as usize].push((tx, elev));
                         }
                     }
 
@@ -3892,13 +4164,15 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                     }).collect();
                     let setup_ms = t_setup.elapsed().as_millis();
 
-                    // Process one tile-row at a time. Grid = gw×ts ≈ 36 MB (fits in L3).
+                    // Process one tile-row at a time. The grid is one tile-row
+                    // of the full width, gw × ts × 4 B (611 tiles of 256 px:
+                    // 152.75 MiB), on top of the budget (see 5.).
                     let t_work = Instant::now();
                     let mut mini_grid = vec![NO_TILE_M; gw * ts];
                     let mut total_rows = 0usize;
                     let mut total_px = 0usize;
 
-                    for tr in 0..sny {
+                    for (tr, tiles) in tiles_by_row.into_iter().enumerate() {
                         let ty = sy0 + tr as u32;
 
                         // Clear the mini-grid so failed tiles don't leak stale
@@ -3907,7 +4181,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                         // behind is what gets written out for it.
                         mini_grid.fill(NO_TILE_M);
 
-                        for &(tx, elev) in &tiles_by_row[tr] {
+                        for (tx, elev) in &tiles {
                             let col = (tx - x0) as usize * ts;
                             for py in 0..ts {
                                 let cw = ts.min(gw - col);
@@ -3915,6 +4189,13 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                                     .copy_from_slice(&elev[py * ts..py * ts + cw]);
                             }
                         }
+                        // The grid holds this tile-row now: free its tiles and
+                        // hand their share of the strip's bytes back to the
+                        // launch gate (changelog 39), before the row is
+                        // sampled and written — the next strip may launch
+                        // while it is.
+                        drop(tiles);
+                        hold.release_row(tr);
 
                         let tr_top = ty2lat(ty, zoom);
                         let tr_bot = ty2lat(ty + 1, zoom);
@@ -3957,23 +4238,21 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                             }).collect()
                         });
 
-                        // Write rows (sequential per sub-tile, single seek then stream).
+                        // Write rows: one positional write per sub-tile, in
+                        // order, through the handle held for the run.
                         for (sti, rows) in per_tile.iter().enumerate() {
                             if rows.is_empty() { continue; }
                             total_rows += rows.len();
                             total_px += rows.len() * specs[sti].0.size_px as usize;
-                            // Open, write, close per tile-row: never more than one
-                            // output file open, so no fd limit can be hit. A failure
-                            // aborts the run — a skipped row would read back as 0 m.
-                            write_rows_at(
-                                &specs[sti].1, specs[sti].0.size_px as usize,
-                                strides[sti], rows,
-                            )?;
+                            // A failure aborts the run — a skipped row would
+                            // read back as 0 m.
+                            let (spec, path) = &specs[sti];
+                            with_output(outputs[sti].as_ref(), path, "strip rows", |f| {
+                                write_rows_at(f, path, spec.size_px as usize, strides[sti], rows)
+                            })?;
                         }
                     }
 
-                    drop(tiles_by_row);
-                    drop(results);
                     let work_ms = t_work.elapsed().as_millis();
                     let out_mb = total_px as f64 * 2.0 / (1024.0 * 1024.0);
                     // Diagnostic, one per strip: `AETHER_DIAG_FILE`, else stderr.
@@ -3983,9 +4262,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
                         total_px as f64 / 1e6, out_mb, asm_start.elapsed().as_secs_f64(),
                     ));
                     Ok(())
-                }).await;
-                held.fetch_sub(bytes, Ordering::AcqRel);
-                done?
+                }).await?
             }
         }));
     }
@@ -3994,34 +4271,44 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     for h in assembly_handles {
         h.await??;
     }
+    // Every strip has handed back exactly the bytes its launch added.
+    let held_at_end = held.load(Ordering::Acquire);
+    debug_assert_eq!(held_at_end, 0, "strip bytes left in the launch gate at the end of the run");
+    // Diagnostic (changelog 39), once per run: how long the launcher sat with
+    // nothing downloading because the next strip did not fit the budget.
+    crate::diag::err(&format!(
+        "[Download] launch gate closed for {:.1} s (assembly behind the network)",
+        gate_closed.as_secs_f64()
+    ));
 
     // Bring every file to full length — assembly only wrote the rows some
     // tile-row covered, and `AbtWriter::create` deliberately skips the
     // `set_len` pre-allocation. The tail is written as void rather than
     // `set_len`'s zeros, for the same reason the grid is: 0 m is sea level.
-    for (spec, path) in &abt_specs {
+    for ((spec, path), held_file) in abt_specs.iter().zip(outputs.iter()) {
         let sz = spec.size_px as usize;
         let stride = ((sz * 2) + 255) & !255;
         let expected = 44 + stride as u64 * sz as u64;
-        {
-            let mut f = fs::OpenOptions::new().write(true).open(path)
-                .with_context(|| format!("open {} for tail fill", path.display()))?;
+        with_output(held_file.as_ref(), path, "tail fill", |mut f| {
             let actual = f.metadata()?.len();
             if actual >= expected {
-                continue;
+                return Ok(());
             }
             // Rows are written whole, so the tail starts on a row boundary;
             // a partial one (an interrupted flush) is rewritten from its start.
             let written = actual.saturating_sub(44) / stride as u64;
             let row = void_row_bytes(sz, stride);
             f.seek(SeekFrom::Start(44 + written * stride as u64))?;
-            let mut w = BufWriter::with_capacity(1 << 20, &mut f);
+            let mut w = BufWriter::with_capacity(1 << 20, f);
             for _ in written..sz as u64 {
                 w.write_all(&row)?;
             }
             w.flush()?;
-        }
+            Ok(())
+        })?;
     }
+    // Every output is complete: close the handles held for the run.
+    drop(outputs);
 
     // A run that genuinely FAILED to fetch a majority of its tiles is not a
     // successful run — the network died, the key expired, or the source serves
@@ -4089,7 +4376,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning) -> Result<
     cleanup.keep();
     Ok(DownloadReport {
         tiles_fetched: total, strips: launched, max_strip_rows: max_rows,
-        first_strip_rows: first_rows,
+        first_strip_rows: first_rows, held_at_end,
     })
 }
 
@@ -4561,21 +4848,136 @@ mod tests {
     use super::*;
 
     #[test]
-    fn write_rows_at_missing_file_is_an_error() {
+    fn a_missing_output_opened_for_its_write_is_an_error_naming_it() {
         let missing = std::env::temp_dir().join("aether_no_such_dir_xyz/a.abt");
         let rows = vec![(0u32, vec![1i16; 4])];
-        assert!(write_rows_at(&missing, 4, 256, &rows).is_err());
+        let err = with_output(None, &missing, "strip rows", |f| write_rows_at(f, &missing, 4, 256, &rows))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("aether_no_such_dir_xyz"), "{err:#}");
     }
 
     #[test]
     fn write_rows_at_writes_at_row_offset() {
-        let p = std::env::temp_dir().join(format!("aether_wr_{}.abt", std::process::id()));
-        fs::write(&p, []).unwrap();
-        write_rows_at(&p, 4, 256, &[(2u32, vec![7i16; 4])]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.abt");
+        let f = File::create(&p).unwrap();
+        write_rows_at(&f, &p, 4, 256, &[(2u32, vec![7i16; 4])]).unwrap();
+        drop(f);
         let b = fs::read(&p).unwrap();
-        let _ = fs::remove_file(&p);
         assert_eq!(b.len(), 44 + 3 * 256);
         assert_eq!(&b[44 + 512..44 + 512 + 2], &7i16.to_ne_bytes());
+        assert!(b[44 + 512 + 8..].iter().all(|&v| v == 0), "the stride's padding is zeros");
+    }
+
+    #[test]
+    fn a_row_block_is_the_bytes_the_per_row_writes_made() {
+        // The writer before changelog 39: seek to the first row, then each
+        // row's samples and the stride's padding, through a BufWriter.
+        fn per_row(path: &Path, size_px: usize, stride: usize, rows: &[(u32, Vec<i16>)]) {
+            const PAD: [u8; 256] = [0u8; 256];
+            let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+            let mut w = BufWriter::with_capacity(1 << 20, f);
+            w.seek(SeekFrom::Start(44 + rows[0].0 as u64 * stride as u64)).unwrap();
+            for (_, row) in rows {
+                w.write_all(bytemuck::cast_slice(row)).unwrap();
+                w.write_all(&PAD[..stride - size_px * 2]).unwrap();
+            }
+            w.flush().unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // 5 px rows (10 bytes of 256) and 128 px rows (exactly one stride).
+        for (sz, stride) in [(5usize, 256usize), (128, 256)] {
+            let block = |y0: u32| -> Vec<(u32, Vec<i16>)> {
+                (y0..y0 + 3).map(|y| (y, (0..sz).map(|x| (y as i16) * 1000 - x as i16).collect())).collect()
+            };
+            let (a, b) = (dir.path().join(format!("old{sz}")), dir.path().join(format!("new{sz}")));
+            fs::write(&a, [0xAAu8; 44]).unwrap();
+            fs::write(&b, [0xAAu8; 44]).unwrap();
+            let f = fs::OpenOptions::new().write(true).open(&b).unwrap();
+            for y0 in [3u32, 0, 6] {
+                per_row(&a, sz, stride, &block(y0));
+                write_rows_at(&f, &b, sz, stride, &block(y0)).unwrap();
+            }
+            drop(f);
+            assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap(), "size_px {sz}");
+        }
+    }
+
+    #[test]
+    fn two_writers_write_rows_of_one_handle_at_once() {
+        // Two assemblies may write different rows of one output at the same
+        // time through its one handle: positional writes share no cursor.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("shared.abt");
+        let f = File::create(&p).unwrap();
+        let (sz, stride, n) = (100usize, 256usize, 400u32);
+        std::thread::scope(|s| {
+            for parity in 0..2u32 {
+                let (f, p) = (&f, &p);
+                s.spawn(move || {
+                    for y in (parity..n).step_by(2) {
+                        write_rows_at(f, p, sz, stride, &[(y, vec![y as i16; sz])]).unwrap();
+                    }
+                });
+            }
+        });
+        drop(f);
+        let b = fs::read(&p).unwrap();
+        assert_eq!(b.len(), 44 + n as usize * stride);
+        for y in 0..n as usize {
+            let row = &b[44 + y * stride..44 + (y + 1) * stride];
+            assert!(row[..sz * 2].chunks_exact(2).all(|v| v == (y as i16).to_ne_bytes()), "row {y}");
+            assert!(row[sz * 2..].iter().all(|&v| v == 0), "row {y} padding");
+        }
+    }
+
+    #[test]
+    fn a_strips_bytes_are_shared_over_its_rows_by_tile_count() {
+        let shares = row_shares(10 * 4096, &[3, 0, 5, 2]);
+        assert_eq!(shares, [3 * 4096, 0, 5 * 4096, 2 * 4096]);
+        // Bytes that do not divide by the tile count: the last row takes the
+        // remainder, and the shares still sum to exactly the bytes.
+        let shares = row_shares(1001, &[1, 1, 1]);
+        assert_eq!(shares, [333, 333, 335]);
+        assert_eq!(row_shares(7, &[0, 0]), [0, 7], "no tiles: the last row holds it all");
+        assert!(row_shares(7, &[]).is_empty());
+        assert_eq!(row_shares(usize::MAX, &[2, 1]).iter().sum::<usize>(), usize::MAX, "no overflow");
+    }
+
+    #[test]
+    fn a_strip_hands_back_exactly_what_it_took_row_by_row_or_when_dropped() {
+        let held = Arc::new(AtomicUsize::new(0));
+        // Assembled to the end: row by row, nothing left at the drop.
+        let mut a = StripHold::new(&held, 1001, &[1, 1, 1]);
+        let mut b = StripHold::new(&held, 500, &[2, 3]);
+        assert_eq!(held.load(Ordering::Acquire), 1501);
+        a.release_row(0);
+        assert_eq!(held.load(Ordering::Acquire), 1501 - 333);
+        a.release_row(0); // a second release of a row hands back nothing
+        a.release_row(1);
+        a.release_row(2);
+        a.release_row(9); // no such row
+        assert_eq!(held.load(Ordering::Acquire), 500);
+        drop(a);
+        assert_eq!(held.load(Ordering::Acquire), 500);
+        // Failed part-way: the rows not reached go back at the drop.
+        b.release_row(0);
+        assert_eq!(held.load(Ordering::Acquire), 300);
+        drop(b);
+        assert_eq!(held.load(Ordering::Acquire), 0);
+        // Never assembled at all.
+        drop(StripHold::new(&held, 4096, &[4]));
+        assert_eq!(held.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn outputs_are_held_open_only_where_they_fit_beside_the_connections() {
+        assert!(hold_outputs_open(256, 100_000, None), "no such limit (Windows)");
+        assert!(hold_outputs_open(256, 2169, Some(1 << 20)));
+        assert!(hold_outputs_open(256, 416, Some(1024)), "608 + 416 exactly fits");
+        assert!(!hold_outputs_open(256, 417, Some(1024)));
+        assert!(!hold_outputs_open(2, 255, Some(100)), "the connections keep their descriptors");
+        assert!(hold_outputs_open(2, 0, Some(100)));
     }
 
     // ── fetch_bounds / URL planning ────────────────────────────────────────
