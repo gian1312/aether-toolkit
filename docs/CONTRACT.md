@@ -915,6 +915,59 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    enumerate with exactly the formulas above — the snap, the rounding
 >    **and** the start term; for older builds, the old ones. Any other mix
 >    makes the tile lists differ and a cross-check abort (§1.5).
+> 44. **`ingest`: a batch decodes its `buildings_pbf_dir` in parallel and
+>    reports how far it is (§1.2, §9a; additive; `aether_converter` 0.2.9;
+>    2026-10-23).** No job-JSON change; `.abt` bytes and every count are
+>    unchanged (on NTFS by construction, elsewhere see (a)). Motivation: a
+>    batch decodes each `buildings_pbf_dir` once, before its first tile — one
+>    read and one MVT decode per file, one file after the other, printing
+>    nothing. 20,808 tiles took 6 min 6 s while a download wrote to the same
+>    HDD (17 ms a tile; 40 s with the disk idle), and the plugin's progress
+>    bar stood still while its ETA ran away. (a) **Parallel, same result.**
+>    The tile files are listed, sorted by name (byte-wise), and read and
+>    decoded on the batch's worker pool (the `[Rust] Rayon Pool:` threads);
+>    the results are taken in name order, exactly as a walk over the sorted
+>    list one file at a time takes them: the building list in the same order,
+>    hence the duplicate filter's choices, `tiles_read` and the
+>    decoded/after-dedup counts; the `[Warn] buildings <name>: <error>` skip;
+>    the first unreadable tile as the run's error. Before, the walk followed
+>    `read_dir` order. NTFS lists a directory in index order — upcased names
+>    as UTF-16 units — which for every name the decoder accepts is byte order
+>    (two such names part at a digit, `+`, `_` or `.`, never at a letter;
+>    pinned by a test), so on Windows the walk, and with it every output byte
+>    and count, is that of the sequential decoder it replaces (the container's
+>    Windows-backed mount lists in name order too, checked). A file system
+>    with an order of its own (ext4 hashes, APFS) was walked in that order and
+>    is now walked in name order: the same buildings, in an order independent
+>    of the disk; `.abt` bytes could move only where the duplicate filter now
+>    keeps the other of two copies of one building, whose coordinates differ
+>    by float rounding, and a pixel centre lies that close to an edge. Checked
+>    with the 0.2.9 sequential build against this one on 2,100 building tiles
+>    (synthetic and real OSM, 1 undecodable) and 4 output tiles, on the
+>    Windows-backed mount and on the container's overlay file system: all
+>    `.abt` byte-identical, every `[Info] buildings_pbf_dir` and `[Warn]` line
+>    identical. (b) **Progress lines** on stdout (§9a): `[Rust] Decoding
+>    building tiles: <n>/<m>` every 1,000 tiles and once at the end, then
+>    `[Rust] Building tiles decoded: <m> tile(s), <b> building(s) in <s.s> s`;
+>    neither contains `Progress:`. The summary line is now the first line
+>    after the decode, so a consumer that stops a run at the line after
+>    `[Warn] buildings …` (the Waveshed plugin's `BurnMonitor`) stops it there
+>    — before any tile is sampled. (c) **Order of the edges.** The `[Warn]
+>    buildings` lines come together, in name order, after the last progress
+>    line (they came as the walk met them); a mixed-zoom directory is refused
+>    before any tile is read (same message; before, after the tiles ahead of
+>    the odd zoom). The single-job form and `download`'s buildings post-pass
+>    and repairs use the same loader on rayon's global pool, without the new
+>    lines. Measured in the container (4 CPUs, warm cache, release build;
+>    `buildings.rs` `bench_pbf_decode_2000_tiles_sequential_vs_parallel`, an
+>    ignored test — `AETHER_PBF_BENCH_DIR` picks the disk), 2,000 gzipped
+>    copies of the OpenFreeMap tile 14/8651/5782 (940,000 buildings):
+>    sequential 6.0 s, of which ~1.7 s is the duplicate filter, which stays on
+>    one thread; 4 threads 2.5 s (2.4×). On the container's Windows-backed 9p
+>    mount, where every file costs a round trip: 19.5 s → 5.9 s at 4 threads;
+>    2,000 small tiles 12.6 s → 1.65 s. The owner's HDD under a concurrent
+>    download is not measured. Nothing to gate on: a consumer can tell this
+>    build by `--version` (0.2.9).
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -1064,6 +1117,12 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   style** — *not* the `[P:]/[S:]/[E:]/[D:]` markers of §1.1.
 * **Ingest progress** (stdout): `[Rust] Progress: <n>/<total>` (emitted every 10
   tiles and once at completion) — `println!("[Rust] Progress: {}/{}", curr, total)`.
+* **Building-tile decode progress** (stdout, batch ingest with a
+  `buildings_pbf_dir`; `aether_converter` ≥ 0.2.9, changelog 44), before the
+  first tile: `[Rust] Decoding building tiles: <n>/<m>` every 1,000 building
+  tiles and once at the end, then `[Rust] Building tiles decoded: <m>
+  tile(s), <b> building(s) in <s.s> s` — see §9a *Building-tile decode*.
+  Neither contains `Progress:`.
 * **Ingest diagnostic lines** (stdout, or the file `AETHER_DIAG_FILE` names
   — below; `aether_converter` ≥ 0.2.7, changelog 31, 37; **diagnostic, not
   parsed** — for people reading a log, wording may change, consumers must
@@ -1677,6 +1736,7 @@ Known capability gates consumers rely on:
 | `AETHER_DIAG_FILE` — `ingest`'s `[Rust] tile` and `download`'s `[Strip …]` diagnostic lines to a file (§1.2; older builds ignore the variable and keep printing them on the console) | `aether_converter 0.2.8` |
 | `download` job field `cache_dir` (§9b; older builds ignore it — nothing is cached and every job fetches everything) | `aether_converter 0.2.8` |
 | `plan` grid of changelog 43 — 1e-9-step snap, edges rounded to 9 decimals, tolerant start per resolution (§1.2; a consumer that cross-checks `plan` must enumerate this way for this build and later and the old way for older ones, or its check aborts) | `aether_converter 0.2.9` |
+| `[Rust] Decoding building tiles: <n>/<m>` and `[Rust] Building tiles decoded: …` lines while a batch `ingest` decodes its `buildings_pbf_dir` (§9a, changelog 44; older builds print nothing during the decode and decode one file after the other) | `aether_converter 0.2.9` |
 
 ---
 
@@ -2484,6 +2544,50 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
 > building grew (see the precondition below). It now refuses the directory with
 > the same message `download` has always used. A single-zoom directory — the
 > only kind that ever produced correct output — is unaffected.
+
+**Building-tile decode (`buildings_pbf_dir`, batch ingest; additive;
+`aether_converter` ≥ 0.2.9, changelog 44).** A batch decodes each distinct
+`buildings_pbf_dir` once, before its first tile, after the unchanged line
+`[Rust] Decoding building tiles in "<dir>" (once for the run)...`. The
+directory's tile files — every name `{z}_{x}_{y}.pbf` or `{z}_{x}_{y}.mvt`;
+anything else is ignored — are taken in **name order** (byte-wise) and read
+and decoded in parallel on the batch's worker pool (the `[Rust] Rayon Pool:`
+threads). The result is exactly what a walk over that order, one file after
+the other, gives: the same building list in the same order (so the duplicate
+filter keeps the same copies), the same counts, the same warnings. On NTFS,
+name order is also the order the sequential decoder before it walked
+(changelog 44). On stdout, the stream of `[Rust] Progress:`:
+
+```
+[Rust] Decoding building tiles: <n>/<m>
+[Rust] Building tiles decoded: <m> tile(s), <b> building(s) in <s.s> s
+```
+
+* `<m>` is the directory's tile files, decoded or not; `<n>` those finished
+  (decoded, skipped or failed). A progress line comes at every multiple of
+  1,000 and once at `<n>` = `<m>` — one line, when `<m>` is a multiple of
+  1,000 — in increasing `<n>`, each flushed as printed; none for a directory
+  without tile files.
+* The summary line follows when the decode and the duplicate filter are
+  done: `<b>` = buildings decoded **before** the duplicate filter (the
+  `<n> building(s)` of the per-tile `[Info] buildings_pbf_dir:` line),
+  `<s.s>` = wall seconds of the whole load, one decimal. It is the line
+  after the decode's last line (a progress line, or the warnings below) and
+  comes before any tile is sampled.
+* A tile that does not decode is still skipped with `[Warn] buildings
+  <name>: <error>` on stderr (and still counts in `<m>`). These lines now come
+  together, in name order, after the last progress line and before the
+  summary line; they used to come as the walk met them. A tile file that
+  cannot be read, and a mixed-zoom directory — now refused before any tile
+  is read, same message — fail the run as before, without a summary line.
+* Neither line contains `Progress:`, so an ingest-progress parser
+  (`Progress:\s*(\d+)/(\d+)`) does not take them for output tiles. The
+  progress lines keep the start line's prefix `[Rust] Decoding building
+  tiles`; the summary line does not. The format is stable: a consumer may
+  show `<n>/<m>` as the decode's progress.
+* The single-job form (a JSON object) decodes the same way on rayon's global
+  pool, without these lines; so do `download`'s buildings post-pass and its
+  repair jobs (§9b), whose lines are unchanged.
 
 **Building write rule (both sources).** Every height off the ladder above is
 normalised to an absolute roof elevation — an above-ground rung by adding the

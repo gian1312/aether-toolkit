@@ -649,8 +649,11 @@ pub fn rasterize_buildings<G: ElevGrid>(
 /// and `download`'s post-pass — load it once per run and share it across tiles.
 #[derive(Debug, Default)]
 pub struct PbfBuildingSet {
-    /// Deduplicated buildings, in directory-scan order.
+    /// Deduplicated buildings, in tile-file **name** order (and, within a
+    /// tile, in the tile's own feature order).
     pub buildings: Vec<Building>,
+    /// `{z}_{x}_{y}` tile files in the directory, decoded or skipped.
+    pub tiles_found: usize,
     /// PBF tiles that decoded successfully.
     pub tiles_read: usize,
     /// Buildings decoded, before duplicate footprints were dropped.
@@ -669,10 +672,75 @@ impl PbfBuildingSet {
 
 /// Decode every `{z}_{x}_{y}.pbf` tile in *pbf_dir* into one shared building set.
 ///
+/// [`load_pbf_building_dir_with_progress`] without the progress callback.
+pub fn load_pbf_building_dir(pbf_dir: &Path) -> Result<PbfBuildingSet> {
+    load_pbf_building_dir_with_progress(pbf_dir, &|_, _| {})
+}
+
+/// One `{z}_{x}_{y}` tile file of a building directory.
+struct PbfTileFile {
+    name: String,
+    path: std::path::PathBuf,
+    z: u32,
+    x: u32,
+    y: u32,
+}
+
+/// What reading and decoding one tile file came to.
+enum PbfTileOutcome {
+    Decoded(Vec<Building>),
+    /// Skipped with a `[Warn] buildings <name>: <error>` line.
+    Undecodable(anyhow::Error),
+    /// The read failed, which fails the whole load.
+    Unreadable(std::io::Error),
+    /// Not read: a tile before it (in name order) was unreadable, so the
+    /// load fails at that one and never looks at this.
+    NotReached,
+}
+
+/// Read and decode one tile file. Never fails the load by itself: the
+/// caller decides, in name order, what an outcome means.
+fn decode_pbf_tile_file(f: &PbfTileFile) -> PbfTileOutcome {
+    let raw = match fs::read(&f.path) {
+        Ok(raw) => raw,
+        Err(e) => return PbfTileOutcome::Unreadable(e),
+    };
+    let bytes = crate::mvt::maybe_gunzip(&raw);
+    match crate::mvt::extract_buildings_from_pbf(&bytes, f.x, f.y, f.z) {
+        Ok((buildings, _)) => {
+            PbfTileOutcome::Decoded(buildings.iter().map(|b| b.to_building()).collect())
+        }
+        Err(e) => PbfTileOutcome::Undecodable(e),
+    }
+}
+
+/// Decode every `{z}_{x}_{y}.pbf` tile in *pbf_dir* into one shared building
+/// set, reporting each finished tile to *on_progress*.
+///
 /// Cost is `O(pbf tiles)` **per run**, not per output tile. Callers must load
 /// once and rasterize the same set onto every tile; re-reading the directory
 /// inside a tile loop turns one directory scan into one scan per `.abt` and
 /// produces exactly the same buildings.
+///
+/// # Parallel, and the same result as one tile after the other
+///
+/// The tile files are taken in **name order** (byte-wise: the order NTFS lists
+/// such names in; other file systems list them in an order of their own, ext4
+/// by hash) and read and decoded in parallel on the current rayon pool — the
+/// batch's pool when called inside its `install`, else the global one (the
+/// `native` feature; without it, one after the other). The results are then
+/// taken in name order, exactly as a sequential walk would take them: the
+/// building list, so the duplicate filter's choices and every byte drawn from
+/// the set; `tiles_read`; the `[Warn] buildings <name>: <error>` line of each
+/// tile that does not decode (skipped, as before — printed in name order once
+/// every tile is decoded, never from two threads at once); and the error of
+/// the first tile, in name order, that cannot be read at all, which fails the
+/// load as it always did (a tile after it is not read once that is known).
+///
+/// *on_progress(done, total)* is called once per tile file, as it finishes
+/// (decoded, skipped or failed): `done` runs 1, 2, …, `total`, the calls never
+/// overlap and arrive in that order. `total` is the directory's tile count
+/// ([`PbfBuildingSet::tiles_found`]); a directory without tiles never calls it.
 ///
 /// # Mixed zooms are refused
 ///
@@ -681,32 +749,90 @@ impl PbfBuildingSet {
 /// self-consistent — but a second pass would measure new roofs against the roofs
 /// the first pass laid down. Two zoom levels covering the same ground are two
 /// passes over the same buildings, so a mixed-zoom directory is refused rather
-/// than silently compounded.
-pub fn load_pbf_building_dir(pbf_dir: &Path) -> Result<PbfBuildingSet> {
+/// than silently compounded — before any tile is read.
+pub fn load_pbf_building_dir_with_progress(
+    pbf_dir: &Path,
+    on_progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<PbfBuildingSet> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     if !pbf_dir.is_dir() {
         anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
     }
 
-    let mut set = PbfBuildingSet::default();
+    let mut files: Vec<PbfTileFile> = Vec::new();
     for entry in fs::read_dir(pbf_dir)?.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
         let Some((z, x, y)) = crate::ingest::parse_pbf_tile_name(name) else { continue };
+        files.push(PbfTileFile { name: name.to_owned(), path, z, x, y });
+    }
+    files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
+    let mut set = PbfBuildingSet { tiles_found: files.len(), ..Default::default() };
+    for f in &files {
         match set.zoom {
-            None => set.zoom = Some(z),
-            Some(z0) if z0 != z => anyhow::bail!(
-                "buildings_pbf_dir mixes zoom levels ({z0} and {z}); expected exactly one"
+            None => set.zoom = Some(f.z),
+            Some(z0) if z0 != f.z => anyhow::bail!(
+                "buildings_pbf_dir mixes zoom levels ({z0} and {}); expected exactly one",
+                f.z
             ),
             _ => {}
         }
-        let raw = fs::read(&path)?;
-        let bytes = crate::mvt::maybe_gunzip(&raw);
-        match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
-            Ok((buildings, _)) => {
-                set.tiles_read += 1;
-                set.buildings.extend(buildings.iter().map(|b| b.to_building()));
+    }
+
+    let total = files.len();
+    let done = Mutex::new(0usize);
+    // The lowest index whose read failed so far. A tile past it is never
+    // looked at by the walk below, so it need not be read; every tile before
+    // the first failure in name order still is (this only ever holds the
+    // index of a real failure, never one below the first).
+    let first_unreadable = AtomicUsize::new(usize::MAX);
+    let work = |(i, f): (usize, &PbfTileFile)| -> PbfTileOutcome {
+        let outcome = if i > first_unreadable.load(Ordering::Relaxed) {
+            PbfTileOutcome::NotReached
+        } else {
+            let outcome = decode_pbf_tile_file(f);
+            if matches!(outcome, PbfTileOutcome::Unreadable(_)) {
+                first_unreadable.fetch_min(i, Ordering::Relaxed);
             }
-            Err(e) => eprintln!("[Warn] buildings {name}: {e}"),
+            outcome
+        };
+        // Counted and reported under one lock, so the calls come in order.
+        let mut n = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *n += 1;
+        on_progress(*n, total);
+        outcome
+    };
+    // An indexed `collect` keeps the input order whatever the thread timing.
+    #[cfg(feature = "native")]
+    let outcomes: Vec<PbfTileOutcome> = {
+        use rayon::prelude::*;
+        files.par_iter().enumerate().map(work).collect()
+    };
+    #[cfg(not(feature = "native"))]
+    let outcomes: Vec<PbfTileOutcome> = files.iter().enumerate().map(work).collect();
+
+    let decoded_total: usize = outcomes
+        .iter()
+        .map(|o| match o {
+            PbfTileOutcome::Decoded(b) => b.len(),
+            _ => 0,
+        })
+        .sum();
+    set.buildings.reserve_exact(decoded_total);
+    for (f, outcome) in files.iter().zip(outcomes) {
+        match outcome {
+            PbfTileOutcome::Decoded(buildings) => {
+                set.tiles_read += 1;
+                set.buildings.extend(buildings);
+            }
+            PbfTileOutcome::Undecodable(e) => eprintln!("[Warn] buildings {}: {e}", f.name),
+            PbfTileOutcome::Unreadable(e) => return Err(e.into()),
+            PbfTileOutcome::NotReached => {
+                unreachable!("a tile past an unreadable one is never walked to")
+            }
         }
     }
 
@@ -1278,6 +1404,391 @@ pub(crate) mod tests {
             per_tile[0].iter().any(|&v| v != 200),
             "the fixture must actually draw a building, or this proves nothing"
         );
+    }
+
+    // ── The parallel decode (changelog 44) ─────────────────────────────────
+
+    /// The loader as it was before its decode went parallel, verbatim but for
+    /// its walk order: it takes the tile files in the order *cmp* puts their
+    /// paths in instead of `read_dir` order. With [`by_name`] that is the
+    /// order the parallel loader fixes on every platform, and the one NTFS
+    /// lists these names in (see the test below).
+    fn load_pbf_building_dir_sequential(
+        pbf_dir: &Path,
+        cmp: impl FnMut(&std::path::PathBuf, &std::path::PathBuf) -> std::cmp::Ordering,
+    ) -> Result<PbfBuildingSet> {
+        if !pbf_dir.is_dir() {
+            anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
+        }
+
+        let mut set = PbfBuildingSet::default();
+        let mut paths: Vec<std::path::PathBuf> =
+            fs::read_dir(pbf_dir)?.flatten().map(|e| e.path()).collect();
+        paths.sort_by(cmp);
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some((z, x, y)) = crate::ingest::parse_pbf_tile_name(name) else { continue };
+            match set.zoom {
+                None => set.zoom = Some(z),
+                Some(z0) if z0 != z => anyhow::bail!(
+                    "buildings_pbf_dir mixes zoom levels ({z0} and {z}); expected exactly one"
+                ),
+                _ => {}
+            }
+            let raw = fs::read(&path)?;
+            let bytes = crate::mvt::maybe_gunzip(&raw);
+            match crate::mvt::extract_buildings_from_pbf(&bytes, x, y, z) {
+                Ok((buildings, _)) => {
+                    set.tiles_read += 1;
+                    set.buildings.extend(buildings.iter().map(|b| b.to_building()));
+                }
+                Err(e) => eprintln!("[Warn] buildings {name}: {e}"),
+            }
+        }
+
+        set.decoded = set.buildings.len();
+        drop_duplicate_buildings(&mut set.buildings, Building::duplicate_key);
+
+        Ok(set)
+    }
+
+    fn by_name(a: &std::path::PathBuf, b: &std::path::PathBuf) -> std::cmp::Ordering {
+        a.file_name().cmp(&b.file_name())
+    }
+
+    /// Bit pattern of a ring.
+    type RingBits = Vec<(u64, u64)>;
+
+    /// Every building of *set*, everything it carries bit for bit, in order.
+    fn building_bits(set: &PbfBuildingSet) -> Vec<(RingBits, Vec<RingBits>, (bool, u64), HeightSource)> {
+        let ring = |r: &[(f64, f64)]| -> RingBits {
+            r.iter().map(|&(lon, lat)| (lon.to_bits(), lat.to_bits())).collect()
+        };
+        set.buildings
+            .iter()
+            .map(|b| {
+                let height = match b.height {
+                    BuildingHeight::Absolute(v) => (true, v.to_bits()),
+                    BuildingHeight::AboveGround(v) => (false, v.to_bits()),
+                };
+                (ring(&b.coords), b.holes.iter().map(|h| ring(h)).collect(), height, b.source)
+            })
+            .collect()
+    }
+
+    /// The `(x, y)` of tile *i* of [`many_tile_dir`]: rows of 40 at z14, x
+    /// crossing 9999 → 10000, so name order ("14_10000_…" < "14_9980_…") is
+    /// neither numeric nor creation order.
+    fn many_tile_xy(i: usize) -> (u32, u32) {
+        (9980 + (i % 40) as u32, 5700 + (i / 40) as u32)
+    }
+
+    /// A z14 directory of *n* building tiles (see [`many_tile_xy`]) holding
+    /// what a real fetch holds: a house at each tile's east edge and its copy
+    /// in the east neighbour's buffer zone (the duplicate filter's case,
+    /// across tiles), a building with a courtyard in every other tile, every
+    /// third tile gzipped, and a file the scan ignores. The tiles listed in
+    /// *bad* are written as bytes that do not decode.
+    fn many_tile_dir(n: usize, bad: &[usize]) -> tempfile::TempDir {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        // The east-edge house of tile i: its ring at the east edge, and the
+        // same ground 4096 units further west, as the east neighbour has it.
+        let house = |i: usize, dx: i32| -> (f64, Vec<Vec<(i32, i32)>>) {
+            let k = (i % 50) as i32;
+            (10.0 + (i % 7) as f64, vec![exterior(4000 - dx, 1000 + k, 4090 - dx, 1090 + k)])
+        };
+        for i in 0..n {
+            let (x, y) = many_tile_xy(i);
+            let bytes = if bad.contains(&i) {
+                b"\x1a\xff\xff\xff\x0fnot a vector tile".to_vec()
+            } else {
+                let mut features = vec![house(i, 0)];
+                if i % 40 != 0 {
+                    features.push(house(i - 1, 4096));
+                }
+                if i % 2 == 0 {
+                    let k = (i % 300) as i32;
+                    features.push((
+                        6.0 + (i % 5) as f64,
+                        vec![exterior(500, 500, 1500 + k, 1500), interior(800, 800, 1000, 1000)],
+                    ));
+                }
+                let tile = building_tile(&features);
+                if i % 3 == 0 {
+                    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                    gz.write_all(&tile).unwrap();
+                    gz.finish().unwrap()
+                } else {
+                    tile
+                }
+            };
+            std::fs::write(dir.path().join(format!("14_{x}_{y}.pbf")), bytes).unwrap();
+        }
+        std::fs::write(dir.path().join("README.txt"), b"not a tile").unwrap();
+        dir
+    }
+
+    #[cfg(feature = "native")]
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap()
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_parallel_decode_is_the_sequential_walk_in_name_order() {
+        let n = 1500;
+        let dir = many_tile_dir(n, &[17, 1203]);
+        let reference = load_pbf_building_dir_sequential(dir.path(), by_name).unwrap();
+        let expected = building_bits(&reference);
+        assert_eq!(reference.tiles_read, n - 2);
+        assert!(
+            reference.duplicates_dropped() > 1000,
+            "the buffer-zone copies must reach the duplicate filter: {} dropped",
+            reference.duplicates_dropped()
+        );
+
+        // Any pool size, and rayon's global pool: the same list, bit for bit.
+        for threads in [1, 3, 8] {
+            let set = pool(threads).install(|| load_pbf_building_dir(dir.path())).unwrap();
+            assert!(building_bits(&set) == expected, "{threads} thread(s): building list differs");
+            assert_eq!(
+                (set.tiles_found, set.tiles_read, set.decoded, set.zoom),
+                (n, reference.tiles_read, reference.decoded, reference.zoom),
+                "{threads} thread(s)"
+            );
+        }
+        let global = load_pbf_building_dir(dir.path()).unwrap();
+        assert!(building_bits(&global) == expected, "global pool: building list differs");
+
+        // Name order indeed: the first building is the east-edge house of
+        // 14_10000_5700, the first name in byte order — not of 14_9980_5700,
+        // the first tile written and the lowest x.
+        let lon = global.buildings[0].coords[0].0;
+        let (w, e) = (crate::download::tx2lon(10000, 14), crate::download::tx2lon(10001, 14));
+        assert!(lon > w && lon < e, "first building at lon {lon}, not in tile x=10000 ({w}..{e})");
+
+        // And the order matters: a walk in numeric order keeps the other
+        // copy of each house at the 9999|10000 seam and lists the tiles
+        // differently, so this comparison would see a wrong order.
+        let numeric = load_pbf_building_dir_sequential(dir.path(), |a, b| {
+            let xy = |p: &std::path::PathBuf| {
+                let (_, x, y) = crate::ingest::parse_pbf_tile_name(p.file_name()?.to_str()?)?;
+                Some((y, x))
+            };
+            xy(a).cmp(&xy(b))
+        })
+        .unwrap();
+        assert!(building_bits(&numeric) != expected);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_parallel_decode_burns_the_same_bytes_as_the_sequential_walk() {
+        // What ingest does with the set, over the 9999|10000 seam where the
+        // name order picks which copy of a house survives: every byte and
+        // every count the `[Info] buildings_pbf_dir` line reports.
+        let dir = many_tile_dir(400, &[123]);
+        let reference = load_pbf_building_dir_sequential(dir.path(), by_name).unwrap();
+        let parallel = pool(8).install(|| load_pbf_building_dir(dir.path())).unwrap();
+
+        let size = 1024u32;
+        let (ul_lon, lr_lon) = (crate::download::tx2lon(9994, 14), crate::download::tx2lon(10006, 14));
+        let (ul_lat, lr_lat) = (crate::download::ty2lat(5700, 14), crate::download::ty2lat(5710, 14));
+        let tile = TileRef {
+            ul_lat,
+            ul_lon,
+            scale_x: (lr_lon - ul_lon) / size as f64,
+            scale_y: (ul_lat - lr_lat) / size as f64,
+            size_px: size,
+        };
+        let terrain: Vec<i16> =
+            (0..size * size).map(|i| 1000 + (((i % size) * 7 + (i / size) * 13) % 211) as i16).collect();
+        let burn = |set: &PbfBuildingSet| {
+            let mut buf = terrain.clone();
+            let mut g = I16Grid { buf: &mut buf, size };
+            let s = rasterize_buildings(&mut g, &tile, &set.buildings, &RasterOpts::default());
+            (buf, (s.buildings_hit, s.pixels_modified, s.buildings_off_tile))
+        };
+        let (want, want_stats) = burn(&reference);
+        let (got, got_stats) = burn(&parallel);
+        assert!(got == want, "the burnt surface differs");
+        assert_eq!(got_stats, want_stats);
+        assert!(want_stats.0 > 100, "the fixture must draw buildings: {want_stats:?}");
+        assert_eq!(
+            (parallel.tiles_read, parallel.decoded, parallel.buildings.len()),
+            (reference.tiles_read, reference.decoded, reference.buildings.len())
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_decode_reports_every_tile_once_and_in_order() {
+        let n = 1200;
+        let dir = many_tile_dir(n, &[5]);
+        let calls = std::sync::Mutex::new(Vec::new());
+        let set = pool(8)
+            .install(|| {
+                load_pbf_building_dir_with_progress(dir.path(), &|done, total| {
+                    calls.lock().unwrap().push((done, total))
+                })
+            })
+            .unwrap();
+        // Every tile file counts, the undecodable one included; the README
+        // is no tile and does not.
+        assert_eq!(calls.into_inner().unwrap(), (1..=n).map(|d| (d, n)).collect::<Vec<_>>());
+        assert_eq!((set.tiles_found, set.tiles_read), (n, n - 1));
+
+        let empty = tempfile::tempdir().unwrap();
+        let set = load_pbf_building_dir_with_progress(empty.path(), &|_, _| panic!("no tiles"))
+            .unwrap();
+        assert_eq!((set.tiles_found, set.tiles_read, set.zoom), (0, 0, None));
+    }
+
+    #[test]
+    fn an_undecodable_tile_is_skipped_and_the_rest_decode() {
+        let dir = pbf_dir_with_two_tiles();
+        std::fs::write(dir.path().join("14_8533_5752.pbf"), b"\x1a\xff\xff\xff\x0fnot a tile").unwrap();
+        let set = load_pbf_building_dir(dir.path()).unwrap();
+        let reference = load_pbf_building_dir_sequential(dir.path(), by_name).unwrap();
+        assert_eq!((set.tiles_found, set.tiles_read, set.buildings.len()), (3, 2, 2));
+        assert!(building_bits(&set) == building_bits(&reference));
+    }
+
+    #[test]
+    fn an_unreadable_tile_still_fails_the_load() {
+        // A directory where a tile file should be: listed, but no read of it
+        // succeeds. That fails the run, as it always has, with the same error.
+        let dir = many_tile_dir(60, &[]);
+        std::fs::create_dir(dir.path().join("14_9990_5799.pbf")).unwrap();
+        let err = load_pbf_building_dir(dir.path()).unwrap_err().to_string();
+        let want = load_pbf_building_dir_sequential(dir.path(), by_name).unwrap_err().to_string();
+        assert_eq!(err, want);
+
+        // A mixed-zoom directory is refused before any tile is read, so its
+        // error wins over the unreadable tile that sorts ahead of the odd
+        // zoom (the sequential walk failed on whichever it met first).
+        std::fs::write(dir.path().join("15_19980_11400.pbf"), synthetic_building_tile()).unwrap();
+        let err = load_pbf_building_dir(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("buildings_pbf_dir mixes zoom levels (14 and 15)"), "got {err:?}");
+    }
+
+    #[test]
+    fn name_order_is_the_order_ntfs_lists_tile_names_in() {
+        // Why the name order changes no byte on Windows: NTFS lists a
+        // directory in the order of its index — names compared as UTF-16
+        // code units after upcasing — so `read_dir`, which the sequential
+        // loader walked, already handed it tiles in byte order there. The
+        // two orders differ only where a letter meets a non-letter, which
+        // two accepted names never do (they part at a digit, `+`, `_` or
+        // `.`, and their extensions are lowercase `pbf`/`mvt`). ext4 and
+        // APFS list in an order of their own, which the old walk followed.
+        let mut names = Vec::new();
+        for z in [0u32, 3, 9, 13, 14, 15, 17, 20] {
+            let n = 1u64 << z;
+            for (x, y) in [(0, 0), (1, 10), (9, 99), (10, 9), (99, 100), (n - 1, n / 3), (n / 7, n - 1)] {
+                for ext in ["pbf", "mvt"] {
+                    names.push(format!("{z}_{x}_{y}.{ext}"));
+                    names.push(format!("{z}_{x:05}_{y}.{ext}"));
+                    names.push(format!("+{z}_+{x}_{y}.{ext}"));
+                }
+            }
+        }
+        for name in &names {
+            assert!(crate::ingest::parse_pbf_tile_name(name).is_some(), "{name} must be a tile name");
+        }
+        let ntfs_key = |s: &String| -> Vec<u16> { s.to_ascii_uppercase().encode_utf16().collect() };
+        let mut by_bytes = names.clone();
+        by_bytes.sort();
+        let mut by_ntfs = names.clone();
+        by_ntfs.sort_by_key(ntfs_key);
+        assert_eq!(by_bytes, by_ntfs);
+    }
+
+    /// Container-measured decode time of 2,000 tiles, sequential vs parallel.
+    /// `cargo test --release -p aether_converter --lib -- --ignored
+    /// --nocapture bench_pbf_decode`. `AETHER_PBF_BENCH_DIR` puts the tiles
+    /// in a directory of your choice (another disk), else a temp dir.
+    #[cfg(feature = "native")]
+    #[test]
+    #[ignore = "timing: [AETHER_PBF_BENCH_DIR=<dir on another disk>] cargo test --release -p aether_converter --lib bench_pbf_decode -- --ignored --nocapture"]
+    fn bench_pbf_decode_2000_tiles_sequential_vs_parallel() {
+        use std::io::Write;
+        use std::time::Instant;
+        let n = 2000;
+        let real = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ofm_z14_8651_5782.pbf"))
+            .expect("fixture ofm_z14_8651_5782.pbf");
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&real).unwrap();
+        let real_gz = gz.finish().unwrap();
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        let root = std::env::var_os("AETHER_PBF_BENCH_DIR").map(std::path::PathBuf::from);
+        let threads = [2usize, 4, 8];
+
+        for (what, content) in [
+            ("OpenFreeMap tile 14/8651/5782 (470 buildings), gzipped", Some(real_gz)),
+            ("synthetic tile (2-3 buildings)", None),
+        ] {
+            let tmp = match &root {
+                Some(r) => tempfile::tempdir_in(r).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            match &content {
+                Some(bytes) => {
+                    for i in 0..n {
+                        let (x, y) = many_tile_xy(i);
+                        std::fs::write(tmp.path().join(format!("14_{x}_{y}.pbf")), bytes).unwrap();
+                    }
+                }
+                None => {
+                    let src = many_tile_dir(n, &[]);
+                    for e in std::fs::read_dir(src.path()).unwrap().flatten() {
+                        std::fs::copy(e.path(), tmp.path().join(e.file_name())).unwrap();
+                    }
+                }
+            }
+            let p: &Path = tmp.path();
+            let time = |f: &dyn Fn() -> PbfBuildingSet| -> (f64, PbfBuildingSet) {
+                let t0 = Instant::now();
+                let set = f();
+                (t0.elapsed().as_secs_f64(), set)
+            };
+            let seq = || load_pbf_building_dir_sequential(p, by_name).unwrap();
+            let pools = threads.map(pool);
+            // A first pass (cold unless the files are still cached from
+            // writing them), then the best of three each.
+            let (cold_seq, reference) = time(&seq);
+            let mut best = [f64::MAX; 4];
+            for _ in 0..3 {
+                for slot in 0..4 {
+                    let (s, set) = match slot {
+                        0 => time(&seq),
+                        _ => time(&|| pools[slot - 1].install(|| load_pbf_building_dir(p).unwrap())),
+                    };
+                    assert!(building_bits(&set) == building_bits(&reference));
+                    best[slot] = best[slot].min(s);
+                }
+            }
+            // The duplicate filter runs after the decode, on one thread, in
+            // both: its share bounds what the threads can win.
+            let mut all = reference.buildings.clone();
+            let t0 = Instant::now();
+            drop_duplicate_buildings(&mut all, Building::duplicate_key);
+            let filter_s = t0.elapsed().as_secs_f64();
+            let par: Vec<String> = threads
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("{t} threads {:.3} s ({:.1}x)", best[i + 1], best[0] / best[i + 1]))
+                .collect();
+            println!(
+                "[bench, container-measured, {cpus} CPU(s) available] {n} x {what}: {} buildings; \
+                 sequential {:.3} s (first pass {cold_seq:.3} s), of which the duplicate \
+                 filter ~{filter_s:.3} s; parallel {}",
+                reference.decoded,
+                best[0],
+                par.join(", "),
+            );
+        }
     }
 
     // ── The buffer-zone duplicate filter ───────────────────────────────────

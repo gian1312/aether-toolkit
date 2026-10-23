@@ -144,6 +144,40 @@ impl BatchTally {
     }
 }
 
+/// A batch prints `[Rust] Decoding building tiles: N/M` every this many tiles
+/// of a `buildings_pbf_dir`, and once after the last (CONTRACT §9a,
+/// changelog 44).
+const PBF_PROGRESS_EVERY: usize = 1000;
+
+/// The decode-progress line for *done* of *total* building tiles, when one is
+/// due. Deliberately not a `Progress:` line: the plugin reads those as output
+/// tiles converted.
+fn pbf_decode_progress_line(done: usize, total: usize) -> Option<String> {
+    (done % PBF_PROGRESS_EVERY == 0 || done == total)
+        .then(|| format!("[Rust] Decoding building tiles: {done}/{total}"))
+}
+
+/// The batch's decode-progress callback: each due line on stdout, the stream
+/// of the `[Rust] Progress:` lines, flushed at once.
+fn print_pbf_decode_progress(done: usize, total: usize) {
+    if let Some(line) = pbf_decode_progress_line(done, total) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{line}");
+        let _ = out.flush();
+    }
+}
+
+/// The line after a directory's decode: its tile files (decoded or skipped),
+/// the buildings decoded from them (before the duplicate filter, as the
+/// `[Info] buildings_pbf_dir` line counts them) and the decode's wall time.
+fn pbf_decoded_line(set: &buildings::PbfBuildingSet, secs: f64) -> String {
+    format!(
+        "[Rust] Building tiles decoded: {} tile(s), {} building(s) in {:.1} s",
+        set.tiles_found, set.decoded, secs
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     // Force line-buffered stdout so progress reaches the parent process
     // immediately when piped (default is fully-buffered when not a TTY).
@@ -262,12 +296,25 @@ fn main() -> anyhow::Result<()> {
                 // every output tile, so scan and decode each directory once for
                 // the whole run. Doing it inside the loop below re-read and
                 // re-decoded the entire directory once per .abt.
+                //
+                // The tiles are read and decoded in parallel on the batch's
+                // pool (changelog 44: 20,808 tiles took 6 min one after the
+                // other while a download wrote to the same HDD), in name order
+                // as far as the result goes, with a progress line every
+                // PBF_PROGRESS_EVERY tiles — nothing at all was printed during
+                // the decode, so the plugin's progress bar froze.
                 let mut pbf_sets: HashMap<PathBuf, buildings::PbfBuildingSet> = HashMap::new();
                 for job in &jobs {
                     if let Some(dir) = &job.buildings_pbf_dir {
                         if !pbf_sets.contains_key(dir) {
                             println!("[Rust] Decoding building tiles in {:?} (once for the run)...", dir);
-                            pbf_sets.insert(dir.clone(), buildings::load_pbf_building_dir(dir)?);
+                            let t0 = std::time::Instant::now();
+                            let set = pool.install(|| {
+                                buildings::load_pbf_building_dir_with_progress(dir, &print_pbf_decode_progress)
+                            })?;
+                            println!("{}", pbf_decoded_line(&set, t0.elapsed().as_secs_f64()));
+                            let _ = std::io::stdout().flush();
+                            pbf_sets.insert(dir.clone(), set);
                         }
                     }
                 }
@@ -397,5 +444,49 @@ mod tests {
             }
             _ => panic!("expected the plan subcommand"),
         }
+    }
+
+    #[test]
+    fn building_decode_progress_comes_every_thousand_tiles_and_at_the_end() {
+        let due = |total: usize| -> Vec<String> {
+            (1..=total).filter_map(|done| pbf_decode_progress_line(done, total)).collect()
+        };
+        assert_eq!(
+            due(2500),
+            [
+                "[Rust] Decoding building tiles: 1000/2500",
+                "[Rust] Decoding building tiles: 2000/2500",
+                "[Rust] Decoding building tiles: 2500/2500",
+            ]
+        );
+        // The last thousand is the end: one line, not two.
+        assert_eq!(
+            due(3000),
+            [
+                "[Rust] Decoding building tiles: 1000/3000",
+                "[Rust] Decoding building tiles: 2000/3000",
+                "[Rust] Decoding building tiles: 3000/3000",
+            ]
+        );
+        assert_eq!(due(7), ["[Rust] Decoding building tiles: 7/7"]);
+        assert!(due(0).is_empty(), "a directory without tiles reports no progress");
+        // The plugin reads output-tile progress with `Progress:\s*(\d+)/(\d+)`
+        // searched anywhere in a line; these must never match it.
+        for line in due(2500) {
+            assert!(!line.contains("Progress:"), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn the_decoded_line_counts_tile_files_and_decoded_buildings() {
+        let set = buildings::PbfBuildingSet {
+            tiles_found: 20808,
+            tiles_read: 20807,
+            decoded: 1_234_567,
+            ..Default::default()
+        };
+        let line = pbf_decoded_line(&set, 40.04);
+        assert_eq!(line, "[Rust] Building tiles decoded: 20808 tile(s), 1234567 building(s) in 40.0 s");
+        assert!(!line.contains("Progress:"));
     }
 }
