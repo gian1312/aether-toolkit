@@ -968,6 +968,56 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    2,000 small tiles 12.6 s → 1.65 s. The owner's HDD under a concurrent
 >    download is not measured. Nothing to gate on: a consumer can tell this
 >    build by `--version` (0.2.9).
+> 45. **CLI `download`: building tiles fetched during the download —
+>    `buildings_pbf_ready` / `buildings_pbf_wait_s` (§9b; additive;
+>    `aether_converter` 0.2.10; 2026-10-23).** Motivation: a download job
+>    burns its `buildings_pbf_dir` after the terrain is assembled, reading
+>    the directory as it finds it then, so a caller had to finish fetching
+>    the building tiles before it could launch the job — the Waveshed
+>    plugin's Site Analysis fetched OpenFreeMap tiles for 27 s, then
+>    downloaded terrain for 19 s, one after the other. New optional job
+>    fields: `buildings_pbf_ready` (string: one plain file name inside
+>    `buildings_pbf_dir`, e.g. `"_ready"`, whose existence declares the
+>    directory complete) and `buildings_pbf_wait_s` (seconds, 0 … 86400;
+>    absent or `null` → **1800**). With the marker, nothing in the job reads
+>    the directory before the buildings post-pass (it need not exist at
+>    launch); the post-pass runs where it always did and first waits for
+>    the marker — one look at once, then one every 250 ms — announcing a
+>    wait on stderr with `[Buildings] waiting for the building tiles
+>    (<marker path>)` and its end with `[Buildings] building tiles ready
+>    after <s.s> s` (nothing when the marker is there at the first look),
+>    then reads and burns the directory exactly as before: the parallel
+>    decode of item 44, the same `[Buildings] <n> pbf tile(s) → …` line, the
+>    same `.abt` bytes as a job whose directory was complete at launch. A
+>    marker still missing after `buildings_pbf_wait_s` fails the run —
+>    `Error: Building tiles not ready: …`, exit 1, no burn line, its `.abt`
+>    files removed — never a silent run without buildings. Bad values are
+>    refused before any request. `[Stats] Downloaded: … in <s>s` leaves the
+>    wait out, `[Download] TOTAL:` keeps it. Details, messages and the
+>    caller's side: §9b *Building tiles fetched during the download*.
+>    **Unchanged:** a job without `buildings_pbf_ready`, byte for byte and
+>    line for line (`buildings_pbf_wait_s` alone is not read); repair jobs
+>    and the in-memory/WASM downloaders, which ignore both fields. Tested in
+>    `tests/test_download_buildings_ready.rs` (loopback terrain, synthetic
+>    MVT tiles): the marker there at launch → no wait line, the burn line and
+>    bytes of the job without the field; the directory created, its tiles and
+>    then the marker written 2 s after launch → one wait line, one ready line
+>    (its seconds at least the time from the wait line to the marker, at
+>    most 1.5 s more), then the same burn line and bytes; no marker within
+>    `buildings_pbf_wait_s: 1` → exit 1 with the
+>    message, no ready or burn line, the outputs removed; without the field
+>    → today's line and bytes (`buildings_pbf_wait_s` alone included); bad
+>    fields → refused with no request made and nothing written; a repair
+>    with the marker gone → no wait. Against the 0.2.9 build, on the
+>    OpenFreeMap tile 14/8651/5782 (470 buildings, nine 5 m output tiles, 12
+>    z15 source tiles): without the field, with `buildings_pbf_wait_s`
+>    alone, with the marker there at launch and with the marker written 2 s
+>    in, all nine `.abt` `cmp`-identical to 0.2.9's, and stderr identical
+>    modulo numbers but for the two wait lines. **Gate** on
+>    `aether_converter` 0.2.10 (§1.5): an older build ignores both fields
+>    and burns whatever the directory holds when its terrain is done — part
+>    of the tiles while a fetch still runs — or fails with
+>    `buildings_pbf_dir … is not a directory` when it does not exist yet.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -1737,6 +1787,7 @@ Known capability gates consumers rely on:
 | `download` job field `cache_dir` (§9b; older builds ignore it — nothing is cached and every job fetches everything) | `aether_converter 0.2.8` |
 | `plan` grid of changelog 43 — 1e-9-step snap, edges rounded to 9 decimals, tolerant start per resolution (§1.2; a consumer that cross-checks `plan` must enumerate this way for this build and later and the old way for older ones, or its check aborts) | `aether_converter 0.2.9` |
 | `[Rust] Decoding building tiles: <n>/<m>` and `[Rust] Building tiles decoded: …` lines while a batch `ingest` decodes its `buildings_pbf_dir` (§9a, changelog 44; older builds print nothing during the decode and decode one file after the other) | `aether_converter 0.2.9` |
+| `download` job fields `buildings_pbf_ready` and `buildings_pbf_wait_s` — fetch the building tiles while the download runs (§9b, changelog 45; older builds ignore both and burn whatever `buildings_pbf_dir` holds when their terrain is done, or fail when it does not exist yet) | `aether_converter 0.2.10` |
 
 ---
 
@@ -2622,7 +2673,9 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
 | `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). A full run (not a repair) also keeps its output files open for the run, so the raise asks for one descriptor per output tile on top; where they do not fit beside the connections' descriptors, the connections keep theirs and each write opens its file instead, printing `[Download] open-file limit <l>: <n> output tiles are opened for each write instead of held open (<d> descriptors would not fit)` (changelog 39). |
-| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
+| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes (with `buildings_pbf_ready`, once its marker exists). All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
+| `buildings_pbf_ready` | string? | optional | Additive, changelog 45, `aether_converter` ≥ 0.2.10 (older builds ignore it: gate on §1.5). One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the job downloads the terrain: nothing reads the directory before the buildings post-pass (it need not exist at launch), and the post-pass first waits for the file — see *Building tiles fetched during the download* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the job before any request. Absent or `null`: the post-pass reads the directory as it finds it, as before. CLI `download` full runs only; repair jobs and the in-memory/WASM downloaders ignore it. |
+| `buildings_pbf_wait_s` | number? | optional | Additive, changelog 45, ≥ 0.2.10. Seconds the post-pass waits for `buildings_pbf_ready`, counted from its first look; absent or `null` → **1800**. Must be 0 … 86400, else the job fails before any request: `buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` (alone it changes nothing). |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 | `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **20** (changelog 30; was 60). At expiry the tile stops as a `timeout` failure and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
@@ -2893,6 +2946,82 @@ it stands for —
 came from the cache or the network (a derived tile is the cache's own
 average, see *Deriving* above); `[Stats] Downloaded:` and the progress
 line's MB/s count network bytes only.
+
+**Building tiles fetched during the download (`buildings_pbf_ready`,
+changelog 45, `aether_converter` ≥ 0.2.10).** A caller that fetches the
+building tiles itself (the Waveshed plugin: OpenFreeMap z14) can launch the
+download job at once, with `buildings_pbf_dir` naming the directory its fetch
+writes into and `buildings_pbf_ready` naming a marker file it creates there
+when the fetch is done. The CLI `download` then:
+
+1. checks the fields before any request — exit 1, nothing written,
+   `output_dir` not created — failing with one of
+   `buildings_pbf_ready "<v>" needs buildings_pbf_dir: the marker is a file inside that directory`;
+   `buildings_pbf_ready must be a file name inside buildings_pbf_dir, got "<v>"`
+   (empty, `.`, `..`, or containing `/` or `\`);
+   `buildings_pbf_ready "<v>" is named like a building tile ({z}_{x}_{y}.pbf) and would be decoded as one; choose another name`;
+   `buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`;
+2. downloads and assembles the terrain without looking at
+   `buildings_pbf_dir` at all — the directory need not exist yet;
+3. at the buildings post-pass — where it always ran: after every output
+   is assembled and padded and the majority rule of §1.2 has passed (a
+   fatal terrain failure fails without waiting) — looks for
+   `<buildings_pbf_dir>/<buildings_pbf_ready>` as a regular file (its
+   contents are ignored; a directory of that name is no marker), at once
+   and then every 250 ms. Found at the first look: nothing is printed.
+   Otherwise it prints, on stderr, once each:
+
+   ```
+   [Buildings] waiting for the building tiles (<marker path>)
+   [Buildings] building tiles ready after <s.s> s
+   ```
+
+   the first before the first poll, the second when a look finds the
+   marker; `<marker path>` is `buildings_pbf_dir` joined with the marker
+   name as the job gives them, `<s.s>` the seconds since the first look,
+   one decimal;
+4. then reads the directory **once** and burns it exactly as a job without
+   the field does: the parallel decode (changelog 44), the same
+   `[Buildings] <n> pbf tile(s) → …` (or `… no buildings in extent`) line,
+   the same `.abt` bytes as a job whose directory was complete at launch;
+5. when the marker is still missing `buildings_pbf_wait_s` seconds (default
+   1800) after the first look, fails — the job asked for buildings, and a
+   run without them is never silent: exit 1 with, on stderr,
+
+   ```
+   Error: Building tiles not ready: the marker file <marker path> (buildings_pbf_ready) did not appear within <w> s (buildings_pbf_wait_s); the download fails rather than leave terrain without its buildings
+   ```
+
+   (one line; match the `Building tiles not ready:` prefix), preceded, as
+   for every failed download (§1.2), by `[Download] Removed <n> incomplete
+   .abt file(s) …` — the terrain is not left behind to be pooled as
+   terrain with buildings — and with no `[Buildings] … pbf tile(s)` line and
+   no `[Stats]` block.
+
+`[Stats] Downloaded: <mb> MB in <s>s` (and its MB/s) leaves the wait out;
+`[Download] TOTAL:` is the wall time, the wait included. Neither new line
+matches `[Buildings] <n> pbf tile(s)`; a consumer that takes **any**
+`[Buildings]` line for a burn must match that line (and exit 0) instead.
+
+**The caller's side.** Write the marker **last**, once every tile file is
+complete and closed: the directory is read once, right after the marker is
+seen, so a tile written later is not burnt and one still being written may
+be read short (decoded in part, or skipped with `[Warn] buildings <name>:
+<error>`). Delete a marker left from an earlier run (or use a fresh
+directory or marker name) before launching — a marker that already exists
+counts. A caller whose fetch failed stops the job (or lets the wait run
+out) rather than write the marker over an incomplete directory. A job
+killed from outside cannot clean up after itself (only an error removes
+its outputs): killed during the wait, it leaves complete terrain **without**
+buildings under the output names — remove them, as after any killed
+download.
+
+**Not affected:** a job without `buildings_pbf_ready` (byte for byte and
+line for line; `buildings_pbf_wait_s` alone is not read); repair jobs
+(`repair_source_tiles`), which ignore both fields — they patch a finished
+run, whose post-pass already saw the marker, and read the directory as they
+find it; and the in-memory/WASM downloaders, which never burn
+`buildings_pbf_dir` and ignore both fields.
 
 ---
 

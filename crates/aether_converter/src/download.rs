@@ -63,6 +63,24 @@ pub struct DownloadJob {
     /// one to two orders of magnitude slower.
     #[serde(default)]
     pub buildings_pbf_dir: Option<PathBuf>,
+    /// File name inside `buildings_pbf_dir` whose existence declares the
+    /// directory complete (additive, CONTRACT §9b, changelog 45;
+    /// `aether_converter` 0.2.10), so a caller can fetch the building tiles
+    /// WHILE this job downloads the terrain. With it the CLI `download` reads
+    /// nothing in the directory before its buildings post-pass, and there
+    /// first waits for `<buildings_pbf_dir>/<buildings_pbf_ready>` to exist
+    /// (polled every 250 ms, for at most `buildings_pbf_wait_s`); a marker
+    /// that never comes fails the run. Absent: the post-pass reads the
+    /// directory as it finds it, as before. Full CLI runs only: repair jobs
+    /// and the in-memory/WASM downloaders ignore it. See
+    /// [`buildings_marker`] / [`wait_for_buildings_marker`].
+    #[serde(default)]
+    pub buildings_pbf_ready: Option<String>,
+    /// How long the buildings post-pass waits for `buildings_pbf_ready`, in
+    /// seconds (additive, changelog 45). Absent → [`BUILDINGS_WAIT_DEFAULT_S`]
+    /// (1800). Read only together with `buildings_pbf_ready`.
+    #[serde(default)]
+    pub buildings_pbf_wait_s: Option<f64>,
     /// Optional fetch region of interest (degrees). When present, only the
     /// source tiles intersecting this box are downloaded and decoded; every
     /// pixel outside keeps the pre-filled `VOID_ELEV` sentinel. The output
@@ -3540,7 +3558,10 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
 
     // Buildings: rasterize onto a copy that holds the repaired terrain and
     // take only the repaired pixels from it — every other pixel already
-    // carries the original run's buildings and stays as it is.
+    // carries the original run's buildings and stays as it is. A repair
+    // ignores `buildings_pbf_ready` / `buildings_pbf_wait_s` (changelog 45):
+    // it patches a finished run, whose post-pass already waited for the
+    // marker, and reads the directory as it finds it, as before.
     if let Some(pbf_dir) = &job.buildings_pbf_dir {
         if patched_px > 0 {
             use crate::buildings::{load_pbf_building_dir, rasterize_buildings, AbtGrid, RasterOpts, TileRef};
@@ -3696,6 +3717,11 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         "mapbox" => dec_mapbox,
         o => anyhow::bail!("Unknown encoding '{o}'"),
     };
+
+    // The building-tile hand-over (`buildings_pbf_ready`, changelog 45):
+    // checked here, before any request or file; the directory itself is not
+    // looked at until the buildings post-pass at the end.
+    let marker = buildings_marker(&job)?;
 
     // 1. Full bbox.
     let (mut bb_s, mut bb_n, mut bb_w, mut bb_e) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
@@ -4366,12 +4392,24 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         );
     }
 
+    // With `buildings_pbf_ready` the directory may still be filling while
+    // the terrain came in: wait for its marker first (changelog 45). A
+    // marker that never comes is an error, so `cleanup` removes the outputs
+    // — terrain without the buildings the job asked for is never left
+    // behind to be pooled as terrain with them.
+    let mut waited = std::time::Duration::ZERO;
     if let Some(pbf_dir) = &job.buildings_pbf_dir {
+        if let Some((path, wait)) = &marker {
+            waited = wait_for_buildings_marker(path, *wait).await?;
+        }
         apply_buildings_post_pass(pbf_dir, &abt_specs)?;
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    stats.log_summary(elapsed, Retries::Counted(STRIP_MAX_RETRIES));
+    // The wait for the building tiles is not download time: `[Stats]
+    // Downloaded: … in <s>` leaves it out, `TOTAL` keeps it (0 without a
+    // marker, so such a run prints exactly what it did before).
+    stats.log_summary(elapsed - waited.as_secs_f64(), Retries::Counted(STRIP_MAX_RETRIES));
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     cleanup.keep();
     Ok(DownloadReport {
@@ -4448,6 +4486,92 @@ fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)
         t0.elapsed().as_secs_f64(),
     );
     Ok(())
+}
+
+/// Default of [`DownloadJob::buildings_pbf_wait_s`], in seconds.
+pub const BUILDINGS_WAIT_DEFAULT_S: f64 = 1800.0;
+
+/// How often the buildings post-pass looks for the `buildings_pbf_ready` marker.
+#[cfg(feature = "native")]
+const BUILDINGS_MARKER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The `buildings_pbf_ready` hand-over of a full CLI `download` (changelog
+/// 45): the marker's path and how long to wait for it, or `None` for a job
+/// without the field, whose post-pass runs as it always did.
+///
+/// Checked before any request; nothing here touches the disk — the
+/// directory is not looked at until the post-pass. The marker must be one
+/// plain file name (no separator, not `.`/`..`), and not one the building
+/// loader would take for a `{z}_{x}_{y}.pbf` tile; `buildings_pbf_wait_s`
+/// (absent → [`BUILDINGS_WAIT_DEFAULT_S`]) is a number of seconds from 0 to
+/// 86400 and is not read without a marker.
+#[cfg(feature = "native")]
+fn buildings_marker(job: &DownloadJob) -> Result<Option<(PathBuf, std::time::Duration)>> {
+    let Some(name) = &job.buildings_pbf_ready else { return Ok(None) };
+    let Some(dir) = &job.buildings_pbf_dir else {
+        anyhow::bail!(
+            "buildings_pbf_ready {name:?} needs buildings_pbf_dir: the marker is a file \
+             inside that directory"
+        );
+    };
+    let mut parts = Path::new(name).components();
+    let plain = !name.contains(['/', '\\'])
+        && matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None));
+    if !plain {
+        anyhow::bail!("buildings_pbf_ready must be a file name inside buildings_pbf_dir, got {name:?}");
+    }
+    if crate::ingest::parse_pbf_tile_name(name).is_some() {
+        anyhow::bail!(
+            "buildings_pbf_ready {name:?} is named like a building tile ({{z}}_{{x}}_{{y}}.pbf) \
+             and would be decoded as one; choose another name"
+        );
+    }
+    let secs = job.buildings_pbf_wait_s.unwrap_or(BUILDINGS_WAIT_DEFAULT_S);
+    if !(secs.is_finite() && (0.0..=86_400.0).contains(&secs)) {
+        anyhow::bail!("buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got {secs}");
+    }
+    Ok(Some((dir.join(name), std::time::Duration::from_secs_f64(secs))))
+}
+
+/// Wait until the `buildings_pbf_ready` marker *marker* exists as a file
+/// (changelog 45): one look at once, then one every
+/// [`BUILDINGS_MARKER_POLL`]. When it is not there at the first look the
+/// wait is announced once, `[Buildings] waiting for the building tiles
+/// (<marker>)`, and its end once, `[Buildings] building tiles ready after
+/// <s.s> s`; a marker there at once prints nothing. One still missing after
+/// *wait* fails the run — the job asked for buildings, and a run without
+/// them is never silent. Returns the time waited (zero when the marker was
+/// there at once).
+#[cfg(feature = "native")]
+async fn wait_for_buildings_marker(marker: &Path, wait: std::time::Duration) -> Result<std::time::Duration> {
+    let t0 = Instant::now();
+    let mut announced = false;
+    loop {
+        // A file, not merely an entry: a directory of that name is no marker.
+        if fs::metadata(marker).is_ok_and(|m| m.is_file()) {
+            if !announced {
+                return Ok(std::time::Duration::ZERO);
+            }
+            let waited = t0.elapsed();
+            eprintln!("[Buildings] building tiles ready after {:.1} s", waited.as_secs_f64());
+            return Ok(waited);
+        }
+        if !announced {
+            eprintln!("[Buildings] waiting for the building tiles ({})", marker.display());
+            announced = true;
+        }
+        let waited = t0.elapsed();
+        if waited >= wait {
+            anyhow::bail!(
+                "Building tiles not ready: the marker file {} (buildings_pbf_ready) did not \
+                 appear within {} s (buildings_pbf_wait_s); the download fails rather than \
+                 leave terrain without its buildings",
+                marker.display(),
+                wait.as_secs_f64()
+            );
+        }
+        tokio::time::sleep(BUILDINGS_MARKER_POLL.min(wait - waited)).await;
+    }
 }
 
 // -- In-memory download (WASM-compatible, no rayon/sysinfo/File) --------------

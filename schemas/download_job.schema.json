@@ -47,7 +47,26 @@
         "string",
         "null"
       ],
-      "description": "Directory of {z}_{x}_{y}.pbf vector tiles fused onto the finished .abt tiles as a post-pass. All tiles must share one zoom level. Absent means terrain only."
+      "description": "Directory of {z}_{x}_{y}.pbf vector tiles fused onto the finished .abt tiles as a post-pass. All tiles must share one zoom level. Absent means terrain only. With buildings_pbf_ready the post-pass first waits for that marker file (changelog 45)."
+    },
+    "buildings_pbf_ready": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "pattern": "^[^/\\\\]+$",
+      "description": "File name inside buildings_pbf_dir (e.g. \"_ready\") whose existence declares the directory complete, so a caller can fetch the building tiles while the job downloads the terrain. With it the CLI download reads nothing in the directory before its buildings post-pass (the directory need not exist at launch); the post-pass first waits for <buildings_pbf_dir>/<buildings_pbf_ready> to exist as a file, looking at once and then every 250 ms for at most buildings_pbf_wait_s. When it has to wait it prints `[Buildings] waiting for the building tiles (<path>)` once and `[Buildings] building tiles ready after <s.s> s` when the marker appears, then burns exactly as a job whose directory was complete at launch (same .abt bytes, same `[Buildings] <n> pbf tile(s)` line). A marker still missing after buildings_pbf_wait_s fails the run (`Building tiles not ready: ...`, exit 1, its .abt files removed) - never a silent run without buildings. Write the marker last, after every tile file is complete; remove a stale one before launching. Requires buildings_pbf_dir; must be one plain file name (no / or \\, not . or ..) and not a {z}_{x}_{y}.pbf/.mvt tile name, else the job fails before any request. Absent or null: unchanged (the post-pass reads the directory as it finds it). CLI download full runs only: repair jobs and the in-memory/WASM downloaders ignore it. Additive, aether_converter >= 0.2.10 (older builds ignore it and burn whatever the directory holds when their terrain is done); CONTRACT 9b, changelog 45."
+    },
+    "buildings_pbf_wait_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 86400,
+      "default": 1800,
+      "description": "Seconds the buildings post-pass waits for buildings_pbf_ready, counted from its first look for the marker; absent or null = 1800. Read only together with buildings_pbf_ready (alone it changes nothing); outside 0..86400 the job fails before any request. Additive, aether_converter >= 0.2.10; CONTRACT 9b, changelog 45."
     },
     "tiles": {
       "type": "array",
