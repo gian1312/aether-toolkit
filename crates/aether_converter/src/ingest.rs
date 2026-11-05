@@ -25,6 +25,12 @@ use crate::tiff_io::{read_full_at, BlockReader, ChunkHeader, DirectChunks};
 #[cfg(feature = "bc6h")]
 use image_dds::{SurfaceRgba32Float, ImageFormat, Mipmaps, Quality};
 
+// A batch that fetches its building tiles while it samples its terrain
+// (`buildings_pbf_ready`, changelog 48). Native only: the wasm build never
+// ingests.
+#[cfg(feature = "native")]
+pub mod buildings_ready;
+
 // -- Diagnostics: the per-tile `[Rust] tile …` and the `[Rust] run: …` lines --
 //
 // CONTRACT changelog 31: diagnostic stdout lines for people reading a log, not
@@ -545,6 +551,33 @@ pub struct IngestJob {
     /// rasterizer resolves against the terrain under each footprint.
     #[serde(default)]
     pub buildings_pbf_dir: Option<PathBuf>,
+    /// File name inside `buildings_pbf_dir` whose existence declares the
+    /// directory complete (additive, CONTRACT §9a, changelog 48;
+    /// `aether_converter` 0.2.12) — the `download` job's hand-over
+    /// (changelog 45), same name rules and messages — so a caller can fetch
+    /// the building tiles WHILE a batch samples its terrain. A batch whose
+    /// marker is missing at launch starts every tile's terrain at once,
+    /// decodes the directory when the marker appears, and holds the tiles
+    /// finished before that until the set is decoded (see
+    /// [`buildings_ready`]). Present at launch: decoded at once, exactly as
+    /// without the field. Absent: the directory is decoded at launch, as
+    /// before. Batch only: a single job refuses it
+    /// ([`process_tile_with_cache`]).
+    #[serde(default)]
+    pub buildings_pbf_ready: Option<String>,
+    /// How long a batch waits for `buildings_pbf_ready`, in seconds counted
+    /// from its first look at launch (changelog 48). Absent → 1800
+    /// ([`crate::download::BUILDINGS_WAIT_DEFAULT_S`]). Read only together
+    /// with `buildings_pbf_ready`.
+    #[serde(default)]
+    pub buildings_pbf_wait_s: Option<f64>,
+    /// The memory, in MB (MiB), a batch may hold in finished tiles while it
+    /// waits for `buildings_pbf_ready` (changelog 48); a tile that does not
+    /// fit waits on its worker thread. Absent → the default rule of
+    /// `buildings_ready::default_hold_bytes`. Read only together with
+    /// `buildings_pbf_ready`.
+    #[serde(default)]
+    pub buildings_hold_mb: Option<f64>,
 }
 
 impl IngestJob {
@@ -909,6 +942,14 @@ fn wgs84_bbox_of_projected(g: &SourceGeom, proj: &Proj, wgs84: &Proj) -> Option<
 /// another source.
 pub const VOID_ELEV: i16 = -9999;
 
+/// The validity floor of `.abt` samples, in half-metres (-2500 m): a sample
+/// at or below it is not ground. The samplers here read only samples above
+/// it (`v > -5000`), and a consumer fills everything at or below it — the
+/// [`VOID_ELEV`] sentinel, deep bathymetry (Terrarium goes to -11000 m),
+/// Mapbox's lowest value (-10000 m). What a `[Tile] <name> voids=<n>` line
+/// counts (CONTRACT changelog 46).
+pub const VOID_FLOOR: i16 = -5000;
+
 /// How much of one tile a source actually reached.
 ///
 /// Counted BEFORE `void_fill_m` is applied, so it answers "did any source
@@ -929,6 +970,13 @@ pub struct TileStats {
     pub peak_window_bytes: u64,
     /// Row bands the tile was streamed in.
     pub bands: u32,
+    /// Samples of the written tile at or below [`VOID_FLOOR`] — the
+    /// [`VOID_ELEV`] sentinel and anything else that is no ground — counted
+    /// AFTER `void_fill_m` and the building burns, so it describes the file
+    /// (the `[Tile] <name> voids=<n>` line of a batch, CONTRACT changelog
+    /// 46). With `void_fill_m` set it is 0 (unless the fill itself is at or
+    /// below the floor, -2500 m).
+    pub void_px: u64,
 }
 
 /// Convert one Float32 DEM sample to the `.abt` half-metre unit.
@@ -2979,7 +3027,20 @@ fn band_row_geoms(
 /// a whole-directory scan whose result is the same for every output tile, so
 /// doing it here runs it once per `.abt`. Batch callers load the set once with
 /// [`load_pbf_building_dir`] and call [`process_tile`].
+///
+/// A job carrying `buildings_pbf_ready` (changelog 48) is refused before
+/// anything is read: the hand-over is a batch's (it starts the terrain while
+/// the directory fills), and this form reads `buildings_pbf_dir` first, as
+/// it finds it — honouring the marker by ignoring it would burn a directory
+/// that is still being fetched.
 pub fn process_tile_with_cache(job: IngestJob, cache_arc: ImageCache) -> Result<TileStats> {
+    if let Some(name) = &job.buildings_pbf_ready {
+        anyhow::bail!(
+            "buildings_pbf_ready {name:?} is read by a batch ingest only (a JSON array of jobs): a \
+             single job decodes its buildings_pbf_dir before its tile, as it finds it — complete the \
+             directory before launching the job, or pass the job as a one-job array"
+        );
+    }
     let pbf_buildings = match &job.buildings_pbf_dir {
         Some(dir) => Some(load_pbf_building_dir(dir)?),
         None => None,
@@ -3217,14 +3278,21 @@ pub fn process_tile_batched(
     done: TileDone,
 ) {
     let spare = writer.spare_buffer();
-    let tile = match sample_tile(job, cache_arc, pbf_buildings, opts, spare) {
-        Ok(t) => t,
-        Err(e) => return done(Err(e)),
-    };
+    match sample_tile(job, cache_arc, pbf_buildings, opts, spare) {
+        Ok(tile) => submit_ready(tile, writer, done),
+        Err(e) => done(Err(e)),
+    }
+}
+
+/// Hand a finished tile to *writer*; *done* runs with the write's outcome
+/// once the tile is committed (or its write failed), after its `[Rust]
+/// tile` line.
+fn submit_ready(tile: ReadyTile, writer: &TileWriter, done: TileDone) {
     let stats = tile.stats;
-    // The tile's time on this thread ends here: the write overlaps the
-    // next tile (a wait for a free writer is not counted).
-    let total_ns = tile.t0.ns();
+    // The tile's time on the compute threads ends here: the write overlaps
+    // the next tile (a wait for a free writer is not counted, nor a held
+    // tile's wait for its buildings — changelog 48).
+    let total_ns = tile.compute_ns;
     writer.submit(WriteJob {
         tile,
         then: Box::new(move |r: Result<()>, line: TileLine, write_ns: u64| {
@@ -3296,7 +3364,32 @@ struct ReadyTile {
     line: TileLine,
     /// When the tile started on its compute thread.
     t0: Clock,
+    /// Nanoseconds the tile spent on compute threads up to here: its terrain
+    /// and its finish ([`finish_tile`]), without a wait for its buildings in
+    /// between (changelog 48).
+    compute_ns: u64,
     /// The ENOSPC test hook, read on the thread that sampled the tile.
+    #[cfg(test)]
+    fail_after: Option<usize>,
+}
+
+/// A tile whose terrain is sampled, `void_fill_m` applied and
+/// `buildings_file` burnt in ([`sample_terrain`]): what is left is the
+/// vector-tile burn, the header and the payload ([`finish_tile`]). A batch
+/// with `buildings_pbf_ready` holds tiles in this state while the building
+/// set is not decoded yet (changelog 48, [`buildings_ready`]).
+struct SampledTile {
+    job: IngestJob,
+    /// The tile's samples, row-major, `size_px²`.
+    buffer: Vec<i16>,
+    pixel_deg: f64,
+    /// Coverage, size, peak and bands; `void_px` as of the terrain and the
+    /// `buildings_file` burn (the vector-tile burn may still lower it).
+    stats: TileStats,
+    line: TileLine,
+    t0: Clock,
+    /// Nanoseconds from `t0` to the end of the terrain stage.
+    terrain_ns: u64,
     #[cfg(test)]
     fail_after: Option<usize>,
 }
@@ -3475,7 +3568,9 @@ impl Drop for TileWriter {
     }
 }
 
-/// Everything of [`process_tile_opts`] but the file write.
+/// Everything of [`process_tile_opts`] but the file write: the terrain
+/// ([`sample_terrain`]), then the vector-tile burn, header and payload
+/// ([`finish_tile`]), one after the other on this thread.
 fn sample_tile(
     job: IngestJob,
     cache_arc: ImageCache,
@@ -3483,6 +3578,21 @@ fn sample_tile(
     opts: &IngestOptions,
     spare: Option<Vec<i16>>,
 ) -> Result<ReadyTile> {
+    finish_tile(sample_terrain(job, cache_arc, opts, spare, None)?, pbf_buildings)
+}
+
+/// The terrain of one tile: its sources sampled band by band, `void_fill_m`
+/// applied and its `buildings_file` burnt in — everything before the
+/// vector-tile burn. *abort* (a batch with `buildings_pbf_ready`, changelog
+/// 48) is looked at before every band: once it is set — the batch failed —
+/// the tile stops with an error and nothing more of it is read.
+fn sample_terrain(
+    job: IngestJob,
+    cache_arc: ImageCache,
+    opts: &IngestOptions,
+    spare: Option<Vec<i16>>,
+    abort: Option<&AtomicBool>,
+) -> Result<SampledTile> {
     // The tile's start on this thread (`total` of the `[Rust] tile` line).
     let t0 = Clock::now();
     // 0. Normalize the legacy aliases into sources[] — ONE code path from here.
@@ -3899,6 +4009,9 @@ fn sample_tile(
     let mut next = Some(plan_band(0, out_size.clamp(1, MAX_BAND_ROWS), true));
     geom_ns += plan_clock.ns();
     while let Some(BandPlan { r0, r1, geoms: band_geoms, rects, est, shadowed, ahead }) = next.take() {
+        if abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
+            anyhow::bail!("converting {:?} stopped: the batch failed", job.output_path);
+        }
         // Decode the band's unshadowed windows, sources in parallel.
         let load = |i: usize, ahead: Option<Vec<RunRead>>| -> Result<Option<Window>> {
             match (&srcs[i], rects[i]) {
@@ -4278,30 +4391,77 @@ fn sample_tile(
         total_px: total_pixels as u64,
         peak_window_bytes: peak_window_bytes as u64,
         bands,
+        void_px: 0,
+    };
+    // The void samples after the fill (changelog 46) — at or below
+    // VOID_FLOOR: a covered pixel never is one (the samplers average only
+    // samples above the floor, and a mean of those stays above it), every
+    // other pixel holds the fill — so the uncovered pixels are void exactly
+    // when the fill is. The building burns lift some of them.
+    let void_px: u64 = if void_fill <= VOID_FLOOR { stats.total_px - stats.covered_px } else { 0 };
+    let mut tile = SampledTile {
+        job,
+        buffer,
+        pixel_deg,
+        stats: TileStats { void_px, ..stats },
+        line,
+        t0,
+        terrain_ns: 0,
+        #[cfg(test)]
+        fail_after: FAIL_TILE_WRITES_AFTER.with(|c| c.get()),
     };
 
-    // Everything after sampling. A failure here still prints the tile's
-    // diagnostic line (its terrain was sampled), then fails the tile.
-    let finished = (|| -> Result<(Vec<u8>, TileBody)> {
-        let mut buffer = buffer;
-        // Building Rasterization
-        if let Some(fgb) = &job.buildings_file {
-            // A buildings source that cannot be read fails the tile, exactly as an
-            // unusable `buildings_pbf_dir` does below. This used to warn and exit 0,
-            // which wrote building-less terrain under an identity that claims
-            // buildings — a cache hit forever, for every later run.
-            if let Err(e) = apply_buildings(&job, &mut buffer, fgb, pixel_deg) {
+    // Building Rasterization, FlatGeobuf first: a `buildings_file` burns with
+    // the terrain, the vector tiles after it ([`finish_tile`]). A failure here
+    // still prints the tile's diagnostic line (its terrain was sampled), then
+    // fails the tile.
+    if let Some(fgb) = &tile.job.buildings_file {
+        // A buildings source that cannot be read fails the tile, exactly as an
+        // unusable `buildings_pbf_dir` does. This used to warn and exit 0,
+        // which wrote building-less terrain under an identity that claims
+        // buildings — a cache hit forever, for every later run.
+        match apply_buildings(&tile.job, &mut tile.buffer, fgb, pixel_deg) {
+            Ok(lifted) => tile.stats.void_px = tile.stats.void_px.saturating_sub(lifted),
+            Err(e) => {
+                tile.line.print(0, tile.t0.ns());
                 anyhow::bail!(
                     "failed to apply buildings from buildings_file {:?} to {:?}: {:#}; \
                      refusing to write a building-less tile",
                     fgb,
-                    job.output_path,
+                    tile.job.output_path,
                     e
                 );
             }
         }
+    }
+    tile.terrain_ns = tile.t0.ns();
+    Ok(tile)
+}
+
+/// The rest of a tile after its terrain ([`sample_terrain`]): the burn of
+/// the vector-tile buildings *pbf_buildings*, the 44-byte header and the
+/// payload. A failure here still prints the tile's diagnostic line (its
+/// terrain was sampled), then fails the tile.
+fn finish_tile(tile: SampledTile, pbf_buildings: Option<&PbfBuildingSet>) -> Result<ReadyTile> {
+    let fin = Clock::now();
+    let SampledTile {
+        job,
+        buffer,
+        pixel_deg,
+        stats,
+        line,
+        t0,
+        terrain_ns,
+        #[cfg(test)]
+        fail_after,
+    } = tile;
+    let mut void_px = stats.void_px;
+    let finished = (|| -> Result<(Vec<u8>, TileBody)> {
+        let mut buffer = buffer;
         match (&job.buildings_pbf_dir, pbf_buildings) {
-            (Some(_), Some(set)) => apply_buildings_pbf(&job, &mut buffer, set, pixel_deg),
+            (Some(_), Some(set)) => {
+                void_px = void_px.saturating_sub(apply_buildings_pbf(&job, &mut buffer, set, pixel_deg))
+            }
             (Some(dir), None) => anyhow::bail!(
                 "buildings_pbf_dir {:?} was requested but no decoded building set was \
                  supplied for {:?}; refusing to write a building-less tile",
@@ -4310,6 +4470,11 @@ fn sample_tile(
             ),
             (None, _) => {}
         }
+        debug_assert_eq!(
+            void_px,
+            buffer.iter().filter(|&&v| v <= VOID_FLOOR).count() as u64,
+            "the tracked void count must be the buffer's"
+        );
 
         let format_str = job.format.as_deref().unwrap_or("r16sint");
         let is_bc6h = format_str.eq_ignore_ascii_case("bc6h");
@@ -4363,6 +4528,8 @@ fn sample_tile(
 
         #[cfg(feature = "bc6h")]
         if is_bc6h {
+            let out_size = job.size_px as usize;
+            let total_pixels = out_size * out_size;
              // 1. Map terrain to 0-aligned RGBA float buffer
             let mut rgba = vec![0.0f32; total_pixels * 4];
             for (i, &v) in buffer.iter().enumerate() {
@@ -4419,19 +4586,21 @@ fn sample_tile(
         let padding_bytes = aligned_stride_r16 - bytes_per_row_r16;
         Ok((header, TileBody::Rows { buf: buffer, size: job.size_px as usize, pad: padding_bytes as usize }))
     })();
+    let compute_ns = terrain_ns + fin.ns();
     match finished {
         Ok((header, body)) => Ok(ReadyTile {
             dst: job.output_path,
             header,
             body,
-            stats,
+            stats: TileStats { void_px, ..stats },
             line,
             t0,
+            compute_ns,
             #[cfg(test)]
-            fail_after: FAIL_TILE_WRITES_AFTER.with(|c| c.get()),
+            fail_after,
         }),
         Err(e) => {
-            line.print(0, t0.ns());
+            line.print(0, compute_ns);
             Err(e)
         }
     }
@@ -4710,7 +4879,11 @@ mod tile_file_tests {
 /// cached it and every later run was a hit. Finding **no** buildings over this
 /// particular tile is not that: it is the ordinary fate of an edge tile, so it
 /// is reported and the terrain is written.
-fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_deg: f64) -> Result<()> {
+///
+/// Returns how many void samples of *buffer* the burn lifted above the floor
+/// ([`crate::buildings::RasterizeStats::voids_filled`], changelog 46; 0 when
+/// nothing was drawn).
+fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_deg: f64) -> Result<u64> {
     let mut files_to_process = Vec::new();
     if fgb_target.is_dir() {
         let entries = fs::read_dir(fgb_target)
@@ -4813,7 +4986,7 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
             fgb_target.display(),
             features_seen
         );
-        return Ok(());
+        return Ok(0);
     }
 
     let tile = TileRef {
@@ -4857,7 +5030,7 @@ fn apply_buildings(job: &IngestJob, buffer: &mut [i16], fgb_target: &Path, px_de
         );
     }
 
-    Ok(())
+    Ok(stats.voids_filled as u64)
 }
 
 /// Parse the `{z}_{x}_{y}.pbf` tile coordinates out of a file name.
@@ -4878,17 +5051,20 @@ pub fn parse_pbf_tile_name(name: &str) -> Option<(u32, u32, u32)> {
 /// *set* is decoded once per run by [`load_pbf_building_dir`]: it is a whole
 /// directory scan plus a PBF decode of every file in it, and its result is the
 /// same for every output tile. This function is what runs per tile.
+///
+/// Returns how many void samples of *buffer* the burn lifted above the floor
+/// ([`crate::buildings::RasterizeStats::voids_filled`], changelog 46).
 fn apply_buildings_pbf(
     job: &IngestJob,
     buffer: &mut [i16],
     set: &PbfBuildingSet,
     px_deg: f64,
-) {
+) -> u64 {
     let tiles_read = set.tiles_read;
 
     if set.buildings.is_empty() {
         println!("[Info] buildings_pbf_dir: {tiles_read} tile(s), no buildings in extent");
-        return;
+        return 0;
     }
 
     let tile = TileRef {
@@ -4906,6 +5082,7 @@ fn apply_buildings_pbf(
          ({} after dedup), {} drawn, {} pixel(s) raised",
         set.decoded, set.buildings.len(), stats.buildings_hit, stats.pixels_modified
     );
+    stats.voids_filled as u64
 }
 
 /// Collect the buildings of a FlatGeobuf geometry into the shared model: one
@@ -5077,6 +5254,7 @@ mod tests {
         // This is why the fix matters: the samplers in this file accept any
         // value above -5000 *half-metres* (-2500 m) as real ground.
         assert!(VOID_ELEV <= -5000, "the sentinel must read as no-data");
+        assert!(VOID_ELEV <= VOID_FLOOR && VOID_FLOOR == -5000, "a void count takes the sentinel in");
         assert!(0 > -5000, "sea level reads as valid ground — as it should");
     }
 
@@ -5313,6 +5491,9 @@ mod tests {
             swiss_tifs: Vec::new(),
             buildings_file: None,
             buildings_pbf_dir: None,
+            buildings_pbf_ready: None,
+            buildings_pbf_wait_s: None,
+            buildings_hold_mb: None,
         }
     }
 

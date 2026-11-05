@@ -23,16 +23,25 @@ fn version_flag_prints_name_and_semver() {
 /// (RAM budget fixed per run, per-row release, outputs held open — no new
 /// field or parsed line, so no new gate), 0.2.10 the `download` job fields
 /// `buildings_pbf_ready` / `buildings_pbf_wait_s` (changelog 45: wait for the
-/// building tiles a caller fetches during the download). Bump the crate
-/// version — and the §1.5 table — with the next capability.
+/// building tiles a caller fetches during the download), 0.2.11 the
+/// `[Tile] <name> voids=<n>` lines of `download` and batch `ingest` and the
+/// download progress record kept in `AETHER_DIAG_FILE` (changelog 46; the
+/// parallel duplicate filter of changelog 47 needs no gate), 0.2.12 the batch
+/// `ingest` job fields `buildings_pbf_ready` / `buildings_pbf_wait_s` /
+/// `buildings_hold_mb` (changelog 48: building tiles fetched while the batch
+/// samples its terrain) and the `[Tile] … voids=` lines kept in
+/// `AETHER_DIAG_FILE`. Bump the crate version — and the §1.5 table — with
+/// the next capability.
 #[test]
 fn version_covers_the_documented_capability_gates() {
     let v: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|p| p.parse().unwrap()).collect();
     assert_eq!(
         v,
-        [0, 2, 10],
-        "CONTRACT §1.5 gates download `buildings_pbf_ready` on aether_converter 0.2.10 \
-         (changelog 45), AETHER_DIAG_FILE and download `cache_dir` on 0.2.8 \
+        [0, 2, 12],
+        "CONTRACT §1.5 gates ingest `buildings_pbf_ready` on aether_converter 0.2.12 \
+         (changelog 48), the `[Tile] … voids=` lines on 0.2.11 (changelog 46), \
+         download `buildings_pbf_ready` on 0.2.10 (changelog 45), \
+         AETHER_DIAG_FILE and download `cache_dir` on 0.2.8 \
          (probe/[Tile]/atomic writes on 0.2.7)"
     );
     let out = Command::new(env!("CARGO_BIN_EXE_aether_converter"))

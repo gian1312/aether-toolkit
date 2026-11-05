@@ -815,6 +815,9 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    four zooms deep (256 decodes, 85 encodes) ~0.38 s; a derived tile is
 >    worked out on the tile's worker thread like a hit's decode. Nothing to
 >    gate on: a consumer can tell this build by `--version` (0.2.9).
+>    Since 0.2.12 (changelog 48f) a derived tile is never written over a
+>    real entry — a body or a 404 another process stored after this one
+>    read its index.
 > 41. **Vector-tile buildings: the duplicate filter keys on the whole
 >    footprint (§9a, §9b; `aether_converter` 0.2.9; 2026-10-23).** No
 >    job-JSON change. Merging vector tiles drops the buildings that arrive
@@ -1018,6 +1021,243 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    and burns whatever the directory holds when its terrain is done — part
 >    of the tiles while a fetch still runs — or fails with
 >    `buildings_pbf_dir … is not a directory` when it does not exist yet.
+> 46. **`[Tile] <name> voids=<n>`: each tile's void samples from `download`
+>    and batch `ingest`; `download`'s progress record also in
+>    `AETHER_DIAG_FILE` (§1.2, §2; additive, parsed; `aether_converter`
+>    0.2.11; 2026-10-25).** No job-JSON change; `.abt` bytes are unchanged
+>    (`cmp` against 0.2.10 of a 6-tile batch `ingest` over 2,100 building
+>    tiles — synthetic and real OSM, one undecodable — with a void hole,
+>    partial coverage and `void_fill_m`, and of two 6-tile z13 downloads,
+>    with and without that building directory, two source tiles 404'd and
+>    one deep-water tile: all 18 `.abt` identical; stdout/stderr identical
+>    modulo numbers but for the new lines). Motivation: after a download
+>    the Waveshed plugin read every output tile in full to find its void
+>    samples (7.3 GB for 119 tiles of 2 m, 18 s, on the owner's machine),
+>    and its log panel is to show only every 10th progress line. **What
+>    counts as void:** a sample at or below the validity floor of **-5000
+>    half-metres (-2500 m)** — the `-9999` void sentinel and anything else
+>    a consumer must not read as ground: bathymetry (Terrarium carries it
+>    down to -11000 m), Mapbox's lowest value (-10000 m), a deep
+>    `void_fill_m`. It is the floor `ingest`'s samplers already apply (a
+>    source sample is ground only above it), and the rule a consumer that
+>    fills voids uses — counting the sentinel alone reported 0 for a tile
+>    of water at -3000 m, which then reached the engine unfilled. (a)
+>    **CLI `download`, full runs:** once every output is finished — strip
+>    assembly, tail fill and the buildings post-pass done — and before the
+>    `[Stats]` block, stderr gets one line per output tile, in job order,
+>    written and flushed together: `[Tile] <output file name> voids=<n>`,
+>    `<n>` = the samples of the file as it now is at or below the floor.
+>    Counted as the rows are written (a row no tile-row covered — the tail
+>    fill — is all void), then lowered by what the burn lifts: `max` takes
+>    any roof over a void sample, so a footprint whose ground reference is
+>    terrain puts its roof on the void pixels it reaches — no longer void
+>    —, while one whose ground reference is itself void puts the sentinel
+>    plus its height there (e.g. `-9987` for 6 m), still below the floor
+>    and still counted. No file is read back. A run that fails prints none
+>    (it removes its outputs); a repair job prints none.
+>    (b) **Batch `ingest`:** right after each tile's `[Tile] <name>
+>    covered=<a>/<b>` line — unchanged, it still ends after `<a>/<b>`, as an
+>    older plugin's pattern requires — a line of its own, `[Tile] <name>
+>    voids=<n>`, same name, written and flushed with it before the `[Rust]
+>    Progress:` line. `<n>` is counted after `void_fill_m` and the building
+>    burns: a covered pixel is never void (the samplers average only samples
+>    above the floor), so it is `<b> − <a>` for a tile without a fill and
+>    without buildings (a source sample at or below the floor is no
+>    coverage), 0 with a `void_fill_m` above -2500 m and `<b> − <a>` with one
+>    at or below it; a burn lowers it as in (a). The single-job form prints
+>    neither line, as before. (c) **`AETHER_DIAG_FILE` keeps the progress
+>    record.** When it is set, every `[Download] <pct>% (…)` line of a
+>    download pass (full run or repair), the `[Download] STALL …` and
+>    `(suppressing …)` lines, the `[Download] first <class>: …` lines
+>    (`timeout`, `connect error`, `decode error`, `unknown error`), the
+>    `[Degraded] …` lines and every line of the `[Stats]` block are ALSO
+>    appended to that file: byte for byte the stderr lines, no prefix, in
+>    stderr's order. stderr is unchanged — still every whole percent. Not
+>    copied: the `[Download] z=` header and the other `[Download]` lines,
+>    `[Tile]` (the voids lines are, since 0.2.12 — changelog 48, also a
+>    batch ingest's), `[Buildings]`, `[Warn]`. Tested in `tests/test_tile_voids.rs`
+>    (every count against an independent count of the written file: a
+>    download with a 404'd source column — tiles with no, some and all
+>    samples void; the same with buildings — a house on terrain reaching
+>    into the void lifts it, one wholly inside it stays void; water at
+>    -3000 m (-6000) counted and ground at -2499.5 m (-4999) not, in a
+>    download and in ingest, where a -6000 source sample is no coverage and
+>    a fill of -3000 m counts while one of -2499.5 m does not; a repair, no
+>    line; ingest batches with partial coverage and an internal void hole,
+>    with `void_fill_m`, fully covered, not covered, and with buildings
+>    over the void), `buildings.rs` (the rasterizer's count of lifted
+>    samples) and `tests/test_diag_file.rs` (a download with a STALL, a
+>    timeout and a decode failure filled from z−1: the file holds exactly
+>    stderr's progress, STALL, first-failure, `[Degraded]` and `[Stats]`
+>    lines, besides the diagnostics it always had). **Gate** on
+>    `aether_converter` 0.2.11 (§1.5): an older build prints no voids line —
+>    the consumer must count the voids itself or treat them as unknown —
+>    and keeps the progress record on stderr only.
+> 47. **`buildings_pbf_dir`: the duplicate filter runs in parallel (§9a,
+>    §9b; `aether_converter` 0.2.11; 2026-10-25).** No job-JSON or line
+>    change; the surviving buildings, their order, every count and every
+>    `.abt` byte are unchanged. The decode of a building directory went
+>    parallel in changelog 44, but the whole-ring duplicate filter after it
+>    (changelog 41) stayed on one thread, building a key — one allocation
+>    per ring — for every building and inserting it into one hash set: 16 s
+>    for 5.1 M buildings (21,148 tiles), 8 s for 3.1 M, 7 s for 2.2 M on the
+>    owner's 16-thread machine, all inside the `[Rust] Building tiles
+>    decoded: … in <s.s> s` a batch prints. It now runs on the decode's
+>    pool (a batch's `[Rust] Rayon Pool:` threads, else rayon's global
+>    pool): each building's key is hashed in place, without allocating; the
+>    `(hash, index)` pairs are sorted; equal keys hash equal, so every group
+>    of copies lies in one run of equal hashes, in list order, and in each
+>    run the first building of each key survives — decided by comparing the
+>    keys themselves, so a hash collision costs time, never a building. The
+>    result is the sequential filter's, by construction and by test
+>    (`buildings.rs`): survivor indices equal on the real OpenFreeMap tile
+>    (twice at its own address and once beside it), 1,500 synthetic tiles
+>    with buffer-zone copies, a seam, and a set of every near miss the key
+>    tells apart (height one ulp off, the other datum, a courtyard more or
+>    with a vertex moved, a vertex one 1e-6° quantum off or 2e-7° off, a
+>    rotated ring, keyless buildings, NaN and −0.0 vertices) — on 1, 3 and
+>    8 threads and the global pool, and with every hash forced to collide.
+>    Measured in the container (16 CPUs visible, a cgroup quota of 4;
+>    release build; `bench_duplicate_filter_5m_sequential_vs_parallel`, an
+>    ignored test): 5,115,800 buildings — the real OpenFreeMap tile at
+>    10,000 addresses with its buffer-zone copies, 415,800 of them dropped
+>    — sequential 10.3 s, parallel 0.47 s on 4 threads (0.47 s on 8, 0.56 s
+>    on 16, oversubscribed). End to end, a batch over 11,000 copies of that
+>    tile on the Windows-backed mount (5,169,530 buildings): `[Rust]
+>    Building tiles decoded: … in` 26.7 s → 16.7–17.7 s, the rest being the
+>    decode's file reads over 9p; peak RSS 2.26 → 1.39 GB. `.abt` bytes and
+>    `[Info] buildings_pbf_dir` lines are identical to 0.2.10's for that
+>    batch and for the checks of item 46. Nothing to gate on: a consumer
+>    can tell this build by `--version` (0.2.11).
+> 48. **Batch `ingest`: building tiles fetched while the batch samples its
+>    terrain — `buildings_pbf_ready` / `buildings_pbf_wait_s` /
+>    `buildings_hold_mb`; the `[Tile] … voids=` lines also in
+>    `AETHER_DIAG_FILE`; the raw tile cache keeps a real answer over a
+>    derived tile (§1.2, §1.5, §9a, §9b; additive; `aether_converter`
+>    0.2.12; 2026-10-25).** Motivation: a batch decodes its
+>    `buildings_pbf_dir` once, before its first tile, so a caller had to
+>    finish fetching the building tiles before it could launch the ingest —
+>    on the owner's machine the Waveshed plugin's Site Analysis waited 6 s of
+>    a 27 s run for them, its Map Converter's Phase 2 39 s before a 123 s
+>    converter run. (a) **The hand-over** — the `download` job's (changelog
+>    45), with the same meaning. New optional fields of a batch job:
+>    `buildings_pbf_ready` (one plain file name inside `buildings_pbf_dir`
+>    whose existence declares the directory complete; the same name rules
+>    and messages), `buildings_pbf_wait_s` (0 … 86400 s, absent or `null` →
+>    **1800**, counted from the batch's first look, at launch) and
+>    `buildings_hold_mb` (b). The marker there at launch: the directory is
+>    decoded at once and the batch runs exactly as without the field — bytes
+>    and lines. Missing at launch: nothing reads the directory (it need not
+>    exist), every tile's terrain starts at once, a watcher looks for the
+>    marker every 250 ms and decodes the directory as soon as it is there —
+>    the loader and lines of changelog 44/47, now when the marker appears, on
+>    a pool of the batch's size beside the batch's own. A tile whose terrain
+>    (and `buildings_file` burn) is done before the set is decoded is
+>    **held** in memory — its samples, not written — while the held tiles
+>    fit the hold budget; a tile that does not fit **waits on its worker
+>    thread**, which starts no other tile meanwhile. Once the set is decoded
+>    the held tiles are burnt and written in the order they finished (as
+>    many drainer threads as the batch has workers, and every worker that
+>    comes free, take them from the front), every later tile inline, as
+>    before: the same `.abt` bytes as a batch whose directory was complete
+>    at launch. The `[Tile] … covered=` / `voids=`, `[Info]
+>    buildings_pbf_dir:` and `[Rust] Progress:` lines keep their meaning and
+>    come when a tile is written — so none of a held tile before its
+>    buildings are ready. New stdout lines (informational, prefixes stable,
+>    as the download's): `[Buildings] waiting for the building tiles
+>    (<marker path>)` once, when the first tile has to wait; once the set is
+>    decoded, `[Buildings] building tiles ready after <s.s> s` (seconds since
+>    the waiting line) and `[Buildings] <n> tile(s) held (<m.m> MB) until the
+>    building tiles were ready` (+ `; <k> more waited on their worker threads
+>    (hold budget <b.b> MB full)` when some did) — none of the three when no
+>    tile had to wait. A marker still missing `buildings_pbf_wait_s` after
+>    the first look fails the batch, exit 1: `Error: Building tiles not
+>    ready: the marker file <marker path> (buildings_pbf_ready) did not
+>    appear within <w> s (buildings_pbf_wait_s); the ingest fails rather
+>    than write tiles without their buildings`; a directory that does not
+>    decode fails it with the loader's error, as at launch (e.g.
+>    `buildings_pbf_dir mixes zoom levels …`). Either way the held tiles are
+>    dropped, a tile not yet started is skipped, one being sampled stops at
+>    its next band, and since no tile of the directory is written before its
+>    set is ready, **the batch leaves no output tile of it behind** (no
+>    `[Tile]`, `[Error]` or progress line for them). (b) **Hold budget**:
+>    `buildings_hold_mb` (MB = MiB, 0 … 1048576; the smallest value the
+>    watched jobs give, taken as given — `0` holds nothing); absent: half of
+>    the available memory the batch measures for its pool once the pool's
+>    reservation is taken off (threads × the per-tile estimate of the `[Rust]
+>    Rayon Pool:` line, plus the 192 MB chunk cache), at most 4096 MB, never
+>    below one tile (`size_px² × 2` bytes of the largest watched tile). (c)
+>    **Checked before any tile**, nothing read: the fields by the download
+>    job's rules, `buildings_hold_mb`, and that the jobs naming one
+>    directory give the same `buildings_pbf_ready` and `buildings_pbf_wait_s`
+>    (it is decoded once for the run); a job's error is prefixed `ingest job
+>    for "<output_path>": `. `buildings_pbf_wait_s` and `buildings_hold_mb`
+>    without `buildings_pbf_ready` are not read — not even checked — so a
+>    batch without the field is unchanged byte for byte and line for line.
+>    (d) **The single-job form** (a JSON object) refuses
+>    `buildings_pbf_ready` before anything is read, exit 1:
+>    `buildings_pbf_ready "<v>" is read by a batch ingest only (a JSON array
+>    of jobs): …` — it decodes its `buildings_pbf_dir` before its tile, as it
+>    finds it, so ignoring the marker would burn a directory still being
+>    fetched; a one-job array takes the field. (e) **`AETHER_DIAG_FILE` keeps
+>    the `[Tile] <name> voids=<n>` lines** too, which changelog 46 had left
+>    out: a download's (stderr) and a batch ingest's (stdout), byte for byte,
+>    in the stream's order; both streams are unchanged, the ingest's covered
+>    lines are not copied. (f) **The raw tile cache never writes a derived
+>    tile over a real answer** (§9b *Raw source-tile cache*). Two processes
+>    may share one cache — the Waveshed plugin runs band b's coarser derive
+>    pass beside band b+1's z15 fetch — and the pack writer wrote its entries
+>    without looking at the slots, last writer winning: the fetch's parent
+>    fill could store the service's own z14 (z13, …) tile, and the derive
+>    pass, which had judged that tile from an index read at its start, then
+>    replace it with its 2 × 2 mean. Now the writer reads, under the pack
+>    lock, what each target slot holds and skips a derived item (status 3)
+>    when the slot holds a body that is all there and matches its CRC
+>    (status 1) or a 404 (status 2), or when the same batch carries a real
+>    answer for that slot before it; a real answer still replaces anything,
+>    a derived tile a derived one or an entry that does not read. `[Stats]
+>    Cache: … <written> written` no longer counts a skipped derived tile.
+>    The reverse order never lost anything. A converter before 0.2.12
+>    sharing the cache still writes blindly: both processes must be this
+>    build or later for the guard to hold. Tested:
+>    `tests/test_ingest_buildings_ready.rs` (an `.abt` terrain under 12
+>    tiles, synthetic MVT): the fields alone and the marker at launch → the bytes
+>    and stdout of the batch without them; the directory created, its tiles
+>    and then the marker written 2 s after launch → no tile written before,
+>    one waiting line naming the marker, the decode lines after it, one
+>    ready line (its seconds at least the time from the waiting line to the
+>    marker, at most 1.5 s more), one held line, every tile line after them,
+>    the reference's bytes; a hold of one tile → `1 tile(s) held`, workers
+>    waiting, the same bytes; no marker within `buildings_pbf_wait_s: 1` →
+>    exit 1 with the message, no tile, no tile line; a mixed-zoom directory
+>    after its marker → its error, no tile; bad fields and disagreeing jobs
+>    → refused before the batch starts; a single job → refused, its other
+>    fields ignored. `buildings_ready.rs` (the budget rule, the checks, the
+>    held line); `tests/test_diag_file.rs` (the voids lines in the file, for
+>    a batch ingest and a download); `tile_cache.rs` (a derived write over a
+>    real body, over a 404, over a derived entry, over a body that fails its
+>    CRC, before and after a real answer in one batch; the writer's count).
+>    Against the 0.2.11 build, on the batch of changelog 46/47's checks (6
+>    tiles over 2,100 building tiles — synthetic and real OSM, one
+>    undecodable — a void hole, partial coverage, `void_fill_m`): without
+>    the fields, with `buildings_pbf_wait_s` / `buildings_hold_mb` alone and
+>    with the marker there at launch, all `.abt` `cmp`-identical and stdout /
+>    stderr identical modulo numbers and completion order; with the
+>    directory appearing during the run (6 and 24 tiles), a hold of one
+>    512 px tile and a hold of 0, all `.abt` identical to 0.2.11's. Measured
+>    in the container (4 threads, release build, building directory
+>    renamed into place 3 s after launch, three runs each), against the
+>    batch launched once the directory is complete: a terrain-bound batch
+>    (32 tiles of 700 px at 10 m over one LV95 2 m LZW source) 6.4–6.5 s →
+>    5.4–5.6 s from the start of the fetch, the terrain now running during
+>    it; a write-bound one (120 tiles of 1000 px at 2 m, 229 MB written to
+>    the container's 9p mount — writes that cannot start before the set is
+>    ready in either form) 7.9–8.4 s → 7.9–8.2 s, no gain; all `.abt`
+>    identical between the two forms. The owner's runs are not measured.
+>    **Gate** on `aether_converter` 0.2.12 (§1.5): an older build ignores
+>    the three fields and reads the directory at launch — `buildings_pbf_dir
+>    … is not a directory` when it does not exist yet, else whatever it
+>    holds then — and keeps the voids lines off the diag file.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -1172,7 +1412,28 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   first tile: `[Rust] Decoding building tiles: <n>/<m>` every 1,000 building
   tiles and once at the end, then `[Rust] Building tiles decoded: <m>
   tile(s), <b> building(s) in <s.s> s` — see §9a *Building-tile decode*.
-  Neither contains `Progress:`.
+  Neither contains `Progress:`. A directory whose `buildings_pbf_ready`
+  marker is missing at launch (≥ 0.2.12, changelog 48) prints the same lines
+  when the marker appears, while tiles are being sampled — still before any
+  `[Rust] Progress:` line of a tile that burns it.
+* **Building-tile hand-over lines** (stdout, batch ingest with
+  `buildings_pbf_ready` whose marker was missing at launch;
+  `aether_converter` ≥ 0.2.12, changelog 48; informational, prefixes stable
+  — match the prefix, as for the download's `[Buildings]` wait lines):
+
+  ```
+  [Buildings] waiting for the building tiles (<marker path>)
+  [Buildings] building tiles ready after <s.s> s
+  [Buildings] <n> tile(s) held (<m.m> MB) until the building tiles were ready[; <k> more waited on their worker threads (hold budget <b.b> MB full)]
+  ```
+
+  The first once, when the first tile's terrain is done and the set is not
+  decoded yet; the other two once the set is decoded (`<s.s>` = seconds since
+  the first, one decimal; `<n>` / `<m.m>` = tiles held in memory and their
+  MB; `<k>` = tiles whose worker waited, the hold being full); none of them
+  when no tile had to wait. None matches `[Buildings] <source>:` (the
+  `buildings_file` line) or `[Info] buildings_pbf_dir:`. See §9a *Building
+  tiles fetched during the batch*.
 * **Ingest diagnostic lines** (stdout, or the file `AETHER_DIAG_FILE` names
   — below; `aether_converter` ≥ 0.2.7, changelog 31, 37; **diagnostic, not
   parsed** — for people reading a log, wording may change, consumers must
@@ -1193,8 +1454,10 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   writing, syncing and renaming the tile file (`0.0` when the tile failed
   before), and `total` the tile's wall time on its compute thread — in a
   batch the write runs on a writer thread, overlapping the next tile, and is
-  not part of it. In a batch the line precedes the tile's `[Tile]` line. A
-  converter before 0.2.8 ends the line at `bands <n>` and prints it when
+  not part of it; a tile held for its building tiles (≥ 0.2.12, changelog
+  48) counts its terrain and its burn, not the wait between. In a batch the
+  line precedes the tile's `[Tile]` line. A converter before 0.2.8 ends the
+  line at `bands <n>` and prints it when
   sampling ends. An `ingest` process prints at exit — after the batch
   result, also when the run fails — on stdout:
 
@@ -1220,7 +1483,18 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   AETHER_DIAG_FILE = "<path>" cannot be opened (<cause>); diagnostics go to
   the console`, and the lines stay on the console; it never fails a run.
   `[Rust] run:` and every parsed line stay on their streams. Older builds
-  ignore the variable.
+  ignore the variable. Since 0.2.11 (changelog 46) the file also keeps a
+  download's progress record: every `[Download] <pct>% (…)` line (full run
+  or repair), the `[Download] STALL …` / `[Download] (suppressing …)` lines,
+  the `[Download] first <class>: …` lines, the `[Degraded] …` lines and
+  every line of the `[Stats]` block are appended to it **as well** — they
+  stay on stderr exactly as before (every whole percent), and the file gets
+  the same bytes, no prefix, in stderr's order. A consumer may show only
+  part of them (the Waveshed plugin shows every 10th percent) and point at
+  the file for the rest. Since 0.2.12 (changelog 48) the `[Tile] <name>
+  voids=<n>` lines are appended **as well** — a download's from stderr, a
+  batch ingest's from stdout (not its `covered=` line) — byte for byte, in
+  the stream's order; both streams are unchanged.
 * **Per-tile coverage line** (stdout, batch ingest only; `aether_converter`
   ≥ 0.2.7, changelog 33). After each tile that was written:
 
@@ -1246,6 +1520,31 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   > older than 0.2.7 prints no `[Tile]` lines — a consumer must then treat
   > every tile's coverage as **unknown** (not as void, not as full), and
   > likewise for any tile whose line it did not see.
+
+  **Per-tile void line** (stdout, batch ingest only; `aether_converter` ≥
+  0.2.11, changelog 46; parsed). Right after each covered line, as a line
+  of its own (the covered line still ends after `<covered_px>/<total_px>`):
+
+  ```
+  [Tile] <output file name> voids=<void_px>
+  ```
+
+  — the same name (split on the **last** ` voids=`), and `<void_px>` the
+  samples of the written tile **at or below -5000 half-metres (-2500 m)**
+  — the `-9999` sentinel and anything else that is no ground (the floor
+  the samplers apply: a source sample is ground only above it) — counted
+  **after** `void_fill_m` and the building burns: for a tile without
+  buildings it is `<total_px> − <covered_px>` without a fill, 0 with a fill
+  above -2500 m and `<total_px> − <covered_px>` with one at or below it; a
+  burn can lower it (a roof resolved on terrain lifts the void samples it
+  covers). Both lines are written and flushed together, before the
+  `[Rust] Progress:` line; a failed tile prints neither, the single-job
+  form neither. Same freeze as the covered line: the prefix, the `voids=`
+  key and the integer. A converter older than 0.2.11 prints no voids line
+  — a consumer must then find a tile's voids itself (or treat them as
+  unknown), and likewise for any tile whose voids line it did not see.
+  Since 0.2.12 the line also goes to `AETHER_DIAG_FILE` when that is set
+  (changelog 48), the covered line does not.
 * **Tile files are replaced atomically (`aether_converter` ≥ 0.2.7,
   changelog 34).** `ingest` writes each `.abt` to `<output_path>.tmp-<pid>`
   in the same directory (`<pid>` = the converter's process id), then
@@ -1269,7 +1568,11 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   file and the fix (§9a). In a batch each failed tile prints
   `[Error] Failed to process tile: <message>` on stdout with the **full
   cause chain**, `: `-joined outermost first (changelog 23), and the run
-  ends with `<n> of <total> tiles failed to convert`.
+  ends with `<n> of <total> tiles failed to convert`. A batch whose
+  building-tile hand-over fails (`buildings_pbf_ready`, changelog 48: the
+  marker did not come, or the directory did not decode) ends with that
+  error instead and prints no line for the tiles it dropped, none of which
+  was written (§9a).
 * **An ingest that covered nothing: batch warns and exits 0; a single job
   still exits non-zero (changelog item 18, 2026-08-31).** A **batch** whose
   tiles took not one pixel from any source keeps its tiles — void, or
@@ -1457,6 +1760,34 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   (changelog 39), `[Download] launch gate closed for <s> s (assembly behind
   the network)`: the time the run waited with no strip downloading because
   the next one did not fit the budget.
+* **Per-tile void line** (stderr, CLI `download` full runs; `aether_converter`
+  ≥ 0.2.11, changelog 46; parsed). Once every output is finished — the strip
+  assembly, the tail fill and the buildings post-pass (§9b) done — and
+  before the `[Stats]` block, one line per output tile, in the order of the
+  job's `tiles`, written and flushed together:
+
+  ```
+  [Tile] <output file name> voids=<void_px>
+  ```
+
+  `<output file name>` is the last component of `output_dir`/`filename` —
+  for the plain `filename` consumers pass, `filename` itself (lossy UTF-8;
+  split on the **last** ` voids=`); `<void_px>` the samples of the written
+  file **at or below -5000 half-metres (-2500 m)**: the `-9999` void
+  sentinel (§6) and anything else a consumer must not read as ground — the
+  source's bathymetry included (Terrarium carries it down to -11000 m;
+  Mapbox's lowest value is -10000 m). `0` for a tile every pixel of which
+  is ground above -2500 m, `size_px²` for one no tile reached. It describes
+  the file as the run leaves it: the buildings post-pass can lower it, as a
+  roof resolved on terrain lifts the void samples it covers (a roof over
+  void ground stays below the floor). Counted while the rows are written,
+  never by reading a file back. A run that fails prints none — it
+  removes its outputs (below); a repair job (§9b) prints none, nor do the
+  in-memory and browser downloaders. Same freeze as the ingest `[Tile]`
+  lines (prefix, `voids=` key, the integer). A converter older than 0.2.11
+  prints none: count the voids from the file, or treat them as unknown.
+  Since 0.2.12 the lines also go to `AETHER_DIAG_FILE` when that is set
+  (changelog 48).
 * **Disk-space failure — `[MPT-critical]` / QGIS-critical.** When the estimated
   `.abt` output exceeds free space, `download` **fails** (`anyhow::bail!`, non-zero
   exit). The exact and only emitted string (`crates/aether_converter/src/download.rs`,
@@ -1788,6 +2119,10 @@ Known capability gates consumers rely on:
 | `plan` grid of changelog 43 — 1e-9-step snap, edges rounded to 9 decimals, tolerant start per resolution (§1.2; a consumer that cross-checks `plan` must enumerate this way for this build and later and the old way for older ones, or its check aborts) | `aether_converter 0.2.9` |
 | `[Rust] Decoding building tiles: <n>/<m>` and `[Rust] Building tiles decoded: …` lines while a batch `ingest` decodes its `buildings_pbf_dir` (§9a, changelog 44; older builds print nothing during the decode and decode one file after the other) | `aether_converter 0.2.9` |
 | `download` job fields `buildings_pbf_ready` and `buildings_pbf_wait_s` — fetch the building tiles while the download runs (§9b, changelog 45; older builds ignore both and burn whatever `buildings_pbf_dir` holds when their terrain is done, or fail when it does not exist yet) | `aether_converter 0.2.10` |
+| `[Tile] <name> voids=<n>` lines — CLI `download` full runs (stderr, one per output before the `[Stats]` block) and batch `ingest` (stdout, after each `covered=` line): the samples at or below -5000 half-metres (-2500 m: the `-9999` sentinel, bathymetry) each written tile holds (§1.2, changelog 46; older builds print none — count the voids from the files, or treat them as unknown) | `aether_converter 0.2.11` |
+| `AETHER_DIAG_FILE` also keeps `download`'s `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and `[Stats]` lines, which stay on stderr (§1.2, changelog 46; older builds keep them on stderr only) | `aether_converter 0.2.11` |
+| Batch `ingest` job fields `buildings_pbf_ready`, `buildings_pbf_wait_s` and `buildings_hold_mb` — fetch the building tiles while the batch samples its terrain (§9a, changelog 48; older builds ignore all three and read `buildings_pbf_dir` at launch: they fail with `buildings_pbf_dir … is not a directory` when it does not exist yet, else burn whatever it holds then; a single job refuses `buildings_pbf_ready` from this version on) | `aether_converter 0.2.12` |
+| `AETHER_DIAG_FILE` also keeps the `[Tile] <name> voids=<n>` lines of `download` (stderr) and batch `ingest` (stdout), which stay on their streams (§1.2, changelog 48; older builds keep them on their streams only) | `aether_converter 0.2.12` |
 
 ---
 
@@ -1797,7 +2132,7 @@ Known capability gates consumers rely on:
 |----------|---------|---------|
 | `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key — **v1 or v2** (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
 | `RUST_LOG` | `aether_core`, toolkit CLIs | `env_logger` level filter. **Must be `info` (or lower)** for the log-line progress diagnostics of §1.1(b) to appear. Markers in §1.1(a) do not depend on it. |
-| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines (and, ≥ 0.2.9, `download`'s once-per-run `[Download] launch gate closed for …`, changelog 39) are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move. |
+| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines (and, ≥ 0.2.9, `download`'s once-per-run `[Download] launch gate closed for …`, changelog 39) are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move; since 0.2.11 (changelog 46) `download`'s `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and `[Stats]` lines are copied into the file as well, staying on stderr unchanged. |
 | `AETHER_BIN_DIR` | consumers only | Convention for locating the engine binaries. **Not read by any engine/toolkit code** — it is purely a consumer-side discovery hint. Do not add engine logic that depends on it. |
 | `PYTHONUNBUFFERED` | consumers only | Set by Python consumers so a child process's stdout markers/log lines arrive line-by-line rather than block-buffered. Not read by Rust code. |
 
@@ -2424,6 +2759,9 @@ a **single object** or a **JSON array** of such objects (batch).
 | `swiss_tifs` | array of string | **DEPRECATED**, no longer required | Alias: normalized to leading `sources` entries with `crs "EPSG:2056"` (in order — which preserves the old per-pixel priority: this stack first, `base_tif` as fallback). Slated for removal in the next major version. |
 | `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in — one `.fgb`, or a directory of them (a directory holding no `.fgb` is an error, not an empty burn). Height follows the **building height ladder** below: geometry Z as an **absolute roof elevation (AMSL)** where the geometry has one, else the attribute rungs as **above-ground** metres. A source that cannot be opened, parsed or scanned fails the run rather than silently producing building-less tiles. |
 | `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Vector tiles carry no geometry Z, so height starts at the ladder's attribute rungs and is always **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
+| `buildings_pbf_ready` | string? | optional | Additive, changelog 48, `aether_converter` ≥ 0.2.12 (older builds ignore it: gate on §1.5). **Batch only.** One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the batch samples its terrain — the download job's hand-over (§9b, changelog 45), same name rules and messages. There at launch: the directory is decoded at once, exactly as without the field. Missing at launch: see *Building tiles fetched during the batch* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the batch before any tile; so do jobs naming one directory with different `buildings_pbf_ready` / `buildings_pbf_wait_s`. The single-job form (a JSON object) refuses it. Absent or `null`: unchanged. |
+| `buildings_pbf_wait_s` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Seconds a batch waits for `buildings_pbf_ready`, counted from its first look, at launch; absent or `null` → **1800**. Must be 0 … 86400, else the batch fails before any tile: `ingest job for "<output_path>": buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` (alone it is not even checked). |
+| `buildings_hold_mb` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Megabytes (MiB) of finished tiles a batch may hold in memory while it waits for `buildings_pbf_ready` — a held tile costs `size_px² × 2` bytes; a tile that does not fit waits on its worker thread. The batch's budget is the smallest value its watched jobs give, taken as given (`0` holds nothing); absent on all of them: half of the available memory the batch measures for its pool once the pool's reservation is taken off (threads × the per-tile estimate of the `[Rust] Rayon Pool:` line, plus the 192 MB chunk cache), at most 4096 MB, never below one tile (the largest watched tile). Must be 0 … 1048576, else the batch fails before any tile: `ingest job for "<output_path>": buildings_hold_mb must be a number of megabytes from 0 to 1048576, got <v>`. Read only together with `buildings_pbf_ready`. |
 
 Both building fields are optional and additive; a job that omits them behaves
 exactly as before. They may be combined, in which case FlatGeobuf is applied
@@ -2599,7 +2937,10 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
 **Building-tile decode (`buildings_pbf_dir`, batch ingest; additive;
 `aether_converter` ≥ 0.2.9, changelog 44).** A batch decodes each distinct
 `buildings_pbf_dir` once, before its first tile, after the unchanged line
-`[Rust] Decoding building tiles in "<dir>" (once for the run)...`. The
+`[Rust] Decoding building tiles in "<dir>" (once for the run)...` — a
+directory whose `buildings_pbf_ready` marker is missing at launch when the
+marker appears, with the same lines (≥ 0.2.12; *Building tiles fetched
+during the batch* below). The
 directory's tile files — every name `{z}_{x}_{y}.pbf` or `{z}_{x}_{y}.mvt`;
 anything else is ignored — are taken in **name order** (byte-wise) and read
 and decoded in parallel on the batch's worker pool (the `[Rust] Rayon Pool:`
@@ -2607,7 +2948,9 @@ threads). The result is exactly what a walk over that order, one file after
 the other, gives: the same building list in the same order (so the duplicate
 filter keeps the same copies), the same counts, the same warnings. On NTFS,
 name order is also the order the sequential decoder before it walked
-(changelog 44). On stdout, the stream of `[Rust] Progress:`:
+(changelog 44). The duplicate filter after the decode runs on the same pool
+too (≥ 0.2.11, changelog 47) and keeps exactly the buildings, in exactly the
+order, the one-thread filter kept. On stdout, the stream of `[Rust] Progress:`:
 
 ```
 [Rust] Decoding building tiles: <n>/<m>
@@ -2624,7 +2967,8 @@ name order is also the order the sequential decoder before it walked
   `<n> building(s)` of the per-tile `[Info] buildings_pbf_dir:` line),
   `<s.s>` = wall seconds of the whole load, one decimal. It is the line
   after the decode's last line (a progress line, or the warnings below) and
-  comes before any tile is sampled.
+  comes before any tile is sampled (a directory decoded when its marker
+  appears: before any tile that burns it is written).
 * A tile that does not decode is still skipped with `[Warn] buildings
   <name>: <error>` on stderr (and still counts in `<m>`). These lines now come
   together, in name order, after the last progress line and before the
@@ -2639,6 +2983,107 @@ name order is also the order the sequential decoder before it walked
 * The single-job form (a JSON object) decodes the same way on rayon's global
   pool, without these lines; so do `download`'s buildings post-pass and its
   repair jobs (§9b), whose lines are unchanged.
+
+**Building tiles fetched during the batch (`buildings_pbf_ready`,
+changelog 48, `aether_converter` ≥ 0.2.12).** A caller that fetches the
+building tiles itself (the Waveshed plugin: OpenFreeMap z14) can launch a
+batch at once, with `buildings_pbf_dir` naming the directory its fetch writes
+into and `buildings_pbf_ready` naming a marker file it creates there when the
+fetch is done — the hand-over of the download job (§9b). The batch then:
+
+1. checks every job's fields before anything is read — exit 1, no tile
+   started, no output directory created — failing with the download job's
+   messages (§9b, step 1), prefixed `ingest job for "<output_path>": `, or
+   with `buildings_hold_mb must be a number of megabytes from 0 to 1048576,
+   got <v>` (same prefix), or, for jobs that name one directory with
+   different hand-overs, `buildings_pbf_dir "<dir>": the jobs for "<a>" and
+   "<b>" give it different buildings_pbf_ready / buildings_pbf_wait_s (<x>
+   against <y>); the directory is decoded once for the run, so every job
+   naming it must give the same`;
+2. looks for `<buildings_pbf_dir>/<buildings_pbf_ready>` as a regular file
+   once, at launch (its contents are ignored; a directory of that name is no
+   marker). There: the directory is decoded at once, before the first tile,
+   exactly as without the field — the same lines and bytes; nothing below
+   applies;
+3. missing: nothing reads the directory (it need not exist yet), every
+   tile's terrain starts at once, and a watcher looks for the marker every
+   250 ms. Once it is there the directory is read once and decoded with the
+   lines of *Building-tile decode* above, on a pool of the batch's size
+   beside the batch's own (whose threads may be waiting for that set);
+4. a tile whose terrain — sampling, `void_fill_m`, `buildings_file` burn — is
+   done before the set is decoded is **held**: its samples stay in memory,
+   unwritten, while all held tiles fit `buildings_hold_mb` (the table above:
+   default half of what the pool leaves, at most 4096 MB, at least one
+   tile — a 2 m tile of 0.1° is about 59 MB); a tile that does not fit waits
+   on its worker thread, which starts no other tile until the set is
+   decoded. When the first tile has to wait, stdout gets, once,
+
+   ```
+   [Buildings] waiting for the building tiles (<marker path>)
+   ```
+
+   (`<marker path>` = `buildings_pbf_dir` joined with the marker name as the
+   jobs give them);
+5. once the set is decoded, stdout gets, when a tile did wait,
+
+   ```
+   [Buildings] building tiles ready after <s.s> s
+   [Buildings] <n> tile(s) held (<m.m> MB) until the building tiles were ready
+   ```
+
+   (`<s.s>` = seconds since the waiting line, one decimal; the second line
+   gains `; <k> more waited on their worker threads (hold budget <b.b> MB
+   full)` when `<k>` tiles waited on their workers), and the held tiles are
+   burnt and written in the order they finished — on as many threads as the
+   batch has workers, beside every worker that comes free — then every later
+   tile inline, as without the field. Each tile's `[Tile] … covered=` /
+   `voids=`, `[Info] buildings_pbf_dir:` and `[Rust] Progress:` lines come
+   as it is written, so none before its buildings are ready; the `.abt`
+   bytes are those of a batch whose directory was complete at launch;
+6. when the marker is still missing `buildings_pbf_wait_s` (default 1800)
+   seconds after the first look, fails — the jobs asked for buildings, and a
+   batch without them is never silent: exit 1 with, on stderr,
+
+   ```
+   Error: Building tiles not ready: the marker file <marker path> (buildings_pbf_ready) did not appear within <w> s (buildings_pbf_wait_s); the ingest fails rather than write tiles without their buildings
+   ```
+
+   (one line; match the `Building tiles not ready:` prefix). A directory that
+   does not decode once its marker is there fails the batch the same way
+   with the decode's error, as at launch (e.g. `buildings_pbf_dir mixes zoom
+   levels (14 and 15); expected exactly one`). Either way the held tiles are
+   dropped, the waiting workers released, every tile not yet started is
+   skipped and every one being sampled stops at its next band; since no tile
+   of the directory is written before its set is ready, **the batch leaves
+   no tile of that directory behind** — no `.abt`, no `*.tmp-*` file, no
+   `[Tile]`, `[Error] Failed to process tile:` or `[Rust] Progress:` line
+   for them. Tiles of other jobs of a mixed batch (no `buildings_pbf_dir`,
+   or one decoded at launch) written before keep their files and lines.
+
+A held tile's `[Rust] tile …` diagnostic line counts its terrain and its
+burn in `total`, not the wait between (§1.2).
+
+**The caller's side.** As for the download (§9b): write the marker **last**,
+once every tile file is complete and closed — the directory is read once,
+right after the marker is seen; delete a marker left from an earlier run (or
+use a fresh directory or marker name) before launching — a marker that
+already exists counts; a caller whose fetch failed stops the batch (kills
+it) or lets the wait run out rather than write the marker over an
+incomplete directory. Killed while it waits, the batch has written no tile
+of the directory (its other jobs' tiles may be there).
+
+**Not affected:** a batch without `buildings_pbf_ready`, byte for byte and
+line for line — `buildings_pbf_wait_s` and `buildings_hold_mb` alone are not
+read; a batch whose marker is there at launch; the single-job form, which
+refuses the field before anything is read (exit 1):
+
+```
+buildings_pbf_ready "<v>" is read by a batch ingest only (a JSON array of jobs): a single job decodes its buildings_pbf_dir before its tile, as it finds it — complete the directory before launching the job, or pass the job as a one-job array
+```
+
+(it reads its directory before its tile, as it finds it, so ignoring the
+marker would burn a directory that is still being fetched; a one-job array
+takes the field).
 
 **Building write rule (both sources).** Every height off the ladder above is
 normalised to an absolute roof elevation — an above-ground rung by adding the
@@ -2674,7 +3119,7 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `zoom` | u32 | **required** | XYZ zoom level. |
 | `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). A full run (not a repair) also keeps its output files open for the run, so the raise asks for one descriptor per output tile on top; where they do not fit beside the connections' descriptors, the connections keep theirs and each write opens its file instead, printing `[Download] open-file limit <l>: <n> output tiles are opened for each write instead of held open (<d> descriptors would not fit)` (changelog 39). |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes (with `buildings_pbf_ready`, once its marker exists). All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
-| `buildings_pbf_ready` | string? | optional | Additive, changelog 45, `aether_converter` ≥ 0.2.10 (older builds ignore it: gate on §1.5). One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the job downloads the terrain: nothing reads the directory before the buildings post-pass (it need not exist at launch), and the post-pass first waits for the file — see *Building tiles fetched during the download* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the job before any request. Absent or `null`: the post-pass reads the directory as it finds it, as before. CLI `download` full runs only; repair jobs and the in-memory/WASM downloaders ignore it. |
+| `buildings_pbf_ready` | string? | optional | Additive, changelog 45, `aether_converter` ≥ 0.2.10 (older builds ignore it: gate on §1.5). One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the job downloads the terrain: nothing reads the directory before the buildings post-pass (it need not exist at launch), and the post-pass first waits for the file — see *Building tiles fetched during the download* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the job before any request. Absent or `null`: the post-pass reads the directory as it finds it, as before. CLI `download` full runs only; repair jobs and the in-memory/WASM downloaders ignore it. A batch `ingest` takes the same field, with the same meaning, since 0.2.12 (§9a, changelog 48). |
 | `buildings_pbf_wait_s` | number? | optional | Additive, changelog 45, ≥ 0.2.10. Seconds the post-pass waits for `buildings_pbf_ready`, counted from its first look; absent or `null` → **1800**. Must be 0 … 86400, else the job fails before any request: `buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` (alone it changes nothing). |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
@@ -2768,7 +3213,9 @@ The CLI `download` then:
    per-tile deadline, parent fill and classification, and prints the normal
    protocol restricted to them — `[Download] <pct>% (<done>/<n>) …`,
    `[Degraded] …`, the `[Stats]` block with `<total>` = the number of listed
-   tiles — preceded by
+   tiles; no `[Tile] … voids=` line (changelog 46: a repair patches pixels
+   of files it does not rewrite, so a consumer re-counts them or treats
+   their voids as unknown) — preceded by
    `[Download] repair: z=<z> <n> source tile(s) into <m> existing output tile(s) connections=<c>`
    and followed by
    `[Download] repair: <p> px rewritten in <k> output tile(s)` (and, when some
@@ -2860,9 +3307,16 @@ pack opened for writing with share mode `FILE_SHARE_READ`, which refuses
 every other writer and admits readers), appends the bodies in one write,
 then writes their index entries in place, and closes the file (which
 releases the lock; the OS releases it when a process dies, so no lock
-outlives its writer). A pack another writer holds for 10 s is not written by
-this run (one `[Warn] cache_dir …` line per run); the run goes on. Several
-converter processes may use one cache at once. **Reading** takes no lock and
+outlives its writer). Under the lock it first reads what each target slot
+holds: a derived tile (status 3, *Deriving* below) is not written into a
+slot that holds a body matching its CRC (status 1) or a 404 (status 2) —
+another process may have stored the service's own tile since this run
+judged the tile derivable from its index — nor after a real answer for the
+same slot in the same batch; a real answer replaces anything (≥ 0.2.12,
+changelog 48f; an older converter writes blindly, last writer winning). A
+pack another writer holds for 10 s is not written by this run (one `[Warn]
+cache_dir …` line per run); the run goes on. Several converter processes may
+use one cache at once. **Reading** takes no lock and
 validates every entry: the header must name this very zoom/column/yblock
 and version 1, a present or derived body must lie past the index and inside
 the file and match its CRC, a 404 entry must have length and CRC 0 (any
@@ -2931,7 +3385,8 @@ the last lines of the `[Stats]` block,
 
 (the first always, `<hits>` counting the derived tiles too, so `<hits> +
 <fetched>` = the pass `<total>`, and `<written>` counting derived tiles and
-their intermediates; the second only when the parent fill asked for coarser
+their intermediates — those written: since 0.2.12 not one a real entry kept
+out (*Writing* above); the second only when the parent fill asked for coarser
 tiles). Before 0.2.9 neither `[Download] cache:` nor `[Stats] Cache:` had
 the `(… derived)` part; both always carry it now, `(0 derived)` included. A
 directory that cannot be
@@ -3253,7 +3708,7 @@ Every release from the first signed engine release on also publishes
 | WASM backend selection | `AETHER/rust/aether_core_wasm/src/lib.rs` |
 | `.abt` writer, disk-space string, download job | `crates/aether_converter/src/{download.rs,ingest.rs}` |
 | `probe` (`aether-probe/1`), its GDAL cross-check | `crates/aether_converter/src/probe.rs`, `tools/probe_vs_gdal.py`, `schemas/probe_output.schema.json` |
-| `[Tile]` line, atomic tile replacement | `crates/aether_converter/src/{main.rs,ingest.rs}` (`TileFile`) |
+| `[Tile]` lines (ingest coverage and voids; `download` voids), atomic tile replacement | `crates/aether_converter/src/{main.rs,ingest.rs}` (`TileFile`, `TileStats::void_px`), `crates/aether_converter/src/download.rs` (`print_tile_void_lines`) |
 | ATIL reader, GeoTIFF export | `crates/aether_export/src/main.rs` |
 | `.vix` writer, ATIL reader, COG output | `crates/aether_aggregate/src/{aggregate.rs,reader.rs,writer.rs}` |
 | `.vix` reader (consumer) | `MPT_SIGMA/…/core/vix_reader.py` |

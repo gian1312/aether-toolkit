@@ -9,10 +9,19 @@
 //! where they always went (stdout for ingest, stderr for download), so a
 //! plain CLI run is unchanged.
 //!
-//! Only lines that are explicitly diagnostic go through here. Parsed lines
-//! (`[Rust] Progress:`, `[Tile]`, `[Download] <pct>%`, `[Degraded]`,
-//! `[Stats] …`, `[Warn] …`) and the one-per-run summaries
+//! Only lines that are explicitly diagnostic go through here ([`out`],
+//! [`err`]). Parsed lines (`[Rust] Progress:`, `[Tile]`, `[Download] <pct>%`,
+//! `[Degraded]`, `[Stats] …`, `[Warn] …`) and the one-per-run summaries
 //! (`[Rust] run: …`) stay on their streams.
+//!
+//! A download's progress record is the exception that is kept twice
+//! (CONTRACT changelog 46): its `[Download] <pct>%` lines, the `[Download]
+//! STALL …` / `[Download] first …` / `[Degraded] …` lines and the `[Stats]`
+//! block stay on stderr exactly as before and, when `AETHER_DIAG_FILE` is
+//! set, are ALSO appended to the file ([`err_kept`]) — a GUI that shows only
+//! every tenth progress line loses nothing. So, since changelog 48, are the
+//! `[Tile] <name> voids=<n>` lines of `download` (stderr, [`err_kept`]) and
+//! of a batch `ingest` (stdout, [`keep`]).
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -75,6 +84,45 @@ pub fn err(line: &str) {
     match sink() {
         Sink::Console => eprintln!("{line}"),
         Sink::File(w) => write_file(w, line),
+    }
+}
+
+/// A **parsed** stderr line that the diagnostic file keeps as well
+/// (CONTRACT changelog 46): printed on stderr exactly as `eprintln!` prints
+/// it, and — when `AETHER_DIAG_FILE` is set — appended to that file too,
+/// unchanged (no prefix, line-flushed). Unset: just the stderr line.
+///
+/// Both writes happen under stderr's lock, so the file keeps the lines in
+/// stderr's order even when several threads print. The sink is resolved
+/// before the lock is taken (its first use may print a `[Warn]`). A caller
+/// that already holds stderr's lock (the progress line, which takes its
+/// count under it) must have resolved the sink before, e.g. by calling
+/// [`to_file`] once at the start of the run — a lookup of the resolved sink
+/// never blocks.
+pub fn err_kept(line: &str) {
+    let file = match sink() {
+        Sink::File(w) => Some(w),
+        Sink::Console => None,
+    };
+    let _in_order = std::io::stderr().lock();
+    // `eprintln!` re-takes the (reentrant) lock this thread holds.
+    eprintln!("{line}");
+    if let Some(w) = file {
+        write_file(w, line);
+    }
+}
+
+/// A **parsed** line the caller prints on its console stream itself — under
+/// that stream's lock, with the lines it belongs with — that the diagnostic
+/// file keeps as well (CONTRACT changelog 48: a batch `ingest`'s `[Tile]
+/// <name> voids=<n>` line, written on stdout with its covered and progress
+/// lines): appended to the file unchanged (no prefix, line-flushed) when
+/// `AETHER_DIAG_FILE` is set, else nothing. Called under the console lock,
+/// the file keeps the console's order. The sink's first use may print a
+/// `[Warn]` on stderr, never on stdout.
+pub fn keep(line: &str) {
+    if let Sink::File(w) = sink() {
+        write_file(w, line);
     }
 }
 

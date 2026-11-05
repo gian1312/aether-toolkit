@@ -113,8 +113,15 @@ impl BatchTally {
                 self.covered.fetch_add(stats.covered_px, Ordering::Relaxed);
                 // Parsed by the Waveshed plugin (CONTRACT §1.2, changelog 33):
                 // per-tile coverage, so a tile the sources never reached is
-                // known as void without opening it.
-                tile_line = Some(format!("[Tile] {} covered={}/{}", tile_name, stats.covered_px, stats.total_px));
+                // known as void without opening it. Then, as a line of its
+                // own (an older plugin's pattern ends the covered line at
+                // `covered=<a>/<b>`), the void samples the written file holds
+                // — at or below -5000 half-metres, after `void_fill_m` and the
+                // building burns (changelog 46).
+                tile_line = Some((
+                    format!("[Tile] {tile_name} covered={}/{}", stats.covered_px, stats.total_px),
+                    format!("[Tile] {tile_name} voids={}", stats.void_px),
+                ));
             }
             Err(e) => {
                 // `{:#}` prints the whole cause chain ("loading source …:
@@ -133,8 +140,12 @@ impl BatchTally {
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             let curr = self.progress.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(line) = &tile_line {
-                let _ = writeln!(out, "{}", line);
+            if let Some((covered, voids)) = &tile_line {
+                let _ = writeln!(out, "{}", covered);
+                let _ = writeln!(out, "{}", voids);
+                // The voids line is kept in `AETHER_DIAG_FILE` too, in
+                // stdout's order (changelog 48); the covered line is not.
+                diag::keep(voids);
             }
             if curr % 10 == 0 || curr == self.total {
                 let _ = writeln!(out, "[Rust] Progress: {}/{}", curr, self.total);
@@ -176,6 +187,27 @@ fn pbf_decoded_line(set: &buildings::PbfBuildingSet, secs: f64) -> String {
         "[Rust] Building tiles decoded: {} tile(s), {} building(s) in {:.1} s",
         set.tiles_found, set.decoded, secs
     )
+}
+
+/// Decode the building directory *dir* for a batch, with its lines (CONTRACT
+/// §9a, changelog 44): the start line, a progress line every
+/// [`PBF_PROGRESS_EVERY`] tiles, the summary line. On *pool* — the batch's
+/// at launch; a pool of its size beside it when the directory is decoded
+/// late (`buildings_pbf_ready`, changelog 48) — or, without one, on rayon's
+/// global pool.
+#[cfg(feature = "native")]
+fn decode_building_dir(pool: Option<&rayon::ThreadPool>, dir: &std::path::Path) -> anyhow::Result<buildings::PbfBuildingSet> {
+    use std::io::Write;
+    println!("[Rust] Decoding building tiles in {:?} (once for the run)...", dir);
+    let t0 = std::time::Instant::now();
+    let load = || buildings::load_pbf_building_dir_with_progress(dir, &print_pbf_decode_progress);
+    let set = match pool {
+        Some(pool) => pool.install(load),
+        None => load(),
+    }?;
+    println!("{}", pbf_decoded_line(&set, t0.elapsed().as_secs_f64()));
+    let _ = std::io::stdout().flush();
+    Ok(set)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -240,6 +272,10 @@ fn main() -> anyhow::Result<()> {
                 for job in &jobs {
                     job.effective_sources()?;
                 }
+                // The building-tile hand-over (`buildings_pbf_ready`,
+                // changelog 48): every job's fields, and one hand-over per
+                // directory, checked before anything is read.
+                let markers = ingest::buildings_ready::batch_markers(&jobs)?;
 
                 // --- THREAD COUNT FROM A PER-JOB MEMORY ESTIMATE ---
                 // Each tile streams its sources in row bands bounded by the
@@ -303,21 +339,41 @@ fn main() -> anyhow::Result<()> {
                 // as far as the result goes, with a progress line every
                 // PBF_PROGRESS_EVERY tiles — nothing at all was printed during
                 // the decode, so the plugin's progress bar froze.
+                //
+                // A directory whose `buildings_pbf_ready` marker is missing at
+                // this first look (changelog 48) is not decoded here: it is
+                // watched while the tiles start, and decoded when the marker
+                // appears. A marker that is there decodes now, as without one.
                 let mut pbf_sets: HashMap<PathBuf, buildings::PbfBuildingSet> = HashMap::new();
+                let mut watched: Vec<ingest::buildings_ready::Watched> = Vec::new();
                 for job in &jobs {
                     if let Some(dir) = &job.buildings_pbf_dir {
-                        if !pbf_sets.contains_key(dir) {
-                            println!("[Rust] Decoding building tiles in {:?} (once for the run)...", dir);
-                            let t0 = std::time::Instant::now();
-                            let set = pool.install(|| {
-                                buildings::load_pbf_building_dir_with_progress(dir, &print_pbf_decode_progress)
-                            })?;
-                            println!("{}", pbf_decoded_line(&set, t0.elapsed().as_secs_f64()));
-                            let _ = std::io::stdout().flush();
-                            pbf_sets.insert(dir.clone(), set);
+                        if pbf_sets.contains_key(dir) || watched.iter().any(|w| &w.dir == dir) {
+                            continue;
                         }
+                        if let Some(Some((marker, wait))) = markers.get(dir) {
+                            let first_look = std::time::Instant::now();
+                            if !download::buildings_marker_present(marker) {
+                                watched.push(ingest::buildings_ready::Watched {
+                                    dir: dir.clone(),
+                                    marker: marker.clone(),
+                                    wait: *wait,
+                                    first_look,
+                                });
+                                continue;
+                            }
+                        }
+                        let set = decode_building_dir(Some(&pool), dir)?;
+                        pbf_sets.insert(dir.clone(), set);
                     }
                 }
+                // The tiles finished before their building set is decoded are
+                // held, up to this budget (changelog 48).
+                let handover = (!watched.is_empty()).then(|| {
+                    let dirs: Vec<PathBuf> = watched.iter().map(|w| w.dir.clone()).collect();
+                    let budget = ingest::buildings_ready::hold_budget(&jobs, &dirs, available_ram, safe_threads, per_job);
+                    ingest::buildings_ready::BuildingsHandOver::new(budget, safe_threads, watched)
+                });
 
                 let total = jobs.len();
                 let tally = Arc::new(BatchTally {
@@ -335,30 +391,76 @@ fn main() -> anyhow::Result<()> {
                 // buffers are reused by the next tiles (one per thread).
                 let writer = ingest::TileWriter::new((safe_threads / 2).clamp(1, 4), safe_threads);
 
-                // Run all jobs in parallel using the constrained pool
-                pool.install(|| {
-                    jobs.into_par_iter().for_each(|job| {
-                        let pbf = match &job.buildings_pbf_dir {
-                            Some(dir) => pbf_sets.get(dir),
-                            None => None,
-                        };
-                        // The output's file name, for the per-tile line below
-                        // (the job moves into process_tile_batched).
-                        let tile_name = job
-                            .output_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| job.output_path.display().to_string());
-                        let tally = tally.clone();
-                        ingest::process_tile_batched(
-                            job,
-                            texture_cache.clone(),
-                            pbf,
-                            &opts,
-                            &writer,
-                            Box::new(move |result| tally.tile_done(&tile_name, result)),
-                        );
+                // A watched directory is decoded on a pool of the batch's
+                // size beside the batch's own, whose threads may be waiting
+                // for that very set (changelog 48).
+                let decode_late = |dir: &std::path::Path| -> anyhow::Result<buildings::PbfBuildingSet> {
+                    match rayon::ThreadPoolBuilder::new()
+                        .num_threads(safe_threads)
+                        .thread_name(|i| format!("aether-pbf-{i}"))
+                        .build()
+                    {
+                        Ok(late_pool) => decode_building_dir(Some(&late_pool), dir),
+                        Err(_) => decode_building_dir(None, dir),
+                    }
+                };
+                let handed_over: anyhow::Result<()> = std::thread::scope(|s| {
+                    // One watcher per watched directory, from the start.
+                    let (decode_late, writer_ref) = (&decode_late, &writer);
+                    let watchers: Vec<_> = handover
+                        .iter()
+                        .flat_map(|h| (0..h.gates()).map(move |g| (h, g)))
+                        .map(|(h, g)| s.spawn(move || h.watch(g, decode_late, writer_ref)))
+                        .collect();
+
+                    // Run all jobs in parallel using the constrained pool
+                    pool.install(|| {
+                        jobs.into_par_iter().for_each(|job| {
+                            // A panicking tile must not leave the workers
+                            // waiting for building tiles (changelog 48).
+                            let _unwinding = handover.as_ref().map(|h| h.cancel_on_panic());
+                            // The output's file name, for the per-tile line below
+                            // (the job moves into process_tile_batched).
+                            let tile_name = job
+                                .output_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| job.output_path.display().to_string());
+                            let tally = tally.clone();
+                            let done: ingest::TileDone = Box::new(move |result| tally.tile_done(&tile_name, result));
+                            let gate = handover
+                                .as_ref()
+                                .and_then(|h| Some((h, h.gate_of(job.buildings_pbf_dir.as_deref()?)?)));
+                            match gate {
+                                Some((h, g)) => h.process(g, job, texture_cache.clone(), &opts, &writer, done),
+                                None => {
+                                    // A failed hand-over fails the run: no
+                                    // further tile starts.
+                                    if handover.as_ref().is_some_and(|h| h.aborted()) {
+                                        return;
+                                    }
+                                    let pbf = match &job.buildings_pbf_dir {
+                                        Some(dir) => pbf_sets.get(dir),
+                                        None => None,
+                                    };
+                                    ingest::process_tile_batched(job, texture_cache.clone(), pbf, &opts, &writer, done);
+                                }
+                            }
+                        });
                     });
+                    // The watchers end once their tiles are burnt and handed
+                    // to the writers, or the run failed.
+                    let mut first_error = None;
+                    for w in watchers {
+                        match w.join() {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                first_error.get_or_insert(e);
+                            }
+                            Err(panic) => std::panic::resume_unwind(panic),
+                        }
+                    }
+                    first_error.map_or(Ok(()), Err)
                 });
                 // Every tile is reported before the batch result is decided.
                 writer.finish();
@@ -368,6 +470,9 @@ fn main() -> anyhow::Result<()> {
                 // one by one here — a file-system round trip each on a
                 // network share or a 9p mount.
                 std::mem::forget(opts);
+                // A marker that never came, or a directory that did not
+                // decode: no tile of that directory was written (changelog 48).
+                handed_over?;
 
                 // Fail loudly if any tile could not be produced, so callers
                 // don't treat a partial/terrain-less batch as success.

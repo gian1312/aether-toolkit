@@ -3,7 +3,13 @@
 //! of stdout; every parsed line (`[Tile]`, `[Rust] Progress:`) and the
 //! one-per-run `[Rust] run:` summary stay on stdout. Unset, the lines are on
 //! stdout as before; a file that cannot be opened costs one `[Warn]` and the
-//! lines fall back to the console.
+//! lines fall back to the console. A `download`'s progress record —
+//! `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and the `[Stats]`
+//! block — stays on stderr and is ALSO kept in the file (changelog 46), and
+//! so are the `[Tile] <name> voids=<n>` lines of a download (stderr) and of
+//! a batch ingest (stdout; changelog 48) — not the ingest's covered lines.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -77,7 +83,9 @@ fn tile_lines(text: &str) -> Vec<&str> {
 
 /// The parsed and summary lines a batch must keep on stdout.
 fn assert_stdout_keeps_the_parsed_lines(stdout: &str) {
-    assert_eq!(stdout.lines().filter(|l| l.starts_with("[Tile] ")).count(), 2, "{stdout}");
+    // Per tile its covered line and (changelog 46) its voids line.
+    assert_eq!(stdout.lines().filter(|l| l.starts_with("[Tile] ") && l.contains(" covered=")).count(), 2, "{stdout}");
+    assert_eq!(stdout.lines().filter(|l| l.starts_with("[Tile] ") && l.contains(" voids=")).count(), 2, "{stdout}");
     assert!(stdout.lines().any(|l| l == "[Rust] Progress: 2/2"), "{stdout}");
     assert!(stdout.lines().any(|l| l.starts_with("[Rust] Batch processing 2 tiles")), "{stdout}");
     assert!(stdout.lines().any(|l| l.starts_with("[Rust] Rayon Pool: ")), "{stdout}");
@@ -103,6 +111,14 @@ fn diag_lines_go_to_the_file_and_parsed_lines_stay_on_stdout() {
 
     let logged = std::fs::read_to_string(&diag).unwrap();
     assert!(logged.starts_with("earlier line\n"), "{logged}");
+    // The voids lines are kept in the file as well (changelog 48): byte for
+    // byte stdout's, in stdout's order; the covered lines are not.
+    let voids = |text: &str| -> Vec<String> {
+        text.lines().filter(|l| l.starts_with("[Tile] ") && l.contains(" voids=")).map(str::to_owned).collect()
+    };
+    assert_eq!(voids(&stdout).len(), 2, "{stdout}");
+    assert_eq!(voids(&logged), voids(&stdout), "the diag file must keep the voids lines:\n{logged}");
+    assert!(!logged.contains(" covered="), "{logged}");
     let lines = tile_lines(&logged);
     assert_eq!(lines.len(), 2, "{logged}");
     for l in &lines {
@@ -127,7 +143,10 @@ fn diag_lines_go_to_the_file_and_parsed_lines_stay_on_stdout() {
     let run: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[Rust] run: ")).collect();
     assert_eq!(run.len(), 1, "{stdout}");
     assert!(!run[0].contains(", threads ") && run[0].contains(", blocked ~"), "{}", run[0]);
-    assert_eq!(tile_lines(&std::fs::read_to_string(&diag).unwrap()).len(), 3);
+    let logged = std::fs::read_to_string(&diag).unwrap();
+    assert_eq!(tile_lines(&logged).len(), 3);
+    // The single job prints no `[Tile]` line, so keeps none.
+    assert_eq!(voids(&logged).len(), 2, "{logged}");
 }
 
 #[test]
@@ -157,4 +176,109 @@ fn an_unopenable_diag_file_warns_once_and_falls_back_to_the_console() {
     for out in &outs {
         assert!(out.exists(), "{out:?} was not written");
     }
+}
+
+// ── download: the progress record is kept in the file too (changelog 46) ────
+
+/// Whether *line* is one a `download` keeps in the diag file as well.
+fn kept_by_download(line: &str) -> bool {
+    let progress = line.strip_prefix("[Download] ").and_then(|r| r.split_once("% (")).is_some_and(|(pct, _)| pct.parse::<u32>().is_ok());
+    progress
+        || line.starts_with("[Download] STALL ")
+        || line.starts_with("[Download] (suppressing further stall warnings")
+        || line.starts_with("[Download] first ")
+        || line.starts_with("[Degraded] ")
+        || line.starts_with("[Stats] ")
+        // changelog 48
+        || (line.starts_with("[Tile] ") && line.contains(" voids="))
+}
+
+#[test]
+fn a_downloads_progress_record_is_also_appended_to_the_diag_file() {
+    use aether_converter::download::{lat2ty, lon2tx};
+    use common::{serve_tiles_delayed, terrarium_png, tile_ground};
+    const Z: u32 = 12;
+    // Two 256 px tiles at 60 m: a 4 x 3 block of z12 source tiles.
+    let (ul_lat, ul_lon, size, res) = (47.01, 8.03, 256usize, 60.0);
+    let pd = res / 111_111.0;
+    let (x0, x1) = (lon2tx(ul_lon, Z), lon2tx(ul_lon + 2.0 * size as f64 * pd, Z));
+    let (y0, y1) = (lat2ty(ul_lat, Z), lat2ty(ul_lat - size as f64 * pd, Z));
+    assert!(x1 > x0 && y1 > y0, "the outputs must span several source tiles");
+    // Three tiles that are not the run's first (the edge probe): one that
+    // does not decode, one 5.5 s late (a STALL), one silent past the 8 s
+    // deadline (a timeout); their z11 parents fill the two that fail.
+    let (bad, slow, dead) = ((x1, y1), (x1, y0), (x0, y1));
+    let (port, _) = serve_tiles_delayed(move |z, x, y| match z {
+        11 => Some((terrarium_png(tile_ground(z, x, y)), 0)),
+        Z if (x, y) == bad => Some((b"not a tile".to_vec(), 0)),
+        Z if (x, y) == slow => Some((terrarium_png(tile_ground(z, x, y)), 5500)),
+        Z if (x, y) == dead => Some((terrarium_png(tile_ground(z, x, y)), 60_000)),
+        Z => Some((terrarium_png(tile_ground(z, x, y)), 0)),
+        _ => None,
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let tiles: Vec<serde_json::Value> = (0..2)
+        .map(|i| serde_json::json!({
+            "filename": format!("t{i}.abt"), "ul_lat": ul_lat, "ul_lon": ul_lon + (i * size) as f64 * pd,
+            "size_px": size, "resolution_m": res,
+        }))
+        .collect();
+    let job = dir.path().join("job.json");
+    std::fs::write(&job, serde_json::to_vec(&serde_json::json!({
+        "url_template": format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}.png"),
+        "encoding": "terrarium", "output_dir": dir.path().join("out"), "zoom": Z,
+        "max_connections": 16, "tile_deadline_s": 8, "tiles": tiles,
+    })).unwrap()).unwrap();
+    let diag = dir.path().join("diag.log");
+    std::fs::write(&diag, "earlier line\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_aether_converter"))
+        .args(["download", "--job-file"]).arg(&job).env(ENV, &diag).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+    let logged = std::fs::read_to_string(&diag).unwrap();
+    assert!(logged.starts_with("earlier line\n"), "appended, never truncated:\n{logged}");
+
+    // stderr is what it was: every whole percent, then the summary.
+    let total = (x1 - x0 + 1) as usize * (y1 - y0 + 1) as usize;
+    let progress: Vec<&str> = stderr.lines().filter(|l| kept_by_download(l) && l.contains("% (")).collect();
+    let due = (1..=total).filter(|&d| d * 100 / total > (d - 1) * 100 / total || d == total).count();
+    assert_eq!(progress.len(), due, "{stderr}");
+    assert!(progress.last().unwrap().starts_with(&format!("[Download] 100% ({total}/{total}) — ")), "{stderr}");
+    for needle in [
+        format!("[Download] STALL tile z={Z}/x={}/y={}: ", slow.0, slow.1),
+        format!("[Download] first timeout: z={Z}/x={}/y={}", dead.0, dead.1),
+        format!("[Download] first decode error: z={Z}/x={}/y={} — ", bad.0, bad.1),
+        format!("[Degraded] z={Z} x={} y={} reason=timeout filled_from=z11", dead.0, dead.1),
+        format!("[Degraded] z={Z} x={} y={} reason=decode filled_from=z11", bad.0, bad.1),
+        format!("[Stats] Tiles: {}/{total} OK", total - 2),
+        format!("[Stats] DEGRADED: 2 of {total} source tile(s)"),
+        // The slow tile, and the silent one: it waited its 8 s for a first byte.
+        format!("[Download] STALL tile z={Z}/x={}/y={}: first byte after ", dead.0, dead.1),
+        format!("[Stats] STALL: 2 of {total} tile(s)"),
+    ] {
+        assert!(stderr.lines().any(|l| l.starts_with(&needle)), "{needle:?} missing on stderr:\n{stderr}");
+    }
+
+    // One voids line per output on stderr (changelog 46), before the
+    // `[Stats]` block — and in the file (changelog 48).
+    let voids: Vec<&str> = stderr.lines().filter(|l| l.starts_with("[Tile] ") && l.contains(" voids=")).collect();
+    assert_eq!(voids.len(), 2, "{stderr}");
+    assert!(voids[0].starts_with("[Tile] t0.abt voids=") && voids[1].starts_with("[Tile] t1.abt voids="), "{voids:?}");
+    assert_eq!(logged.lines().filter(|l| voids.contains(l)).count(), 2, "{logged}");
+
+    // The file keeps exactly those lines too, byte for byte, in stderr's
+    // order — and besides them only the diagnostics it always had.
+    let mine: Vec<&str> = stderr.lines().filter(|l| kept_by_download(l)).collect();
+    let theirs: Vec<&str> = logged.lines().skip(1).filter(|l| kept_by_download(l)).collect();
+    assert!(mine.len() > total, "{stderr}");
+    assert_eq!(theirs, mine, "the diag file must hold the same lines in the same order");
+    for l in logged.lines().skip(1).filter(|l| !kept_by_download(l)) {
+        assert!(
+            l.starts_with("[Strip ") || l.starts_with("[StripMem ") || l.starts_with("[Download] launch gate closed for "),
+            "unexpected line in the diag file: {l:?}"
+        );
+        assert!(!stderr.contains(l), "a diagnostic line is in the file instead of on stderr: {l:?}");
+    }
+    assert!(logged.contains("[Download] launch gate closed for "), "{logged}");
 }

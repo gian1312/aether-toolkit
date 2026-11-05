@@ -380,3 +380,42 @@ pub fn run_download_cli(job_file: &Path) -> (bool, String) {
         .args(["download", "--job-file"]).arg(job_file).output().unwrap();
     (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
+
+// ── Building tiles (MVT) ────────────────────────────────────────────────────
+
+/// ZigZag encoding of an MVT parameter integer.
+fn mvt_zz(n: i32) -> u32 {
+    ((n << 1) ^ (n >> 31)) as u32
+}
+
+/// A `building` layer (extent 4096): one polygon per `(render_height, ring)`,
+/// the ring in tile units with y down (clockwise = exterior), as the other
+/// building tests write them.
+pub fn mvt_building_tile(features: &[(f64, Vec<(i32, i32)>)]) -> Vec<u8> {
+    use aether_converter::mvt::{Feature, Layer, Tile, Value};
+    use prost::Message;
+    let mut values = Vec::new();
+    let mut feats = Vec::new();
+    for (i, (h, r)) in features.iter().enumerate() {
+        values.push(Value { double_val: Some(*h), ..Default::default() });
+        let mut geometry = vec![(1 << 3) | 1, mvt_zz(r[0].0), mvt_zz(r[0].1), (((r.len() - 1) as u32) << 3) | 2];
+        let mut c = r[0];
+        for &p in &r[1..] {
+            geometry.extend([mvt_zz(p.0 - c.0), mvt_zz(p.1 - c.1)]);
+            c = p;
+        }
+        geometry.push((1 << 3) | 7);
+        feats.push(Feature { id: Some(i as u64 + 1), tags: vec![0, i as u32], r#type: Some(3), geometry });
+    }
+    Tile {
+        layers: vec![Layer {
+            name: "building".into(),
+            features: feats,
+            keys: vec!["render_height".into()],
+            values,
+            extent: Some(4096),
+            version: Some(2),
+        }],
+    }
+    .encode_to_vec()
+}

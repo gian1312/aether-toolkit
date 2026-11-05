@@ -344,6 +344,9 @@ const NO_TILE_M: f32 = -1.0e30;
 /// The `.abt` no-data sentinel, shared with the ingest path — one convention
 /// for "no terrain here" across both writers (§6 of the contract).
 use crate::ingest::VOID_ELEV;
+/// The floor a `[Tile] … voids=` count takes in (changelog 46; CLI only).
+#[cfg(feature = "native")]
+use crate::ingest::VOID_FLOOR;
 
 // Assembly resampling ---------------------------------------------------------
 //
@@ -512,6 +515,32 @@ fn void_row_bytes(size_px: usize, stride: usize) -> Vec<u8> {
         row[x * 2..x * 2 + 2].copy_from_slice(&void);
     }
     row
+}
+
+/// Bring an output `.abt` of `sz` rows of `stride` bytes to full length with
+/// void rows ([`void_row_bytes`]): the rows after the last one the assembly
+/// wrote, which no tile-row covered. `AbtWriter::create` skips the `set_len`
+/// pre-allocation, and `set_len`'s zeros would read as 0 m sea level.
+/// Returns the number of rows written — each wholly void, for the tile's
+/// `[Tile] … voids=` count (changelog 46).
+#[cfg(feature = "native")]
+fn fill_tail_with_void(mut f: &File, sz: usize, stride: usize) -> Result<u64> {
+    let expected = 44 + stride as u64 * sz as u64;
+    let actual = f.metadata()?.len();
+    if actual >= expected {
+        return Ok(0);
+    }
+    // Rows are written whole, so the tail starts on a row boundary;
+    // a partial one (an interrupted flush) is rewritten from its start.
+    let written = actual.saturating_sub(44) / stride as u64;
+    let row = void_row_bytes(sz, stride);
+    f.seek(SeekFrom::Start(44 + written * stride as u64))?;
+    let mut w = BufWriter::with_capacity(1 << 20, f);
+    for _ in written..sz as u64 {
+        w.write_all(&row)?;
+    }
+    w.flush()?;
+    Ok(sz as u64 - written)
 }
 
 /// `1.0 / n`, from a table for the small counts a footprint actually has.
@@ -1105,10 +1134,11 @@ impl DownloadStats {
     }
 
     /// Tally one tile's final failure in its error class (after all retries).
-    /// Prints the one-per-class "first …" diagnostic line.
+    /// Prints the one-per-class "first …" diagnostic line (stderr, and the
+    /// `AETHER_DIAG_FILE` too — changelog 46).
     fn record_failure(&self, why: FetchFailure, z: u32, x: u32, y: u32, msg: &str) {
         let first = |prev: usize, what: &str| if prev == 0 {
-            eprintln!("[Download] first {what}: z={z}/x={x}/y={y} — {msg}");
+            crate::diag::err_kept(&format!("[Download] first {what}: z={z}/x={x}/y={y} — {msg}"));
         };
         match why {
             FetchFailure::Http(429) => { self.err_http_429.fetch_add(1, Ordering::Relaxed); }
@@ -1119,7 +1149,7 @@ impl DownloadStats {
             FetchFailure::Http(_) => { self.err_other.fetch_add(1, Ordering::Relaxed); }
             FetchFailure::Timeout => {
                 if self.err_timeout.fetch_add(1, Ordering::Relaxed) == 0 {
-                    eprintln!("[Download] first timeout: z={z}/x={x}/y={y}");
+                    crate::diag::err_kept(&format!("[Download] first timeout: z={z}/x={x}/y={y}"));
                 }
             }
             FetchFailure::Connect => first(self.err_connect.fetch_add(1, Ordering::Relaxed), "connect error"),
@@ -1158,14 +1188,18 @@ impl DownloadStats {
     }
 
     /// Count a stalled tile; prints its `[Download] STALL` line for the first
-    /// [`STALL_LINES`], then one suppression note (the summary counts all).
+    /// [`STALL_LINES`], then one suppression note (the summary counts all) —
+    /// on stderr, and in the `AETHER_DIAG_FILE` too (changelog 46).
     fn note_stall(&self, z: u32, x: u32, y: u32, t: &FetchTiming) {
         let prev = self.stalled.fetch_add(1, Ordering::Relaxed);
         if prev < STALL_LINES {
-            eprintln!("[Download] STALL tile z={z}/x={x}/y={y}: first byte after {:.1}s, \
-                       longest body gap {:.1}s", t.first_byte.as_secs_f64(), t.max_gap.as_secs_f64());
+            crate::diag::err_kept(&format!(
+                "[Download] STALL tile z={z}/x={x}/y={y}: first byte after {:.1}s, \
+                 longest body gap {:.1}s",
+                t.first_byte.as_secs_f64(), t.max_gap.as_secs_f64()
+            ));
         } else if prev == STALL_LINES {
-            eprintln!("[Download] (suppressing further stall warnings; [Stats] STALL counts them all)");
+            crate::diag::err_kept("[Download] (suppressing further stall warnings; [Stats] STALL counts them all)");
         }
     }
 
@@ -1210,32 +1244,37 @@ impl DownloadStats {
     /// that ran: [`Retries::Counted`] with that path's per-tile maximum, or
     /// [`Retries::Browser`] when the browser retried and nothing was counted.
     fn log_summary(&self, elapsed: f64, retries: Retries) {
+        // Every line of the block goes to stderr as before and, when
+        // `AETHER_DIAG_FILE` is set, into that file too (changelog 46).
+        macro_rules! out {
+            ($($arg:tt)*) => { crate::diag::err_kept(&format!($($arg)*)) };
+        }
         let ok = self.ok_count.load(Ordering::Relaxed);
         let total = self.total_tiles();
         let bytes = self.bytes_downloaded.load(Ordering::Relaxed);
         let mb = bytes as f64 / (1024.0 * 1024.0);
         let throughput = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
 
-        eprintln!("[Stats] Tiles: {}/{} OK ({:.1}% success)",
+        out!("[Stats] Tiles: {}/{} OK ({:.1}% success)",
             ok, total,
             if total > 0 { ok as f64 / total as f64 * 100.0 } else { 100.0 });
-        eprintln!("[Stats] Downloaded: {:.1} MB in {:.1}s = {:.1} MB/s",
+        out!("[Stats] Downloaded: {:.1} MB in {:.1}s = {:.1} MB/s",
             mb, elapsed, throughput);
         match retries {
-            Retries::Counted(max) => eprintln!("[Stats] Retries: {} (up to {} per failed tile)",
+            Retries::Counted(max) => out!("[Stats] Retries: {} (up to {} per failed tile)",
                 self.retries.load(Ordering::Relaxed), max),
-            Retries::Browser(max) => eprintln!("[Stats] Retries: not counted (the browser \
+            Retries::Browser(max) => out!("[Stats] Retries: not counted (the browser \
                 retries up to {} per failed tile)", max),
         }
         let repaired = self.backfilled.load(Ordering::Relaxed);
         if repaired > 0 {
-            eprintln!("[Stats] Repaired from coarser parent tiles: {} \
+            out!("[Stats] Repaired from coarser parent tiles: {} \
                        (missing at this zoom, present at a lower one)", repaired);
         }
         for line in self.degraded_summary_lines() {
-            eprintln!("{line}");
+            out!("{line}");
         }
-        eprintln!("[Stats] Peak concurrent requests: {}",
+        out!("[Stats] Peak concurrent requests: {}",
             self.peak_in_flight.load(Ordering::Relaxed));
 
         if total > 0 {
@@ -1255,21 +1294,21 @@ impl DownloadStats {
             } else {
                 String::new()
             };
-            eprintln!("[Stats] Tile latency: min={:.0}ms avg={:.0}ms max={:.0}ms{}",
+            out!("[Stats] Tile latency: min={:.0}ms avg={:.0}ms max={:.0}ms{}",
                 min_ms, avg_ms, max_ms, first_byte);
         }
         let stalled = self.stalled.load(Ordering::Relaxed);
         if stalled > 0 {
-            eprintln!("[Stats] STALL: {} of {} tile(s) waited > {} s for the first byte \
+            out!("[Stats] STALL: {} of {} tile(s) waited > {} s for the first byte \
                        or between body chunks", stalled, total, STALL_THRESHOLD.as_secs());
         }
         if let Some(line) = self.window_line.lock().ok().and_then(|g| g.clone()) {
-            eprintln!("{line}");
+            out!("{line}");
         }
 
         let errs = self.total_errors();
         if errs > 0 {
-            eprintln!("[Stats] ERRORS ({}): {}", errs, self.error_breakdown());
+            out!("[Stats] ERRORS ({}): {}", errs, self.error_breakdown());
 
             // No-data is not failure, so it gets its own machine-readable
             // line: callers (the Waveshed plugin parses this) turn it into a
@@ -1277,10 +1316,10 @@ impl DownloadStats {
             // level" warning instead of a network diagnosis.
             let n404 = self.no_data_count();
             if n404 > 0 {
-                eprintln!("[Stats] NO-DATA (HTTP 404): {} of {} tile(s) — the \
+                out!("[Stats] NO-DATA (HTTP 404): {} of {} tile(s) — the \
                            service has no data there; written as void", n404, total);
                 if ok == 0 && self.degraded_count() == 0 {
-                    eprintln!("[Stats] >>> every answered request was 404 — the \
+                    out!("[Stats] >>> every answered request was 404 — the \
                                area is entirely outside this service's coverage, \
                                or the source does not serve this zoom. The output \
                                is all void (0 m sea level where the consumer \
@@ -1294,20 +1333,20 @@ impl DownloadStats {
             let r429 = self.err_http_429.load(Ordering::Relaxed);
 
             if r429 > 0 {
-                eprintln!("[Stats] >>> Server rate-limiting detected (HTTP 429). Reduce download connections.");
+                out!("[Stats] >>> Server rate-limiting detected (HTTP 429). Reduce download connections.");
             }
             if t > total / 4 {
-                eprintln!("[Stats] >>> >25% timeouts — network saturated or server overloaded.");
+                out!("[Stats] >>> >25% timeouts — network saturated or server overloaded.");
             }
             if c > total / 10 {
-                eprintln!("[Stats] >>> >10% connection errors — too many connections for network/router.");
+                out!("[Stats] >>> >10% connection errors — too many connections for network/router.");
             }
         }
 
         // The raw source-tile cache (changelog 38; informational): last, so
         // every earlier line keeps its place in the block.
         for line in self.cache_lines.lock().map(|l| l.clone()).unwrap_or_default() {
-            eprintln!("{line}");
+            out!("{line}");
         }
     }
 }
@@ -2438,7 +2477,8 @@ async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
                     stats.record_failure(why, zoom, tx, ty, &msg);
                     let from = fill.coarsest_zoom.unwrap_or(zoom.saturating_sub(1));
                     if let Some(line) = stats.note_degraded(zoom, tx, ty, why, from) {
-                        eprintln!("{line}");
+                        // stderr, and the `AETHER_DIAG_FILE` too (changelog 46).
+                        crate::diag::err_kept(&line);
                     }
                 }
                 None => stats.record_failure(why, zoom, tx, ty, &msg),
@@ -2458,7 +2498,11 @@ async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
     // between 10 % lines. Tiles finish on several threads at once now, so
     // the count is taken and its line written under stderr's lock: the lines
     // reach the stream in count order, as they did when one thread ran a
-    // strip. (No await below: the lock never travels with the task.)
+    // strip. (No await below: the lock never travels with the task.) Each
+    // line also goes to the `AETHER_DIAG_FILE` when that is set (changelog
+    // 46), in the same order: the sink is resolved here, before the lock
+    // (see `diag::err_kept`).
+    crate::diag::to_file();
     {
         let _in_order = std::io::stderr().lock();
         let done = progress.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2471,12 +2515,12 @@ async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
             let errs = stats.total_errors();
             let in_fl = stats.in_flight.load(Ordering::Relaxed);
             // `window` is a trailing field (changelog 30): the plugin matches
-            // the prefix `[Download] <pct>% (<done>/<total>)`. `eprintln!`
+            // the prefix `[Download] <pct>% (<done>/<total>)`. `err_kept`
             // re-takes the (reentrant) lock this thread already holds.
-            eprintln!(
+            crate::diag::err_kept(&format!(
                 "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight, window {}",
                 pct, done, total, tp, errs, in_fl, gate.window()
-            );
+            ));
         }
     }
 
@@ -2607,10 +2651,11 @@ async fn download_strip_raw(
                     let tp = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
                     let errs = stats.total_errors();
                     let in_fl = stats.in_flight.load(Ordering::Relaxed);
-                    eprintln!(
+                    // stderr, and the `AETHER_DIAG_FILE` too (changelog 46).
+                    crate::diag::err_kept(&format!(
                         "[Download] {}% ({}/{}) — {:.1} MB/s, {} errors, {} in-flight",
                         pct, done, total, tp, errs, in_fl
-                    );
+                    ));
                 }
 
                 (tx, ty, result)
@@ -3852,6 +3897,14 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         specs
     };
     let outputs: Arc<Vec<Option<File>>> = Arc::new(files);
+    // The void samples each output holds — at or below `VOID_FLOOR` (-2500 m):
+    // the `VOID_ELEV` sentinel, and bathymetry a consumer fills like it — for
+    // its `[Tile] <name> voids=<n>` line (changelog 46): counted in the rows
+    // the assembly writes, as it writes them, plus the void rows of the tail
+    // fill, then lowered by what the buildings post-pass lifts above the
+    // floor — never by reading a file back. Each output row is written once
+    // (it samples exactly one tile-row), so the sums are the files' contents.
+    let tile_voids: Arc<Vec<AtomicU64>> = Arc::new(abt_specs.iter().map(|_| AtomicU64::new(0)).collect());
 
     // 4b. Assembly thread pool. One strip at a time on a quarter of the CPUs
     //     assembled ~450 tiles/s on 16 CPUs — the limit once the download
@@ -4157,6 +4210,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         assembly_handles.push(tokio::spawn({
             let specs = abt_specs.clone();
             let outputs = outputs.clone();
+            let tile_voids = tile_voids.clone();
             let pool = asm_pool.clone();
             let asm_sem = asm_semaphore.clone();
             let si = strip_idx + 1;
@@ -4229,8 +4283,10 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
 
                         // Sample + write output rows that fall within this tile-row.
                         // Parallel across sub-tiles (each writes to its own file).
+                        // Each sub-tile's rows come with the void samples they
+                        // hold (changelog 46), counted while the row is hot.
                         let grid_ref: &[f32] = &mini_grid;
-                        let per_tile: Vec<Vec<(u32, Vec<i16>)>> = pool.install(|| {
+                        let per_tile: Vec<(Vec<(u32, Vec<i16>)>, u64)> = pool.install(|| {
                             use rayon::prelude::*;
                             specs.par_iter().enumerate().map(|(sti, (spec, _))| {
                                 let pd = spec.resolution_m / 111_111.0;
@@ -4240,10 +4296,11 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
                                 // Skip sub-tiles that don't overlap this tile-row.
                                 let spec_bot = spec.ul_lat - sz as f64 * pd;
                                 if spec.ul_lat <= tr_bot || spec_bot >= tr_top {
-                                    return Vec::new();
+                                    return (Vec::new(), 0);
                                 }
 
-                                (0..sz).filter_map(|y| {
+                                let mut voids = 0u64;
+                                let rows = (0..sz).filter_map(|y| {
                                     let lat = spec.ul_lat - (y as f64 + 0.5) * pd;
                                     if lat > tr_top || lat <= tr_bot { return None; }
                                     let (r0, r1) = tile_row_span(
@@ -4259,14 +4316,16 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
                                             grid_ref, gw, c0 as usize, c1 as usize, r0, r1,
                                         );
                                     }
+                                    voids += row_data.iter().filter(|&&v| v <= VOID_FLOOR).count() as u64;
                                     Some((y as u32, row_data))
-                                }).collect()
+                                }).collect();
+                                (rows, voids)
                             }).collect()
                         });
 
                         // Write rows: one positional write per sub-tile, in
                         // order, through the handle held for the run.
-                        for (sti, rows) in per_tile.iter().enumerate() {
+                        for (sti, (rows, voids)) in per_tile.iter().enumerate() {
                             if rows.is_empty() { continue; }
                             total_rows += rows.len();
                             total_px += rows.len() * specs[sti].0.size_px as usize;
@@ -4276,6 +4335,8 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
                             with_output(outputs[sti].as_ref(), path, "strip rows", |f| {
                                 write_rows_at(f, path, spec.size_px as usize, strides[sti], rows)
                             })?;
+                            // Counted once the rows are on disk.
+                            tile_voids[sti].fetch_add(*voids, Ordering::Relaxed);
                         }
                     }
 
@@ -4311,30 +4372,18 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     // tile-row covered, and `AbtWriter::create` deliberately skips the
     // `set_len` pre-allocation. The tail is written as void rather than
     // `set_len`'s zeros, for the same reason the grid is: 0 m is sea level.
-    for ((spec, path), held_file) in abt_specs.iter().zip(outputs.iter()) {
+    for (((spec, path), held_file), voids) in abt_specs.iter().zip(outputs.iter()).zip(tile_voids.iter()) {
         let sz = spec.size_px as usize;
         let stride = ((sz * 2) + 255) & !255;
-        let expected = 44 + stride as u64 * sz as u64;
-        with_output(held_file.as_ref(), path, "tail fill", |mut f| {
-            let actual = f.metadata()?.len();
-            if actual >= expected {
-                return Ok(());
-            }
-            // Rows are written whole, so the tail starts on a row boundary;
-            // a partial one (an interrupted flush) is rewritten from its start.
-            let written = actual.saturating_sub(44) / stride as u64;
-            let row = void_row_bytes(sz, stride);
-            f.seek(SeekFrom::Start(44 + written * stride as u64))?;
-            let mut w = BufWriter::with_capacity(1 << 20, f);
-            for _ in written..sz as u64 {
-                w.write_all(&row)?;
-            }
-            w.flush()?;
-            Ok(())
-        })?;
+        let tail_rows = with_output(held_file.as_ref(), path, "tail fill", |f| fill_tail_with_void(f, sz, stride))?;
+        // A tail row is all void, and none of it was written by an assembly
+        // (every block ends on a row boundary, and the file ended before it).
+        voids.fetch_add(tail_rows * sz as u64, Ordering::Relaxed);
     }
     // Every output is complete: close the handles held for the run.
     drop(outputs);
+    // What each file holds now, before the buildings post-pass moves it.
+    let mut tile_voids: Vec<u64> = tile_voids.iter().map(|v| v.load(Ordering::Relaxed)).collect();
 
     // A run that genuinely FAILED to fetch a majority of its tiles is not a
     // successful run — the network died, the key expired, or the source serves
@@ -4402,8 +4451,14 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         if let Some((path, wait)) = &marker {
             waited = wait_for_buildings_marker(path, *wait).await?;
         }
-        apply_buildings_post_pass(pbf_dir, &abt_specs)?;
+        apply_buildings_post_pass(pbf_dir, &abt_specs, &mut tile_voids)?;
     }
+
+    // Every output is finished: one `[Tile] <name> voids=<n>` line per output,
+    // in job order, before the `[Stats]` block (changelog 46). Parsed by the
+    // Waveshed plugin, which no longer reads every tile to find its voids. A
+    // run that fails prints none — it removes its outputs.
+    print_tile_void_lines(&abt_specs, &tile_voids);
 
     let elapsed = start.elapsed().as_secs_f64();
     // The wait for the building tiles is not download time: `[Stats]
@@ -4429,8 +4484,13 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
 /// decoded **once** for the run and then rasterized per tile. Tiles are read,
 /// modified and written back one at a time, so peak memory stays at one `.abt`
 /// plus the decoded building model.
+///
+/// *voids* holds each tile's void-sample count (`[Tile] … voids=`, changelog
+/// 46) and loses what the burn lifts above the floor: a roof resolved on
+/// valid ground lands on the void samples its footprint reaches (see
+/// [`crate::buildings::RasterizeStats::voids_filled`]).
 #[cfg(feature = "native")]
-fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)]) -> Result<()> {
+fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)], voids: &mut [u64]) -> Result<()> {
     use crate::buildings::{load_pbf_building_dir, rasterize_buildings, AbtGrid, RasterOpts, TileRef};
 
     let t0 = Instant::now();
@@ -4448,7 +4508,7 @@ fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)
     // 2. Rasterize onto each finished tile, one at a time.
     let opts = RasterOpts::default();
     let (mut tiles_hit, mut px_total) = (0usize, 0u64);
-    for (spec, path) in abt_specs {
+    for ((spec, path), voids) in abt_specs.iter().zip(voids.iter_mut()) {
         let mut buf = match fs::read(path) {
             Ok(b) if b.len() >= 44 => b,
             // A tile the download never produced is a download failure and is
@@ -4472,6 +4532,7 @@ fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)
             fs::write(path, &buf)?;
             tiles_hit += 1;
             px_total += stats.pixels_modified as u64;
+            *voids = voids.saturating_sub(stats.voids_filled as u64);
         }
     }
 
@@ -4488,12 +4549,34 @@ fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)
     Ok(())
 }
 
+/// The `[Tile] <output file name> voids=<n>` lines of a finished CLI
+/// `download` (CONTRACT §1.2, changelog 46; parsed): one per output, in job
+/// order, on stderr, flushed together. `<n>` is the number of samples the
+/// file holds at or below `VOID_FLOOR` (the `VOID_ELEV` sentinel included);
+/// the name is the last component of the output path, as the ingest
+/// `[Tile]` line names its tile.
+#[cfg(feature = "native")]
+fn print_tile_void_lines(abt_specs: &[(SubTileSpec, PathBuf)], voids: &[u64]) {
+    // Each line also goes to `AETHER_DIAG_FILE` when that is set (changelog
+    // 48), in stderr's order; the sink is resolved before the lock (see
+    // `diag::err_kept`).
+    crate::diag::to_file();
+    let mut err = std::io::stderr().lock();
+    for ((spec, path), n) in abt_specs.iter().zip(voids) {
+        let name = path.file_name().map_or_else(|| spec.filename.clone(), |n| n.to_string_lossy().into_owned());
+        // `err_kept` re-takes the (reentrant) lock held here.
+        crate::diag::err_kept(&format!("[Tile] {name} voids={n}"));
+    }
+    let _ = err.flush();
+}
+
 /// Default of [`DownloadJob::buildings_pbf_wait_s`], in seconds.
 pub const BUILDINGS_WAIT_DEFAULT_S: f64 = 1800.0;
 
-/// How often the buildings post-pass looks for the `buildings_pbf_ready` marker.
+/// How often the buildings post-pass looks for the `buildings_pbf_ready`
+/// marker (a batch `ingest`'s watcher too, changelog 48).
 #[cfg(feature = "native")]
-const BUILDINGS_MARKER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+pub(crate) const BUILDINGS_MARKER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The `buildings_pbf_ready` hand-over of a full CLI `download` (changelog
 /// 45): the marker's path and how long to wait for it, or `None` for a job
@@ -4507,8 +4590,27 @@ const BUILDINGS_MARKER_POLL: std::time::Duration = std::time::Duration::from_mil
 /// 86400 and is not read without a marker.
 #[cfg(feature = "native")]
 fn buildings_marker(job: &DownloadJob) -> Result<Option<(PathBuf, std::time::Duration)>> {
-    let Some(name) = &job.buildings_pbf_ready else { return Ok(None) };
-    let Some(dir) = &job.buildings_pbf_dir else {
+    buildings_ready_marker(
+        job.buildings_pbf_ready.as_deref(),
+        job.buildings_pbf_dir.as_deref(),
+        job.buildings_pbf_wait_s,
+    )
+}
+
+/// The `buildings_pbf_ready` hand-over of a job — the marker's path and how
+/// long to wait for it, or `None` without a marker — from its
+/// `buildings_pbf_ready`, `buildings_pbf_dir` and `buildings_pbf_wait_s`:
+/// the rules and messages of [`buildings_marker`], shared by the CLI
+/// `download` (changelog 45) and a batch `ingest` (changelog 48). Touches
+/// no disk.
+#[cfg(feature = "native")]
+pub(crate) fn buildings_ready_marker(
+    ready: Option<&str>,
+    dir: Option<&Path>,
+    wait_s: Option<f64>,
+) -> Result<Option<(PathBuf, std::time::Duration)>> {
+    let Some(name) = ready else { return Ok(None) };
+    let Some(dir) = dir else {
         anyhow::bail!(
             "buildings_pbf_ready {name:?} needs buildings_pbf_dir: the marker is a file \
              inside that directory"
@@ -4526,11 +4628,19 @@ fn buildings_marker(job: &DownloadJob) -> Result<Option<(PathBuf, std::time::Dur
              and would be decoded as one; choose another name"
         );
     }
-    let secs = job.buildings_pbf_wait_s.unwrap_or(BUILDINGS_WAIT_DEFAULT_S);
+    let secs = wait_s.unwrap_or(BUILDINGS_WAIT_DEFAULT_S);
     if !(secs.is_finite() && (0.0..=86_400.0).contains(&secs)) {
         anyhow::bail!("buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got {secs}");
     }
     Ok(Some((dir.join(name), std::time::Duration::from_secs_f64(secs))))
+}
+
+/// Whether the `buildings_pbf_ready` marker *marker* is there: a regular
+/// file, not merely an entry — a directory of that name is no marker
+/// (changelog 45; a batch `ingest` looks the same way, changelog 48).
+#[cfg(feature = "native")]
+pub(crate) fn buildings_marker_present(marker: &Path) -> bool {
+    fs::metadata(marker).is_ok_and(|m| m.is_file())
 }
 
 /// Wait until the `buildings_pbf_ready` marker *marker* exists as a file
@@ -4548,7 +4658,7 @@ async fn wait_for_buildings_marker(marker: &Path, wait: std::time::Duration) -> 
     let mut announced = false;
     loop {
         // A file, not merely an entry: a directory of that name is no marker.
-        if fs::metadata(marker).is_ok_and(|m| m.is_file()) {
+        if buildings_marker_present(marker) {
             if !announced {
                 return Ok(std::time::Duration::ZERO);
             }
@@ -5416,6 +5526,34 @@ mod tests {
     }
 
     #[test]
+    fn the_tail_no_tile_row_covered_is_void_and_counted_as_such() {
+        // A 6-row file whose assembly wrote rows 0..2 (one void sample in
+        // each): the fill brings it to full length with void rows and says
+        // how many — the rows a `[Tile] … voids=` count takes as all void
+        // (changelog 46). A full file is left alone.
+        let (sz, stride) = (6usize, 256usize);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.abt");
+        let file = AbtWriter::create(&path, sz as u32, 47.0, 8.0, 1e-4).unwrap().into_file().unwrap();
+        let rows: Vec<(u32, Vec<i16>)> = (0..2).map(|y| (y, vec![100 + y as i16, VOID_ELEV, 7, 8, 9, 10])).collect();
+        write_rows_at(&file, &path, sz, stride, &rows).unwrap();
+
+        assert_eq!(fill_tail_with_void(&file, sz, stride).unwrap(), 4);
+        let buf = fs::read(&path).unwrap();
+        assert_eq!(buf.len(), 44 + stride * sz);
+        let samples: Vec<i16> = (0..sz)
+            .flat_map(|y| (0..sz).map(move |x| 44 + y * stride + x * 2))
+            .map(|o| i16::from_le_bytes([buf[o], buf[o + 1]]))
+            .collect();
+        let voids = samples.iter().filter(|&&v| v <= VOID_FLOOR).count() as u64;
+        assert_eq!(voids, 2 + 4 * sz as u64, "the file holds what the count says");
+        assert!(samples[2 * sz..].iter().all(|&v| v == VOID_ELEV));
+        assert_eq!(samples[..2 * sz].iter().filter(|&&v| v <= VOID_FLOOR).count(), 2);
+        assert_eq!(fill_tail_with_void(&file, sz, stride).unwrap(), 0, "a full file gets no tail");
+        assert_eq!(fs::read(&path).unwrap(), buf);
+    }
+
+    #[test]
     fn a_blank_terrarium_tile_decodes_below_the_nodata_floor() {
         // The void backfill keys off this: RGB 0,0,0 is -32768 m, not ground.
         assert!(dec_terrarium(0, 0, 0) <= NODATA_M);
@@ -5630,7 +5768,10 @@ mod tests {
         }
         w.finish().unwrap();
 
-        apply_buildings_post_pass(&pbf_dir, &[(spec, path.clone())]).unwrap();
+        // No void on that terrain, and the burn makes none.
+        let mut voids = [0u64];
+        apply_buildings_post_pass(&pbf_dir, &[(spec, path.clone())], &mut voids).unwrap();
+        assert_eq!(voids, [0]);
 
         // 200 m ground + a 12 m render_height = 212 m = 424 half-metres.
         let buf = fs::read(&path).unwrap();
@@ -5657,7 +5798,7 @@ mod tests {
         fs::write(dir.path().join("14_8531_5752.pbf"), synthetic_building_tile()).unwrap();
         fs::write(dir.path().join("15_17062_11504.pbf"), synthetic_building_tile()).unwrap();
 
-        let err = apply_buildings_post_pass(dir.path(), &[]).unwrap_err().to_string();
+        let err = apply_buildings_post_pass(dir.path(), &[], &mut []).unwrap_err().to_string();
         assert!(err.contains("buildings_pbf_dir mixes zoom levels"), "got {err:?}");
     }
 

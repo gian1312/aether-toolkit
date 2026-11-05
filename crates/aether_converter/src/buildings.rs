@@ -23,7 +23,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::ingest::point_in_poly;
+use crate::ingest::{point_in_poly, VOID_FLOOR};
 
 /// How a source expresses a building's height.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -237,26 +237,35 @@ impl DuplicateKey {
             return None;
         }
         let quantise = |ring: &[(f64, f64)]| -> Vec<(i64, i64)> {
-            ring.iter()
-                .map(|&(lon, lat)| {
-                    ((lon * 1_000_000.0).round() as i64, (lat * 1_000_000.0).round() as i64)
-                })
-                .collect()
+            ring.iter().map(|&(lon, lat)| (quantise_deg(lon), quantise_deg(lat))).collect()
         };
         let mut rings = Vec::with_capacity(1 + holes.len());
         rings.push(quantise(exterior));
         rings.extend(holes.iter().map(|h| quantise(h)));
-        let height = match height {
-            BuildingHeight::Absolute(v) => (0, v.to_bits()),
-            BuildingHeight::AboveGround(v) => (1, v.to_bits()),
-        };
-        Some(Self { rings, height })
+        Some(Self { rings, height: height_key(height) })
+    }
+}
+
+/// One coordinate as the duplicate key rounds it: to 1e-6°.
+#[inline]
+fn quantise_deg(v: f64) -> i64 {
+    (v * 1_000_000.0).round() as i64
+}
+
+/// The height part of the duplicate key: the datum (0 absolute, 1 above
+/// ground) and the metres' bit pattern.
+#[inline]
+fn height_key(height: BuildingHeight) -> (u8, u64) {
+    match height {
+        BuildingHeight::Absolute(v) => (0, v.to_bits()),
+        BuildingHeight::AboveGround(v) => (1, v.to_bits()),
     }
 }
 
 /// Keep the first of every group of buildings sharing a [`DuplicateKey`], in
 /// order, and drop buildings that have no key. One rule for every place that
-/// merges vector tiles: [`load_pbf_building_dir`], the WASM surface pass and
+/// merges vector tiles: [`load_pbf_building_dir`] (through its parallel twin
+/// [`drop_duplicate_buildings_par`], same result), the WASM surface pass and
 /// the GeoJSON export.
 pub(crate) fn drop_duplicate_buildings<T>(
     buildings: &mut Vec<T>,
@@ -264,6 +273,153 @@ pub(crate) fn drop_duplicate_buildings<T>(
 ) {
     let mut seen = std::collections::HashSet::new();
     buildings.retain(|b| key(b).is_some_and(|k| seen.insert(k)));
+}
+
+/// [`drop_duplicate_buildings`] with [`Building::duplicate_key`], on the
+/// current rayon pool, with exactly its result (CONTRACT changelog 47): the
+/// same survivors in the same order — the first of every group of equal keys
+/// in list order — and every building without a key dropped.
+///
+/// The sequential filter built a [`DuplicateKey`] — one allocation per ring
+/// — for every building and inserted it into one hash set on one thread:
+/// 16 s for 5.1 M buildings on the owner's 16-thread machine, while the
+/// decode before it ran on all of them. Here each building's key is hashed in place (no allocation,
+/// in parallel), the `(hash, index)` pairs are sorted (in parallel), and
+/// since equal keys have equal hashes, every group of duplicates lies in one
+/// run of equal hashes, in list order: within a run the first building of
+/// each key survives, decided by comparing the keys themselves, so a hash
+/// collision costs time, never a building ([`later_copies`]).
+#[cfg(feature = "native")]
+pub(crate) fn drop_duplicate_buildings_par(buildings: &mut Vec<Building>) {
+    let keep = duplicate_survivors(buildings, duplicate_hash);
+    let mut i = 0;
+    buildings.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+}
+
+/// Which of *buildings* [`drop_duplicate_buildings_par`] keeps, by index;
+/// *hash* must give equal hashes for equal [`DuplicateKey`]s and `None`
+/// exactly where there is no key (tests pass colliding ones).
+#[cfg(feature = "native")]
+fn duplicate_survivors(
+    buildings: &[Building],
+    hash: impl Fn(&Building) -> Option<u64> + Sync,
+) -> Vec<bool> {
+    use rayon::prelude::*;
+    if u32::try_from(buildings.len()).is_err() {
+        // More buildings than u32 indices (cannot fit in memory anyway): the
+        // sequential filter, which is the definition.
+        let mut seen = std::collections::HashSet::new();
+        return buildings.iter().map(|b| b.duplicate_key().is_some_and(|k| seen.insert(k))).collect();
+    }
+    // 1. Every keyed building's hash and index.
+    let mut keyed: Vec<(u64, u32)> = buildings
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, b)| hash(b).map(|h| (h, i as u32)))
+        .collect();
+    // 2. By hash, and within one hash by index: a run of equal hashes holds
+    //    every copy of its key(s), in list order.
+    keyed.par_sort_unstable();
+    // 3. The runs in parallel, in ranges that never cut a run.
+    let n = keyed.len();
+    let parts = rayon::current_num_threads().max(1) * 4;
+    let mut cuts: Vec<usize> = (0..=parts).map(|p| p * n / parts).collect();
+    for c in &mut cuts {
+        while *c > 0 && *c < n && keyed[*c].0 == keyed[*c - 1].0 {
+            *c += 1;
+        }
+    }
+    let later: Vec<Vec<u32>> =
+        cuts.par_windows(2).map(|w| later_copies(&keyed[w[0]..w[1]], buildings)).collect();
+    // 4. A building survives when it has a key and is no later copy.
+    let mut keep = vec![false; buildings.len()];
+    for &(_, i) in &keyed {
+        keep[i as usize] = true;
+    }
+    for i in later.into_iter().flatten() {
+        keep[i as usize] = false;
+    }
+    keep
+}
+
+/// The later copies in *runs* — `(hash, index)` pairs sorted, whole runs of
+/// one hash only: in each run, every building whose [`DuplicateKey`] equals
+/// that of a building before it in the run. A run almost always holds one
+/// key; a second one is a hash collision, told apart by the keys themselves.
+#[cfg(feature = "native")]
+fn later_copies(runs: &[(u64, u32)], buildings: &[Building]) -> Vec<u32> {
+    let mut later = Vec::new();
+    let mut firsts: Vec<u32> = Vec::new();
+    let mut s = 0;
+    while s < runs.len() {
+        let h = runs[s].0;
+        let mut e = s + 1;
+        while e < runs.len() && runs[e].0 == h {
+            e += 1;
+        }
+        if e - s > 1 {
+            firsts.clear();
+            firsts.push(runs[s].1);
+            for &(_, i) in &runs[s + 1..e] {
+                let b = &buildings[i as usize];
+                if firsts.iter().any(|&j| same_duplicate_key(b, &buildings[j as usize])) {
+                    later.push(i);
+                } else {
+                    firsts.push(i);
+                }
+            }
+        }
+        s = e;
+    }
+    later
+}
+
+/// A hash of [`Building::duplicate_key`] without building it: the same
+/// rounded vertices of every ring, the ring lengths and the height, `None`
+/// when there is no key (no exterior vertex). Equal keys hash equal.
+#[cfg(feature = "native")]
+fn duplicate_hash(b: &Building) -> Option<u64> {
+    if b.coords.is_empty() {
+        return None;
+    }
+    // One multiply-rotate step per word (FxHash's): cheap, and a bijection
+    // of the state for each word, so keys of one shape rarely collide.
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h = 0u64;
+    let mut add = |w: u64| h = (h.rotate_left(5) ^ w).wrapping_mul(K);
+    let (datum, bits) = height_key(b.height);
+    add(datum as u64);
+    add(bits);
+    add(b.holes.len() as u64);
+    for ring in std::iter::once(&b.coords).chain(&b.holes) {
+        add(ring.len() as u64);
+        for &(lon, lat) in ring {
+            add(quantise_deg(lon) as u64);
+            add(quantise_deg(lat) as u64);
+        }
+    }
+    Some(h)
+}
+
+/// `a.duplicate_key() == b.duplicate_key()` for two buildings that have one,
+/// compared in place: same height key, same number of rings, and every ring
+/// the same rounded vertices in the same order.
+#[cfg(feature = "native")]
+fn same_duplicate_key(a: &Building, b: &Building) -> bool {
+    let same_ring = |p: &[(f64, f64)], q: &[(f64, f64)]| {
+        p.len() == q.len()
+            && p.iter().zip(q).all(|(&(px, py), &(qx, qy))| {
+                quantise_deg(px) == quantise_deg(qx) && quantise_deg(py) == quantise_deg(qy)
+            })
+    };
+    height_key(a.height) == height_key(b.height)
+        && a.holes.len() == b.holes.len()
+        && same_ring(&a.coords, &b.coords)
+        && a.holes.iter().zip(&b.holes).all(|(p, q)| same_ring(p, q))
 }
 
 /// Which terrain statistic under a footprint counts as its ground level.
@@ -453,6 +609,17 @@ pub struct RasterizeStats {
     /// Median of `roof - terrain` over absolute-height buildings, when known.
     /// A large constant offset here is the signature of a datum mismatch.
     pub median_roof_above_terrain: Option<f64>,
+    /// Writes that lifted a void sample — one at or below [`VOID_FLOOR`]
+    /// (-5000 half-metres, -2500 m: the `-9999` sentinel, deep water) — to
+    /// a roof above it. `max` takes any roof over such a sample, so the void
+    /// pixels of a footprint reaching past the terrain get the roof of its
+    /// valid ground; a footprint whose ground reference is itself void puts
+    /// the sentinel plus its height there (e.g. `-9987` for 6 m), still
+    /// below the floor and not counted. A write never lowers a sample, so
+    /// this is the whole change of the grid's void count — what a caller
+    /// needs to keep a tile's `[Tile] … voids=` count exact without reading
+    /// the tile again (CONTRACT changelog 46).
+    pub voids_filled: u32,
 }
 
 /// Pixels of *grid* whose centre falls inside *ring* and outside every one of
@@ -630,6 +797,7 @@ pub fn rasterize_buildings<G: ElevGrid>(
                 if roof > cur {
                     grid.set(x, y, roof);
                     stats.pixels_modified += 1;
+                    stats.voids_filled += (cur <= VOID_FLOOR && roof > VOID_FLOOR) as u32;
                     any = true;
                 }
             }
@@ -736,6 +904,9 @@ fn decode_pbf_tile_file(f: &PbfTileFile) -> PbfTileOutcome {
 /// every tile is decoded, never from two threads at once); and the error of
 /// the first tile, in name order, that cannot be read at all, which fails the
 /// load as it always did (a tile after it is not read once that is known).
+/// The duplicate filter after the decode runs on the same pool
+/// ([`drop_duplicate_buildings_par`], changelog 47) and keeps exactly the
+/// buildings the sequential filter keeps, in the same order.
 ///
 /// *on_progress(done, total)* is called once per tile file, as it finishes
 /// (decoded, skipped or failed): `done` runs 1, 2, …, `total`, the calls never
@@ -843,7 +1014,12 @@ pub fn load_pbf_building_dir_with_progress(
     // one that two tiles clipped differently is drawn once per copy, which
     // `max` makes harmless too. `decoded - buildings.len()` is what the
     // `[Info] buildings_pbf_dir` / `[Buildings]` lines report as dropped.
+    // On the same pool as the decode, with the sequential filter's result
+    // (changelog 47).
     set.decoded = set.buildings.len();
+    #[cfg(feature = "native")]
+    drop_duplicate_buildings_par(&mut set.buildings);
+    #[cfg(not(feature = "native"))]
     drop_duplicate_buildings(&mut set.buildings, Building::duplicate_key);
 
     Ok(set)
@@ -876,6 +1052,37 @@ pub(crate) mod tests {
 
     fn flat_grid(value: i16) -> Vec<i16> {
         vec![value; 100]
+    }
+
+    #[test]
+    fn a_roof_that_lifts_a_void_sample_above_the_floor_is_counted() {
+        use crate::ingest::VOID_ELEV;
+        // A footprint over all ten pixels of row 0 of `tile()`.
+        let row0 = |height| Building {
+            coords: vec![(8.0, 48.0), (9.0, 48.0), (9.0, 47.9), (8.0, 47.9)],
+            holes: Vec::new(),
+            height,
+            source: HeightSource::ExplicitHeight,
+        };
+        let burn = |row: [i16; 10], height| {
+            let mut buf = flat_grid(100);
+            buf[..10].copy_from_slice(&row);
+            let mut g = I16Grid { buf: &mut buf, size: 10 };
+            let s = rasterize_buildings(&mut g, &tile(), &[row0(height)], &RasterOpts::default());
+            let lifted = row.iter().zip(&buf[..10]).filter(|(a, b)| **a <= VOID_FLOOR && **b > VOID_FLOOR).count();
+            (s.pixels_modified, s.voids_filled, lifted as u32)
+        };
+        // A 250 m roof over the sentinel, deep water, the floor itself, the
+        // deepest ground and terrain: what was at or below -5000 is lifted.
+        let r = [VOID_ELEV, -6000, -5000, -4999, 100, 100, 100, 100, 100, 100];
+        assert_eq!(burn(r, BuildingHeight::Absolute(250.0)), (10, 3, 3));
+        // Ground reference void (P10 of two sentinels in ten): the roof is
+        // the sentinel + 12, written over both — and still void.
+        let r = [VOID_ELEV, VOID_ELEV, -6000, 100, 100, 100, 100, 100, 100, 100];
+        assert_eq!(burn(r, BuildingHeight::AboveGround(6.0)), (2, 0, 0));
+        // Ground reference terrain: the roof lands on the one void pixel.
+        let r = [VOID_ELEV, 100, 100, 100, 100, 100, 100, 100, 100, 100];
+        assert_eq!(burn(r, BuildingHeight::AboveGround(6.0)), (10, 1, 1));
     }
 
     #[test]
@@ -1883,6 +2090,278 @@ pub(crate) mod tests {
             (*n != 3).then(|| key(&ring, BuildingHeight::AboveGround(*n as f64))).flatten()
         });
         assert_eq!(v, vec![1, 2], "first of each kept, in order; keyless dropped");
+    }
+
+    // ── The parallel duplicate filter (changelog 47) ───────────────────────
+
+    /// Every building of the tile files in *dir*, decoded in name order —
+    /// the list the loader hands its duplicate filter.
+    fn decoded_in_name_order(dir: &Path) -> Vec<Building> {
+        let mut paths: Vec<std::path::PathBuf> =
+            fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
+        paths.sort_by(by_name);
+        let mut out = Vec::new();
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some((z, x, y)) = crate::ingest::parse_pbf_tile_name(name) else { continue };
+            let raw = fs::read(&path).unwrap();
+            if let Ok((b, _)) = crate::mvt::extract_buildings_from_pbf(&crate::mvt::maybe_gunzip(&raw), x, y, z) {
+                out.extend(b.iter().map(|b| b.to_building()));
+            }
+        }
+        out
+    }
+
+    /// The indices the sequential filter — the definition — keeps.
+    fn sequential_survivors(buildings: &[Building]) -> Vec<usize> {
+        let mut tagged: Vec<(usize, Building)> = buildings.iter().cloned().enumerate().collect();
+        drop_duplicate_buildings(&mut tagged, |(_, b)| b.duplicate_key());
+        tagged.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// The indices [`duplicate_survivors`] keeps with *hash*.
+    #[cfg(feature = "native")]
+    fn parallel_survivors(buildings: &[Building], hash: impl Fn(&Building) -> Option<u64> + Sync) -> Vec<usize> {
+        duplicate_survivors(buildings, hash).iter().enumerate().filter(|(_, &k)| k).map(|(i, _)| i).collect()
+    }
+
+    /// Duplicates and near misses of every kind the key tells apart, in 40
+    /// "tiles" of 300 buildings: each tile repeats the east column of the
+    /// one before it (its buffer zone, exact copies, later in the list), then
+    /// lists its own buildings (two datums, some with a courtyard), then
+    /// variants of the first one's courtyard (a vertex one quantum off, the
+    /// ring rotated — distinct; a vertex 2e-7° off — a duplicate) and of
+    /// another building — the height one ulp off, the other datum, a
+    /// courtyard more, a vertex one 1e-6° quantum off, a ring rotated (all
+    /// distinct), a vertex 2e-7° off (rounds alike: a duplicate), two exact
+    /// repeats, a building without a vertex (no key: dropped). Last, a ring
+    /// at 0.0 and the same at -0.0 and NaN (all round to 0: one key), and a
+    /// keyless building with a courtyard.
+    fn duplicate_zoo() -> Vec<Building> {
+        let sq = |lon: f64, lat: f64, d: f64| vec![(lon, lat), (lon + d, lat), (lon + d, lat - d), (lon, lat - d)];
+        let bld = |coords: Vec<(f64, f64)>, holes: Vec<Vec<(f64, f64)>>, height: BuildingHeight| Building {
+            coords,
+            holes,
+            height,
+            source: HeightSource::ExplicitHeight,
+        };
+        let tile = |t: usize| -> Vec<Building> {
+            (0..300)
+                .map(|i| {
+                    let lon = 7.0 + t as f64 * 0.01 + (i % 20) as f64 * 0.0004;
+                    let lat = 46.9 - (i / 20) as f64 * 0.0004;
+                    let height = match i % 7 {
+                        0 => BuildingHeight::Absolute(500.0 + i as f64),
+                        1 => BuildingHeight::AboveGround(6.0),
+                        _ => BuildingHeight::AboveGround(8.0 + (i % 5) as f64),
+                    };
+                    let holes = if i % 11 == 0 { vec![sq(lon + 1e-4, lat - 1e-4, 5e-5)] } else { Vec::new() };
+                    bld(sq(lon, lat, 2e-4), holes, height)
+                })
+                .collect()
+        };
+        let mut out = Vec::new();
+        for t in 0..40 {
+            if t > 0 {
+                out.extend(tile(t - 1).into_iter().enumerate().filter(|(i, _)| i % 20 == 19).map(|(_, b)| b));
+            }
+            let own = tile(t);
+            let b0 = own[3].clone();
+            let b1 = own[0].clone();
+            assert_eq!(b1.holes.len(), 1);
+            out.extend(own);
+            // A courtyard of the same count but other vertices: distinct when
+            // a vertex is one quantum off or the ring is rotated, a duplicate
+            // when it rounds alike.
+            let mut v = b1.clone();
+            v.holes[0][1].1 -= 1.0e-6;
+            out.push(v);
+            let mut v = b1.clone();
+            v.holes[0].rotate_left(1);
+            out.push(v);
+            let mut v = b1.clone();
+            v.holes[0][1].1 -= 2.0e-7;
+            out.push(v);
+            let mut v = b0.clone();
+            v.height = BuildingHeight::AboveGround(f64::from_bits(b0.height.metres().to_bits() + 1));
+            out.push(v);
+            let mut v = b0.clone();
+            v.height = BuildingHeight::Absolute(b0.height.metres());
+            out.push(v);
+            let mut v = b0.clone();
+            v.holes.push(sq(b0.coords[0].0 + 2e-5, b0.coords[0].1 - 2e-5, 3e-5));
+            out.push(v);
+            let mut v = b0.clone();
+            v.coords[2].0 += 1.0e-6;
+            out.push(v);
+            let mut v = b0.clone();
+            v.coords.rotate_left(1);
+            out.push(v);
+            let mut v = b0.clone();
+            v.coords[2].0 += 2.0e-7;
+            out.push(v);
+            out.push(b0.clone());
+            out.push(b0);
+            out.push(bld(Vec::new(), Vec::new(), BuildingHeight::AboveGround(6.0)));
+        }
+        let z = |a: f64| vec![(a, 0.0), (1e-3, a), (1e-3, 1e-3), (0.0, 1e-3)];
+        for a in [0.0, -0.0, f64::NAN] {
+            out.push(bld(z(a), Vec::new(), BuildingHeight::AboveGround(6.0)));
+        }
+        out.push(bld(Vec::new(), vec![sq(7.0, 46.0, 1e-4)], BuildingHeight::AboveGround(6.0)));
+        out
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_parallel_duplicate_filter_keeps_what_the_sequential_one_keeps() {
+        // The real OpenFreeMap tile three times: twice at its own address
+        // (`.mvt` and `.pbf` name the same tile, so every building of the
+        // second is a copy of the first) and once one tile east (no copy).
+        let real = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ofm_z14_8651_5782.pbf"))
+            .expect("fixture ofm_z14_8651_5782.pbf");
+        let real_dir = tempfile::tempdir().unwrap();
+        for name in ["14_8651_5782.mvt", "14_8651_5782.pbf", "14_8652_5782.pbf"] {
+            std::fs::write(real_dir.path().join(name), &real).unwrap();
+        }
+        let many = many_tile_dir(1500, &[17, 1203]);
+        let seam = pbf_dir_of(&[
+            ((8531, 5752), vec![(12.0, vec![exterior(4000, 1000, 4090, 1090)])]),
+            ((8532, 5752), vec![(12.0, vec![exterior(-96, 1000, -6, 1090)])]),
+            ((8532, 5753), vec![(15.0, vec![exterior(-96, 1000, -6, 1090), interior(-80, 1020, -20, 1070)])]),
+        ]);
+        let cases: Vec<(&str, Vec<Building>)> = vec![
+            ("the real tile", decoded_in_name_order(real_dir.path())),
+            ("1,500 synthetic tiles", decoded_in_name_order(many.path())),
+            ("a seam", decoded_in_name_order(seam.path())),
+            ("the zoo", duplicate_zoo()),
+        ];
+        let mut all: Vec<Building> = cases.iter().flat_map(|(_, b)| b.iter().cloned()).collect();
+        all.extend(duplicate_zoo());
+        let cases = cases.into_iter().chain([("all of them, the zoo twice", all)]);
+
+        for (what, list) in cases {
+            let want = sequential_survivors(&list);
+            assert!(want.len() < list.len(), "{what}: the fixture must hold duplicates");
+            assert!(!want.is_empty(), "{what}");
+            for threads in [1, 3, 8] {
+                let got = pool(threads).install(|| parallel_survivors(&list, duplicate_hash));
+                assert!(got == want, "{what}, {threads} thread(s): other survivors");
+            }
+            assert!(parallel_survivors(&list, duplicate_hash) == want, "{what}, global pool");
+
+            // The filter itself: the sequential filter's list, bit for bit.
+            let mut seq = list.clone();
+            drop_duplicate_buildings(&mut seq, Building::duplicate_key);
+            let mut par = list.clone();
+            pool(8).install(|| drop_duplicate_buildings_par(&mut par));
+            let bits = |v: Vec<Building>| building_bits(&PbfBuildingSet { buildings: v, ..Default::default() });
+            assert!(bits(par) == bits(seq), "{what}: the filtered lists differ");
+        }
+
+        // The zoo's own verdicts, which both filters reach.
+        let zoo = duplicate_zoo();
+        let kept = sequential_survivors(&zoo);
+        let n = zoo.len();
+        assert!(kept.contains(&(n - 4)), "the 0.0 ring is the first of its key");
+        assert!(!kept.contains(&(n - 3)) && !kept.contains(&(n - 2)), "-0.0 and NaN round to its key");
+        assert!(!kept.contains(&(n - 1)), "no exterior vertex, no key: dropped");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn a_hash_collision_costs_time_never_a_building() {
+        // The survivors may depend on the keys only: with every keyed
+        // building in ONE run of equal hashes, or spread over three, the
+        // in-place key comparison must reach the sequential verdict.
+        let zoo: Vec<Building> = duplicate_zoo().into_iter().take(2000).chain(duplicate_zoo().into_iter().rev().take(5)).collect();
+        let want = sequential_survivors(&zoo);
+        assert!(want.len() < zoo.len());
+        let one = |b: &Building| (!b.coords.is_empty()).then_some(7u64);
+        let three = |b: &Building| (!b.coords.is_empty()).then(|| (b.coords.len() + b.holes.len()) as u64 % 3);
+        for threads in [1, 4] {
+            assert!(pool(threads).install(|| parallel_survivors(&zoo, one)) == want, "{threads} thread(s), one run");
+            assert!(pool(threads).install(|| parallel_survivors(&zoo, three)) == want, "{threads} thread(s), three runs");
+        }
+    }
+
+    /// Container-measured time of the duplicate filter on ~5.1 M buildings,
+    /// the sequential one against the parallel one (changelog 47). The list
+    /// is the real OpenFreeMap tile 14/8651/5782 (470 buildings) laid out
+    /// over 100 × 100 tile addresses, each tile listing first the exact
+    /// copies of its west neighbour's buildings in that tile's east tenth and
+    /// of its north neighbour's in its south tenth (its buffer zone), then
+    /// its own. `cargo test --release -p aether_converter --lib
+    /// bench_duplicate_filter -- --ignored --nocapture`.
+    #[cfg(feature = "native")]
+    #[test]
+    #[ignore = "timing: cargo test --release -p aether_converter --lib bench_duplicate_filter -- --ignored --nocapture"]
+    fn bench_duplicate_filter_5m_sequential_vs_parallel() {
+        use std::time::Instant;
+        let real = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ofm_z14_8651_5782.pbf"))
+            .expect("fixture ofm_z14_8651_5782.pbf");
+        let (bx, by) = (8651u32, 5782u32);
+        let (templ, _) = crate::mvt::extract_buildings_from_pbf(&crate::mvt::maybe_gunzip(&real), bx, by, 14).unwrap();
+        let templ: Vec<Building> = templ.iter().map(|b| b.to_building()).collect();
+        let (w, e) = (crate::download::tx2lon(bx, 14), crate::download::tx2lon(bx + 1, 14));
+        let (n, s) = (crate::download::ty2lat(by, 14), crate::download::ty2lat(by + 1, 14));
+        let (span_lon, span_lat) = (e - w, n - s);
+        let east: Vec<&Building> = templ.iter().filter(|b| b.coords[0].0 > w + 0.9 * span_lon).collect();
+        let south: Vec<&Building> = templ.iter().filter(|b| b.coords[0].1 < s + 0.1 * span_lat).collect();
+        let shift = |b: &Building, dx: f64, dy: f64| {
+            let mv = |r: &[(f64, f64)]| r.iter().map(|&(lon, lat)| (lon + dx, lat + dy)).collect::<Vec<_>>();
+            Building { coords: mv(&b.coords), holes: b.holes.iter().map(|h| mv(h)).collect(), ..b.clone() }
+        };
+        let (cols, rows) = (100usize, 100usize);
+        let mut list: Vec<Building> = Vec::with_capacity(cols * rows * (templ.len() + east.len() + south.len()));
+        for r in 0..rows {
+            for c in 0..cols {
+                let (dx, dy) = (c as f64 * span_lon, -(r as f64) * span_lat);
+                if c > 0 {
+                    list.extend(east.iter().map(|b| shift(b, dx - span_lon, dy)));
+                }
+                if r > 0 {
+                    list.extend(south.iter().map(|b| shift(b, dx, dy + span_lat)));
+                }
+                list.extend(templ.iter().map(|b| shift(b, dx, dy)));
+            }
+        }
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0);
+        let mut seq_s = Vec::new();
+        let mut want = None;
+        for _ in 0..2 {
+            let mut v = list.clone();
+            let t0 = Instant::now();
+            drop_duplicate_buildings(&mut v, Building::duplicate_key);
+            seq_s.push(t0.elapsed().as_secs_f64());
+            want = Some(v);
+        }
+        let want = want.unwrap();
+        let mut par = Vec::new();
+        for threads in [4usize, 8, 16] {
+            let pool = pool(threads);
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut v = list.clone();
+                let t0 = Instant::now();
+                pool.install(|| drop_duplicate_buildings_par(&mut v));
+                best = best.min(t0.elapsed().as_secs_f64());
+                assert_eq!(v.len(), want.len());
+                assert!(
+                    v.iter().zip(&want).all(|(a, b)| a.coords == b.coords && a.holes == b.holes && a.height == b.height),
+                    "the parallel filter kept other buildings"
+                );
+            }
+            par.push(format!("{threads} threads {best:.3} s"));
+        }
+        println!(
+            "[bench, container-measured, {cpus} CPU(s)] duplicate filter over {} buildings ({} dropped): \
+             sequential {} s; parallel (best of 3) {}",
+            list.len(),
+            list.len() - want.len(),
+            seq_s.iter().map(|s| format!("{s:.3}")).collect::<Vec<_>>().join(" / "),
+            par.join(", "),
+        );
     }
 
     // ── The shared height ladder ────────────────────────────────────────────

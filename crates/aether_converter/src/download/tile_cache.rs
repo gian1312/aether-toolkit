@@ -57,7 +57,11 @@
 //! entry still reads as before (a miss for a new tile). A rewritten entry
 //! (a corrupt one repaired, a repair job's fresh body) points to newly
 //! appended bytes and the old ones become garbage; nothing compacts a pack
-//! — delete the directory to reclaim the space.
+//! — delete the directory to reclaim the space. Under the lock the writer
+//! also reads what each slot holds: a derived tile is not written over a
+//! real answer that reads (a CRC-valid body, or a 404) — another process may
+//! have stored the service's tile since this one looked (changelog 48); a
+//! real answer replaces anything.
 //!
 //! **Reading** takes no lock. Every entry is validated — the pack header must
 //! name this very column, a present or derived body must lie inside the
@@ -405,8 +409,21 @@ impl From<io::Error> for WriteError {
 /// the pack `key` at `path`, creating it when absent: lock, append every
 /// body in one write, then write their index entries in place, close
 /// (which releases the lock). [`WriteError::Busy`] when another writer holds
-/// the lock; nothing is written then.
-pub(super) fn write_pack(path: &Path, key: PackKey, items: &[(usize, &Cached)]) -> Result<(), WriteError> {
+/// the lock; nothing is written then. Returns which items were written, in
+/// `items` order.
+///
+/// A derived tile (status 3) never replaces a real answer of the service
+/// (changelog 48): an item [`Cached::Derived`] is skipped when its slot,
+/// read under the lock, holds a body that is all there and matches its CRC
+/// (status 1) or a 404 (status 2) — or when a real answer for that slot
+/// comes earlier in `items`. Two processes can share a cache (the plugin
+/// runs a coarser zoom's derive pass beside a finer zoom's fetch): the
+/// derive pass judged its tiles from an index read at its start, while the
+/// fetch's parent fill may store the service's own tile for the same slot
+/// meanwhile, which a blind write would then overwrite with a 2 × 2 mean.
+/// A real answer still replaces anything, a derived tile a derived one or
+/// an entry that does not read.
+pub(super) fn write_pack(path: &Path, key: PackKey, items: &[(usize, &Cached)]) -> Result<Vec<bool>, WriteError> {
     let Some(mut f) = lock::open_locked(path)? else {
         return Err(WriteError::Busy);
     };
@@ -439,26 +456,58 @@ pub(super) fn write_pack(path: &Path, key: PackKey, items: &[(usize, &Cached)]) 
     }
 
     let end = f.seek(SeekFrom::End(0))?;
+    // What each slot holds now: read under the lock, so no other writer can
+    // change it before this batch lands (changelog 48).
+    let now: Vec<Entry> = if fresh {
+        Vec::new()
+    } else {
+        let mut index = vec![0u8; (SLOTS as u64 * ENTRY_LEN) as usize];
+        read_exact_at(&f, &mut index, HEADER_LEN)?;
+        index.chunks_exact(ENTRY_LEN as usize).map(Entry::parse).collect()
+    };
+    // Whether `slot` holds a real answer that reads: the service's body, all
+    // there and matching its CRC, or its 404.
+    let real_now = |slot: usize| -> bool {
+        let Some(e) = now.get(slot) else { return false };
+        match e.status {
+            STATUS_PRESENT => e.usable(len) && read_body_from(&f, e).is_some(),
+            STATUS_NO_TILE => e.usable(len),
+            _ => false,
+        }
+    };
+
     let mut blob: Vec<u8> = Vec::new();
     let mut entries: BTreeMap<usize, Entry> = BTreeMap::new();
-    for &(slot, item) in items {
+    let mut real: HashSet<usize> = HashSet::new();
+    let mut written = vec![false; items.len()];
+    for (i, &(slot, item)) in items.iter().enumerate() {
         if slot >= SLOTS as usize {
             continue;
+        }
+        let derived = matches!(item, Cached::Derived(_));
+        if derived && (real.contains(&slot) || real_now(slot)) {
+            continue; // a derived tile never replaces a real answer
         }
         let e = match item {
             Cached::Body(b) | Cached::Derived(b) => {
                 let Ok(n) = u32::try_from(b.len()) else { continue };
-                let status = if matches!(item, Cached::Derived(_)) { STATUS_DERIVED } else { STATUS_PRESENT };
+                let status = if derived { STATUS_DERIVED } else { STATUS_PRESENT };
                 let e = Entry { offset: end + blob.len() as u64, len: n, status, crc: crc32(b) };
                 blob.extend_from_slice(b);
                 e
             }
             Cached::NoTile => Entry { offset: 0, len: 0, status: STATUS_NO_TILE, crc: 0 },
         };
+        if !derived {
+            real.insert(slot);
+        }
         entries.insert(slot, e);
+        written[i] = true;
     }
-    // 1. The bodies, appended in one write ...
+    // 1. The bodies, appended in one write (at the end the entries above
+    //    point to: a read without positioned I/O moved the cursor) ...
     if !blob.is_empty() {
+        f.seek(SeekFrom::Start(end))?;
         f.write_all(&blob)?;
     }
     // 2. ... then the entries that point to them.
@@ -466,7 +515,7 @@ pub(super) fn write_pack(path: &Path, key: PackKey, items: &[(usize, &Cached)]) 
         f.seek(SeekFrom::Start(HEADER_LEN + slot as u64 * ENTRY_LEN))?;
         f.write_all(&e.bytes())?;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// The pack write lock: one writer per pack at a time, across processes and
@@ -1255,10 +1304,15 @@ fn writer(rx: mpsc::Receiver<Job>, ctx: WriterCtx) {
             }
             let items: Vec<(usize, &Cached)> = p.jobs.iter().map(|j| (j.slot, &j.item)).collect();
             match write_pack(&path, key, &items) {
-                Ok(()) => {
-                    let parents = p.jobs.iter().filter(|j| j.parent).count();
-                    ctx.counts.written.fetch_add(p.jobs.len() - parents, Ordering::Relaxed);
-                    ctx.counts.parent_written.fetch_add(parents, Ordering::Relaxed);
+                Ok(written) => {
+                    // A derived tile kept out by a real answer (changelog 48)
+                    // is not written, and not counted.
+                    let mut n = (0, 0);
+                    for (j, _) in p.jobs.iter().zip(&written).filter(|(_, w)| **w) {
+                        if j.parent { n.1 += 1 } else { n.0 += 1 }
+                    }
+                    ctx.counts.written.fetch_add(n.0, Ordering::Relaxed);
+                    ctx.counts.parent_written.fetch_add(n.1, Ordering::Relaxed);
                     release(&p.jobs);
                 }
                 Err(WriteError::Busy) => {
@@ -1545,7 +1599,7 @@ mod tests {
                     let refs: Vec<(usize, &Cached)> = items.iter().map(|(s, c)| (*s, c)).collect();
                     loop {
                         match write_pack(&path, key, &refs) {
-                            Ok(()) => break,
+                            Ok(_) => break,
                             Err(WriteError::Busy) => {
                                 busy.fetch_add(1, Ordering::Relaxed);
                                 std::thread::sleep(Duration::from_millis(1));
@@ -1581,6 +1635,97 @@ mod tests {
         let own: usize = (0..64).map(|i| 200 + i).sum();
         let data: usize = 2 * 20 * own + (0..20).map(|r| 2 * 64 * (50 + r)).sum::<usize>();
         assert_eq!(fs::metadata(&*path).unwrap().len(), DATA_START + data as u64);
+    }
+
+    #[test]
+    fn a_derived_tile_never_replaces_a_real_answer_and_a_real_answer_replaces_a_derived_one() {
+        // Changelog 48: a derive pass decides from an index read at its
+        // start; another process's parent fill may store the service's tile
+        // in the same slot meanwhile. The derived write must not clobber it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.pack");
+        let key = (14, 8650, 22);
+        let status = |slot: usize| entry_at(&fs::read(&path).unwrap(), slot).status;
+        let (real, derived) = (body(1, 400), body(2, 300));
+        let w = |items: &[(usize, Cached)]| -> Vec<bool> {
+            let refs: Vec<(usize, &Cached)> = items.iter().map(|(s, c)| (*s, c)).collect();
+            write_pack(&path, key, &refs).expect("write")
+        };
+
+        // A real body and a 404 in the pack: derived writes for both slots
+        // are skipped — entries, statuses and bodies unchanged, nothing
+        // appended — while a derived write for an empty slot lands.
+        assert_eq!(w(&[(3, Cached::Body(real.clone())), (4, Cached::NoTile)]), [true, true]);
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            w(&[(3, Cached::Derived(derived.clone())), (4, Cached::Derived(derived.clone()))]),
+            [false, false]
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "the pack is byte for byte as before");
+        assert_eq!(w(&[(5, Cached::Derived(derived.clone()))]), [true]);
+        assert_eq!((status(3), status(4), status(5)), (STATUS_PRESENT, STATUS_NO_TILE, STATUS_DERIVED));
+        assert_eq!(get(&path, key, 3), Some(Cached::Body(real.clone())));
+        assert_eq!(get(&path, key, 4), Some(Cached::NoTile));
+
+        // The reverse order loses nothing either: a real answer replaces a
+        // derived tile (and a 404 a derived tile).
+        let fresh = body(3, 500);
+        assert_eq!(w(&[(5, Cached::Body(fresh.clone()))]), [true]);
+        assert_eq!(status(5), STATUS_PRESENT);
+        assert_eq!(get(&path, key, 5), Some(Cached::Body(fresh.clone())));
+        assert_eq!(w(&[(6, Cached::Derived(derived.clone()))]), [true]);
+        assert_eq!(w(&[(6, Cached::NoTile)]), [true]);
+        assert_eq!(status(6), STATUS_NO_TILE);
+
+        // A derived tile still replaces a derived one, and a real entry that
+        // does not read (its body fails the CRC) — a miss, which is when a
+        // run derives the tile in the first place.
+        assert_eq!(w(&[(7, Cached::Derived(body(4, 64)))]), [true]);
+        assert_eq!(w(&[(7, Cached::Derived(derived.clone()))]), [true]);
+        assert_eq!(read_body(&path, &entry_at(&fs::read(&path).unwrap(), 7)), Some(derived.clone()));
+        assert_eq!(w(&[(8, Cached::Body(body(5, 90)))]), [true]);
+        let mut raw = fs::read(&path).unwrap();
+        let e8 = entry_at(&raw, 8);
+        raw[e8.offset as usize + 10] ^= 0x01;
+        fs::write(&path, &raw).unwrap();
+        assert_eq!(get(&path, key, 8), None, "slot 8 no longer reads");
+        assert_eq!(w(&[(8, Cached::Derived(derived.clone()))]), [true]);
+        assert_eq!(status(8), STATUS_DERIVED);
+
+        // Within one batch: a real answer before a derived tile of the same
+        // slot stands; a derived tile before a real answer is replaced.
+        assert_eq!(
+            w(&[(9, Cached::Body(real.clone())), (9, Cached::Derived(derived.clone()))]),
+            [true, false]
+        );
+        assert_eq!(status(9), STATUS_PRESENT);
+        assert_eq!(
+            w(&[(10, Cached::Derived(derived.clone())), (10, Cached::Body(real.clone()))]),
+            [true, true]
+        );
+        assert_eq!(status(10), STATUS_PRESENT);
+        assert_eq!(get(&path, key, 10), Some(Cached::Body(real)));
+    }
+
+    #[test]
+    fn the_writer_does_not_count_a_derived_tile_a_real_answer_kept_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let tpl = "http://t/{z}/{x}/{y}.png";
+        let cache = TileCache::open(dir.path(), tpl, "terrarium").unwrap();
+        let root = dir.path().join(service_key(tpl, "terrarium"));
+        // Another process stored the service's tile while this one derived it.
+        fs::create_dir_all(root.join("z14")).unwrap();
+        let pack = pack_path(&root, (14, 8650, 22));
+        let real = body(7, 120);
+        put(&pack, (14, 8650, 22), &[(100, Cached::Body(real.clone()))]);
+        rt().block_on(async {
+            cache.store(14, 8650, 22 * 256 + 100, Cached::Derived(body(8, 80)), false).await;
+            cache.store(14, 8650, 22 * 256 + 101, Cached::Derived(body(9, 80)), false).await;
+        });
+        let s = cache.finish();
+        assert_eq!((s.written, s.dropped), (1, 0), "{s:?}");
+        assert_eq!(get(&pack, (14, 8650, 22), 100), Some(Cached::Body(real)));
+        assert_eq!(raw_entry(&root, 14, 8650, 22 * 256 + 101).map(|e| e.status), Some(STATUS_DERIVED));
     }
 
     #[test]
