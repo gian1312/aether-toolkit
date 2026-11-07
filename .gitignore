@@ -20,3 +20,6 @@ Thumbs.db
 *.pem
 license.key
 vendor_keys.json
+
+# scratch (owner rule: temp files in a gitignored .tmp of the mounted project)
+.tmp/

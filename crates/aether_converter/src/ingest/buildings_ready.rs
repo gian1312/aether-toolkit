@@ -1,6 +1,9 @@
 //! A batch `ingest` that fetches its building tiles while it samples its
 //! terrain: `buildings_pbf_ready` (CONTRACT §9a, changelog 48;
-//! `aether_converter` 0.2.12).
+//! `aether_converter` 0.2.12) — and `buildings_pbf_list` (changelog 51;
+//! 0.2.14), whose list file is the ready signal of the tiles it names, with
+//! the same watcher, hold, lines and timeout; there the directory is never
+//! listed, the named tiles are read (see [`PbfSource`]).
 //!
 //! A batch decodes each `buildings_pbf_dir` once and, without a marker, does
 //! so before its first tile — so a caller had to finish fetching the
@@ -35,6 +38,7 @@
 //! thread.
 
 use super::*;
+use crate::download::ReadySignal;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -47,27 +51,38 @@ pub const HOLD_CAP_BYTES: u64 = 4096 * MB;
 /// a unit mistake (bytes for megabytes), not a budget.
 pub const HOLD_MB_MAX: f64 = 1_048_576.0;
 
-/// A directory's hand-over: the marker's path and how long to wait for it.
-pub type Marker = (PathBuf, Duration);
+/// A building source's hand-over: what to wait for — the
+/// `buildings_pbf_ready` marker or the `buildings_pbf_list` file — and how
+/// long.
+pub type Marker = (ReadySignal, Duration);
 
-/// The hand-over of every `buildings_pbf_dir` of a batch (changelog 48):
-/// `Some(marker)` for a directory whose jobs name a `buildings_pbf_ready`,
-/// `None` for one decoded at launch as before.
+/// The hand-over of every building source of a batch (changelog 48, 51):
+/// `Some(marker)` for a `buildings_pbf_dir` whose jobs name a
+/// `buildings_pbf_ready`, and for every `buildings_pbf_list` (the list file
+/// is its ready signal); `None` for a directory decoded at launch as before.
 ///
 /// Checked before any tile work, nothing read: every job's fields by the
-/// `download` job's rules and messages (changelog 45) — a marker needs
-/// `buildings_pbf_dir`, is one plain file name and no `{z}_{x}_{y}.pbf` tile
-/// name, `buildings_pbf_wait_s` is 0 … 86400 s — and, with a marker,
+/// `download` job's rules and messages (changelog 45, 51) — a marker or a
+/// list needs `buildings_pbf_dir`, the two exclude each other, a marker is
+/// one plain file name and no `{z}_{x}_{y}.pbf` tile name, a list an
+/// absolute path, `buildings_pbf_wait_s` is 0 … 86400 s — and, with either,
 /// `buildings_hold_mb` 0 … [`HOLD_MB_MAX`]; then the jobs naming one
-/// directory must give the same marker and wait (the directory is decoded
-/// once for the run). `buildings_pbf_wait_s` and `buildings_hold_mb` without
-/// a marker are not read.
-pub fn batch_markers(jobs: &[IngestJob]) -> Result<HashMap<PathBuf, Option<Marker>>> {
-    let mut by_dir: HashMap<PathBuf, (usize, Option<Marker>)> = HashMap::new();
+/// directory without a list must give the same marker and wait (the
+/// directory is decoded once for the run), and the jobs naming one list the
+/// same `buildings_pbf_dir` and wait (the list is decoded once for the run).
+/// `buildings_pbf_wait_s` and `buildings_hold_mb` without a marker or list
+/// are not read. The one look at the disk: a list's `buildings_pbf_dir` must
+/// exist ([`crate::download::listed_store_exists`]); neither its listing nor
+/// the list is read here.
+pub fn batch_markers(jobs: &[IngestJob]) -> Result<HashMap<PbfSource, Option<Marker>>> {
+    let mut by_source: HashMap<PbfSource, (usize, Option<Marker>)> = HashMap::new();
+    // Every list's first job and source: one list, one directory.
+    let mut by_list: HashMap<PathBuf, (usize, PbfSource)> = HashMap::new();
     for (i, job) in jobs.iter().enumerate() {
         let in_job = |e: anyhow::Error| anyhow::anyhow!("ingest job for {:?}: {e}", job.output_path);
         let marker = crate::download::buildings_ready_marker(
             job.buildings_pbf_ready.as_deref(),
+            job.buildings_pbf_list.as_deref(),
             job.buildings_pbf_dir.as_deref(),
             job.buildings_pbf_wait_s,
         )
@@ -81,31 +96,66 @@ pub fn batch_markers(jobs: &[IngestJob]) -> Result<HashMap<PathBuf, Option<Marke
                 }
             }
         }
-        let Some(dir) = &job.buildings_pbf_dir else { continue };
-        match by_dir.get(dir) {
+        let Some(source) = job.pbf_source() else { continue };
+        if let PbfSource::List { list, dir } = &source {
+            match by_list.get(list) {
+                None => {
+                    // The store must be there at launch (checked once per list).
+                    crate::download::listed_store_exists(dir).map_err(in_job)?;
+                    by_list.insert(list.clone(), (i, source.clone()));
+                }
+                Some((first, theirs)) if theirs.dir() != dir.as_path() => anyhow::bail!(
+                    "buildings_pbf_list {:?}: the jobs for {:?} and {:?} give it different \
+                     buildings_pbf_dir ({:?} against {:?}); the list is decoded once for the run, \
+                     so every job naming it must give the same",
+                    list,
+                    jobs[*first].output_path,
+                    job.output_path,
+                    theirs.dir(),
+                    dir
+                ),
+                Some(_) => {}
+            }
+        }
+        match by_source.get(&source) {
             None => {
-                by_dir.insert(dir.clone(), (i, marker));
+                by_source.insert(source, (i, marker));
             }
             Some((first, theirs)) if *theirs != marker => {
                 let say = |m: &Option<Marker>| match m {
-                    Some((p, w)) => format!("marker {:?}, {} s", p.file_name().unwrap_or_default(), w.as_secs_f64()),
+                    Some((ReadySignal::Marker(p), w)) => {
+                        format!("marker {:?}, {} s", p.file_name().unwrap_or_default(), w.as_secs_f64())
+                    }
+                    Some((ReadySignal::List(_), w)) => format!("{} s", w.as_secs_f64()),
                     None => "no marker".to_owned(),
                 };
-                anyhow::bail!(
-                    "buildings_pbf_dir {:?}: the jobs for {:?} and {:?} give it different \
-                     buildings_pbf_ready / buildings_pbf_wait_s ({} against {}); the directory is \
-                     decoded once for the run, so every job naming it must give the same",
-                    dir,
-                    jobs[*first].output_path,
-                    job.output_path,
-                    say(theirs),
-                    say(&marker)
-                );
+                match &source {
+                    PbfSource::Dir(dir) => anyhow::bail!(
+                        "buildings_pbf_dir {:?}: the jobs for {:?} and {:?} give it different \
+                         buildings_pbf_ready / buildings_pbf_wait_s ({} against {}); the directory is \
+                         decoded once for the run, so every job naming it must give the same",
+                        dir,
+                        jobs[*first].output_path,
+                        job.output_path,
+                        say(theirs),
+                        say(&marker)
+                    ),
+                    PbfSource::List { list, .. } => anyhow::bail!(
+                        "buildings_pbf_list {:?}: the jobs for {:?} and {:?} give it different \
+                         buildings_pbf_wait_s ({} against {}); the list is decoded once for the run, \
+                         so every job naming it must give the same",
+                        list,
+                        jobs[*first].output_path,
+                        job.output_path,
+                        say(theirs),
+                        say(&marker)
+                    ),
+                }
             }
             Some(_) => {}
         }
     }
-    Ok(by_dir.into_iter().map(|(dir, (_, m))| (dir, m)).collect())
+    Ok(by_source.into_iter().map(|(source, (_, m))| (source, m)).collect())
 }
 
 /// The samples a held tile of *size_px* keeps: `size_px² × 2` bytes.
@@ -124,12 +174,12 @@ pub fn default_hold_bytes(available: u64, threads: usize, per_tile: u64, chunk_c
     (available.saturating_sub(reserved) / 2).min(HOLD_CAP_BYTES).max(largest_tile)
 }
 
-/// The hold budget, in bytes, of a batch that watches the directories
-/// *watched* (changelog 48): the smallest `buildings_hold_mb` their jobs
+/// The hold budget, in bytes, of a batch that watches the building sources
+/// *watched* (changelog 48, 51): the smallest `buildings_hold_mb` their jobs
 /// give — taken as given, `0` holding nothing — else [`default_hold_bytes`]
 /// over the largest of their tiles.
-pub fn hold_budget(jobs: &[IngestJob], watched: &[PathBuf], available: u64, threads: usize, per_tile: u64) -> u64 {
-    let theirs = || jobs.iter().filter(|j| j.buildings_pbf_dir.as_ref().is_some_and(|d| watched.contains(d)));
+pub fn hold_budget(jobs: &[IngestJob], watched: &[PbfSource], available: u64, threads: usize, per_tile: u64) -> u64 {
+    let theirs = || jobs.iter().filter(|j| j.pbf_source().is_some_and(|s| watched.contains(&s)));
     match theirs().filter_map(|j| j.buildings_hold_mb).reduce(f64::min) {
         Some(mb) => (mb * MB as f64) as u64,
         None => {
@@ -139,11 +189,11 @@ pub fn hold_budget(jobs: &[IngestJob], watched: &[PathBuf], available: u64, thre
     }
 }
 
-/// A directory to watch.
+/// A building source to watch: a directory with its marker, or a list.
 pub struct Watched {
-    pub dir: PathBuf,
-    /// `<dir>/<buildings_pbf_ready>`.
-    pub marker: PathBuf,
+    pub source: PbfSource,
+    /// `<dir>/<buildings_pbf_ready>`, or the `buildings_pbf_list` file.
+    pub marker: ReadySignal,
     /// `buildings_pbf_wait_s`.
     pub wait: Duration,
     /// The first look for the marker (at launch, where it was missing):
@@ -160,7 +210,7 @@ enum GateSet {
     Failed,
 }
 
-/// One watched directory.
+/// One watched building source.
 struct Gate {
     marker: PathBuf,
     set: GateSet,
@@ -194,14 +244,15 @@ struct State {
     held_bytes: u64,
 }
 
-/// The `buildings_pbf_ready` hand-over of one batch (changelog 48): the
-/// directories whose marker was missing at launch, the tiles held for them
-/// and the hold budget. See the module documentation.
+/// The `buildings_pbf_ready` / `buildings_pbf_list` hand-over of one batch
+/// (changelog 48, 51): the building sources whose marker or list was
+/// missing at launch, the tiles held for them and the hold budget. See the
+/// module documentation.
 pub struct BuildingsHandOver {
-    /// The watched directories, by gate index.
-    dirs: Vec<PathBuf>,
-    /// Their markers' paths, how long to wait, and the first look.
-    watched: Vec<(PathBuf, Duration, Instant)>,
+    /// The watched building sources, by gate index.
+    sources: Vec<PbfSource>,
+    /// What each waits for, how long, and the first look.
+    watched: Vec<(ReadySignal, Duration, Instant)>,
     /// Bytes the held tiles of all gates may take.
     budget: u64,
     /// Threads that burn and write the held tiles once a set is ready: the
@@ -264,7 +315,7 @@ impl BuildingsHandOver {
         let gates = watched
             .iter()
             .map(|w| Gate {
-                marker: w.marker.clone(),
+                marker: w.marker.path().to_path_buf(),
                 set: GateSet::Pending,
                 queue: VecDeque::new(),
                 waiting_since: None,
@@ -274,7 +325,7 @@ impl BuildingsHandOver {
             })
             .collect();
         BuildingsHandOver {
-            dirs: watched.iter().map(|w| w.dir.clone()).collect(),
+            sources: watched.iter().map(|w| w.source.clone()).collect(),
             watched: watched.into_iter().map(|w| (w.marker, w.wait, w.first_look)).collect(),
             budget,
             drainers: drainers.max(1),
@@ -284,14 +335,14 @@ impl BuildingsHandOver {
         }
     }
 
-    /// How many directories are watched (gate indices `0..gates()`).
+    /// How many building sources are watched (gate indices `0..gates()`).
     pub fn gates(&self) -> usize {
-        self.dirs.len()
+        self.sources.len()
     }
 
-    /// The gate of `buildings_pbf_dir` *dir*, when it is watched.
-    pub fn gate_of(&self, dir: &Path) -> Option<usize> {
-        self.dirs.iter().position(|d| d == dir)
+    /// The gate of the building source *source*, when it is watched.
+    pub fn gate_of(&self, source: &PbfSource) -> Option<usize> {
+        self.sources.iter().position(|s| s == source)
     }
 
     /// Whether the run failed (a marker that did not come, a directory that
@@ -321,47 +372,47 @@ impl BuildingsHandOver {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Watch gate *gate*'s marker, on a thread of its own, from the batch's
-    /// launch to its end: look every 250 ms ([`crate::download::BUILDINGS_MARKER_POLL`])
-    /// until the marker is a file, then *decode* the directory (it prints
-    /// the decode's lines), release the tiles waiting for it — announcing,
-    /// when one did wait, `[Buildings] building tiles ready after <s.s> s`
-    /// (seconds since the `waiting` line) and the hold — and burn and write
-    /// the held tiles, oldest first, on as many threads as the batch has
-    /// (with the workers that come free). A marker still missing
-    /// `buildings_pbf_wait_s` after the first look, or a decode that fails,
-    /// fails the run with that error; nothing of this gate is written then.
-    /// Returns `Ok` also when another gate failed the run.
+    /// Watch gate *gate*'s marker (or list), on a thread of its own, from
+    /// the batch's launch to its end: look every 250 ms
+    /// ([`crate::download::BUILDINGS_MARKER_POLL`]) until it is a file, then
+    /// *decode* the source — the directory, or the tiles the list names (it
+    /// prints the decode's lines) —, release the tiles waiting for it —
+    /// announcing, when one did wait, `[Buildings] building tiles ready after
+    /// <s.s> s` (seconds since the `waiting` line) and the hold — and burn
+    /// and write the held tiles, oldest first, on as many threads as the
+    /// batch has (with the workers that come free). A marker or list still
+    /// missing `buildings_pbf_wait_s` after the first look, or a decode that
+    /// fails, fails the run with that error; nothing of this gate is written
+    /// then. Returns `Ok` also when another gate failed the run.
     pub fn watch(
         &self,
         gate: usize,
-        decode: &(dyn Fn(&Path) -> Result<PbfBuildingSet> + Sync),
+        decode: &(dyn Fn(&PbfSource) -> Result<PbfBuildingSet> + Sync),
         writer: &TileWriter,
     ) -> Result<()> {
         let _unwinding = self.cancel_on_panic();
-        let (marker, wait, first_look) = self.watched[gate].clone();
+        let (signal, wait, first_look) = self.watched[gate].clone();
         loop {
             if self.aborted() {
                 self.fail(gate);
                 return Ok(());
             }
-            if crate::download::buildings_marker_present(&marker) {
+            if crate::download::buildings_marker_present(signal.path()) {
                 break;
             }
             let waited = first_look.elapsed();
             if waited >= wait {
                 self.fail(gate);
                 anyhow::bail!(
-                    "Building tiles not ready: the marker file {} (buildings_pbf_ready) did not \
-                     appear within {} s (buildings_pbf_wait_s); the ingest fails rather than write \
-                     tiles without their buildings",
-                    marker.display(),
+                    "Building tiles not ready: {} did not appear within {} s (buildings_pbf_wait_s); \
+                     the ingest fails rather than write tiles without their buildings",
+                    signal.subject(),
                     wait.as_secs_f64()
                 );
             }
             std::thread::sleep(crate::download::BUILDINGS_MARKER_POLL.min(wait - waited));
         }
-        let set = match decode(&self.dirs[gate]) {
+        let set = match decode(&self.sources[gate]) {
             Ok(set) => set,
             Err(e) => {
                 self.fail(gate);
@@ -533,6 +584,28 @@ mod tests {
         j
     }
 
+    /// A job naming the list *list* (and the directory *dir*, if any).
+    fn listed(out: &str, dir: Option<&str>, list: &Path) -> IngestJob {
+        let mut j = job(out, dir, None);
+        j.buildings_pbf_list = Some(list.to_path_buf());
+        j
+    }
+
+    fn dir_source(dir: &str) -> PbfSource {
+        PbfSource::Dir(PathBuf::from(dir))
+    }
+
+    fn list_source(list: &Path, dir: &str) -> PbfSource {
+        PbfSource::List { list: list.to_path_buf(), dir: PathBuf::from(dir) }
+    }
+
+    /// An absolute list path on every platform (nothing is created).
+    fn abs_list(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(name);
+        assert!(p.is_absolute(), "{p:?}");
+        p
+    }
+
     #[test]
     fn the_default_hold_is_half_of_what_the_pool_leaves_capped_and_never_below_one_tile() {
         const GB: u64 = 1 << 30;
@@ -552,7 +625,7 @@ mod tests {
         let mut b = job("b.abt", Some("pbf"), Some("_ready"));
         let mut c = job("c.abt", Some("other"), Some("_ready"));
         c.size_px = 4000;
-        let watched = [PathBuf::from("pbf")];
+        let watched = [dir_source("pbf")];
         // No value: the default, never below the largest WATCHED tile (1000² × 2).
         let jobs = [a.clone(), b.clone(), c.clone()];
         assert_eq!(hold_budget(&jobs, &watched, 0, 1, 0), 2_000_000);
@@ -567,10 +640,28 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_list_counts_its_own_jobs_for_the_hold() {
+        let list = abs_list("aether_hold_list.txt");
+        // The same directory, once whole (decoded at launch) and once through
+        // the watched list: only the list's jobs give the hold.
+        let mut whole = job("a.abt", Some("pbf"), None);
+        whole.size_px = 4000;
+        whole.buildings_hold_mb = Some(0.0);
+        let mut by_list = listed("b.abt", Some("pbf"), &list);
+        let watched = [list_source(&list, "pbf")];
+        assert_eq!(hold_budget(&[whole.clone(), by_list.clone()], &watched, 0, 1, 0), 2_000_000);
+        by_list.buildings_hold_mb = Some(1.5);
+        assert_eq!(hold_budget(&[whole, by_list], &watched, 0, 1, 0), 3 * MB / 2);
+    }
+
+    #[test]
     fn markers_are_checked_per_job_and_must_agree_per_directory() {
         let m = batch_markers(&[job("a.abt", Some("pbf"), Some("_ready")), job("b.abt", None, None)]).unwrap();
         assert_eq!(m.len(), 1);
-        assert_eq!(m[Path::new("pbf")], Some((Path::new("pbf").join("_ready"), Duration::from_secs(1800))));
+        assert_eq!(
+            m[&dir_source("pbf")],
+            Some((ReadySignal::Marker(Path::new("pbf").join("_ready")), Duration::from_secs(1800)))
+        );
 
         let err = |jobs: &[IngestJob]| batch_markers(jobs).unwrap_err().to_string();
         let e = err(&[job("a.abt", None, Some("_ready"))]);
@@ -587,7 +678,7 @@ mod tests {
         let mut quiet = job("a.abt", Some("pbf"), None);
         quiet.buildings_pbf_wait_s = Some(-1.0);
         quiet.buildings_hold_mb = Some(-1.0);
-        assert_eq!(batch_markers(&[quiet]).unwrap()[Path::new("pbf")], None);
+        assert_eq!(batch_markers(&[quiet]).unwrap()[&dir_source("pbf")], None);
 
         // One directory, two hand-overs: refused.
         let e = err(&[job("a.abt", Some("pbf"), Some("_ready")), job("b.abt", Some("pbf"), None)]);
@@ -598,9 +689,137 @@ mod tests {
         assert!(e.contains("(marker \"_ready\", 1800 s against marker \"_ready\", 60 s)"), "{e}");
     }
 
+    #[test]
+    fn lists_are_checked_per_job_and_decoded_once_per_list() {
+        // A list's store must exist at launch: two real ones.
+        let tmp = tempfile::tempdir().unwrap();
+        let (pbf_dir, other_dir) = (tmp.path().join("pbf"), tmp.path().join("other"));
+        std::fs::create_dir(&pbf_dir).unwrap();
+        std::fs::create_dir(&other_dir).unwrap();
+        let (pbf, other) = (pbf_dir.to_str().unwrap(), other_dir.to_str().unwrap());
+        let (la, lb) = (abs_list("aether_list_a.txt"), abs_list("aether_list_b.txt"));
+        // Two jobs naming one list, one another, one the same directory
+        // whole: three sources — one per list, and the directory, which is
+        // no conflict (it is decoded whole for its job, at launch).
+        let m = batch_markers(&[
+            listed("a.abt", Some(pbf), &la),
+            listed("b.abt", Some(pbf), &la),
+            listed("c.abt", Some(pbf), &lb),
+            job("d.abt", Some(pbf), None),
+        ])
+        .unwrap();
+        assert_eq!(m.len(), 3);
+        let wait = Duration::from_secs(1800);
+        assert_eq!(m[&list_source(&la, pbf)], Some((ReadySignal::List(la.clone()), wait)));
+        assert_eq!(m[&list_source(&lb, pbf)], Some((ReadySignal::List(lb.clone()), wait)));
+        assert_eq!(m[&dir_source(pbf)], None);
+
+        let err = |jobs: &[IngestJob]| batch_markers(jobs).unwrap_err().to_string();
+        let e = err(&[listed("a.abt", None, &la)]);
+        assert_eq!(
+            e,
+            format!(
+                "ingest job for \"a.abt\": buildings_pbf_list {la:?} needs buildings_pbf_dir: the \
+                 listed tile names are files inside that directory"
+            )
+        );
+        let mut both = listed("a.abt", Some(pbf), &la);
+        both.buildings_pbf_ready = Some("_ready".into());
+        assert_eq!(
+            err(&[both]),
+            "ingest job for \"a.abt\": buildings_pbf_list and buildings_pbf_ready exclude each other: \
+             the list file is itself the ready signal (it is read once it exists); give \
+             buildings_pbf_list alone"
+        );
+        let e = err(&[listed("a.abt", Some(pbf), Path::new("list.txt"))]);
+        assert_eq!(
+            e,
+            "ingest job for \"a.abt\": buildings_pbf_list must be the absolute path of a file, got \"list.txt\""
+        );
+        // The store is not there: refused at launch, not when the list comes.
+        let gone = tmp.path().join("gone");
+        let e = err(&[listed("a.abt", gone.to_str(), &la)]);
+        assert_eq!(
+            e,
+            format!(
+                "ingest job for \"a.abt\": buildings_pbf_dir {gone:?} is not a directory; with \
+                 buildings_pbf_list it must exist when the job starts — the listed tiles are read from it"
+            )
+        );
+        // With a list, the wait and the hold are read and checked.
+        let mut w = listed("a.abt", Some(pbf), &la);
+        w.buildings_pbf_wait_s = Some(86_401.0);
+        assert!(err(&[w]).contains("buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got 86401"));
+        let mut h = listed("a.abt", Some(pbf), &la);
+        h.buildings_hold_mb = Some(-0.5);
+        assert!(err(&[h]).contains("buildings_hold_mb must be a number of megabytes from 0 to 1048576, got -0.5"));
+        let mut ok = listed("a.abt", Some(pbf), &la);
+        ok.buildings_pbf_wait_s = Some(0.0);
+        assert_eq!(batch_markers(&[ok]).unwrap()[&list_source(&la, pbf)], Some((ReadySignal::List(la.clone()), Duration::ZERO)));
+
+        // One list is decoded once: every job naming it gives the same
+        // directory and wait.
+        let e = err(&[listed("a.abt", Some(pbf), &la), listed("b.abt", Some(other), &la)]);
+        assert_eq!(
+            e,
+            format!(
+                "buildings_pbf_list {la:?}: the jobs for \"a.abt\" and \"b.abt\" give it different \
+                 buildings_pbf_dir ({pbf_dir:?} against {other_dir:?}); the list is decoded once for the run, \
+                 so every job naming it must give the same"
+            )
+        );
+        let mut late = listed("b.abt", Some(pbf), &la);
+        late.buildings_pbf_wait_s = Some(60.0);
+        let e = err(&[listed("a.abt", Some(pbf), &la), late]);
+        assert_eq!(
+            e,
+            format!(
+                "buildings_pbf_list {la:?}: the jobs for \"a.abt\" and \"b.abt\" give it different \
+                 buildings_pbf_wait_s (1800 s against 60 s); the list is decoded once for the run, so \
+                 every job naming it must give the same"
+            )
+        );
+    }
+
     fn one_gate(marker: PathBuf, wait: Duration) -> BuildingsHandOver {
-        let dir = marker.parent().unwrap().to_path_buf();
-        BuildingsHandOver::new(0, 1, vec![Watched { dir, marker, wait, first_look: Instant::now() }])
+        let source = dir_source(marker.parent().unwrap().to_str().unwrap());
+        BuildingsHandOver::new(
+            0,
+            1,
+            vec![Watched { source, marker: ReadySignal::Marker(marker), wait, first_look: Instant::now() }],
+        )
+    }
+
+    #[test]
+    fn a_list_that_never_comes_fails_its_watcher_naming_the_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let list = tmp.path().join("batch_7.txt");
+        let source = PbfSource::List { list: list.clone(), dir: tmp.path().join("pool") };
+        let h = BuildingsHandOver::new(
+            0,
+            1,
+            vec![Watched {
+                source: source.clone(),
+                marker: ReadySignal::List(list.clone()),
+                wait: Duration::from_millis(300),
+                first_look: Instant::now(),
+            }],
+        );
+        assert_eq!(h.gate_of(&source), Some(0));
+        assert_eq!(h.gate_of(&PbfSource::Dir(tmp.path().join("pool"))), None, "the directory whole is another source");
+        let writer = TileWriter::new(1, 1);
+        let decode = |_: &PbfSource| -> Result<PbfBuildingSet> { panic!("no list, no decode") };
+        let e = h.watch(0, &decode, &writer).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "Building tiles not ready: the list file {} (buildings_pbf_list) did not appear \
+                 within 0.3 s (buildings_pbf_wait_s); the ingest fails rather than write tiles \
+                 without their buildings",
+                list.display()
+            )
+        );
+        assert!(h.aborted());
     }
 
     #[test]
@@ -611,7 +830,7 @@ mod tests {
         let t = Instant::now();
         let h = one_gate(marker.clone(), Duration::from_millis(300));
         let writer = TileWriter::new(1, 1);
-        let decode = |_: &Path| -> Result<PbfBuildingSet> { panic!("no marker, no decode") };
+        let decode = |_: &PbfSource| -> Result<PbfBuildingSet> { panic!("no marker, no decode") };
         let e = h.watch(0, &decode, &writer).unwrap_err().to_string();
         let waited = t.elapsed();
         assert!(waited >= Duration::from_millis(300) && waited < Duration::from_secs(5), "{waited:?}");
@@ -646,7 +865,7 @@ mod tests {
         // A watcher of a cancelled batch ends at its next look, without an
         // error of its own (the panic is the run's error).
         let writer = TileWriter::new(1, 1);
-        let decode = |_: &Path| -> Result<PbfBuildingSet> { panic!("cancelled, no decode") };
+        let decode = |_: &PbfSource| -> Result<PbfBuildingSet> { panic!("cancelled, no decode") };
         assert!(h.watch(0, &decode, &writer).is_ok());
     }
 

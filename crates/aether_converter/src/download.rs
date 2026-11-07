@@ -46,6 +46,13 @@ mod tile_cache;
 #[cfg(feature = "native")]
 use tile_cache::{Cached, TileCache};
 
+// The seam filter of the CLI `download` (`seam_filter`, changelog 49):
+// samples of a mosaic seam turned into voids before the parent fill.
+#[cfg(feature = "native")]
+mod seam;
+#[cfg(feature = "native")]
+use seam::SEAM_VOID_M;
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct DownloadJob {
     pub url_template: String,
@@ -76,11 +83,28 @@ pub struct DownloadJob {
     /// [`buildings_marker`] / [`wait_for_buildings_marker`].
     #[serde(default)]
     pub buildings_pbf_ready: Option<String>,
-    /// How long the buildings post-pass waits for `buildings_pbf_ready`, in
-    /// seconds (additive, changelog 45). Absent → [`BUILDINGS_WAIT_DEFAULT_S`]
-    /// (1800). Read only together with `buildings_pbf_ready`.
+    /// How long the buildings post-pass waits for `buildings_pbf_ready` (or
+    /// for the `buildings_pbf_list` file, changelog 51), in seconds
+    /// (additive, changelog 45). Absent → [`BUILDINGS_WAIT_DEFAULT_S`]
+    /// (1800). Read only together with one of those two.
     #[serde(default)]
     pub buildings_pbf_wait_s: Option<f64>,
+    /// Absolute path of a UTF-8 text file naming, one per line, the building
+    /// tile files (`{z}_{x}_{y}.pbf`) of `buildings_pbf_dir` the post-pass
+    /// burns (additive, CONTRACT §9b, changelog 51; `aether_converter`
+    /// 0.2.14): only those are read — the directory itself is never listed,
+    /// so it may be a store of far more tiles. The file is also the ready
+    /// signal, as `buildings_pbf_ready`'s marker is: the post-pass waits for
+    /// it (polled every 250 ms, for at most `buildings_pbf_wait_s`), then
+    /// reads it and decodes the listed tiles; a list that never comes, or a
+    /// listed tile that is not in the directory, fails the run. Requires
+    /// `buildings_pbf_dir`; excludes `buildings_pbf_ready`. CLI `download`
+    /// full runs and repair jobs alike — a repair burns the listed tiles
+    /// onto its repaired pixels and waits for the list as a full run does
+    /// (it ignores only the marker); the in-memory/WASM downloaders ignore
+    /// it.
+    #[serde(default)]
+    pub buildings_pbf_list: Option<PathBuf>,
     /// Optional fetch region of interest (degrees). When present, only the
     /// source tiles intersecting this box are downloaded and decoded; every
     /// pixel outside keeps the pre-filled `VOID_ELEV` sentinel. The output
@@ -125,6 +149,31 @@ pub struct DownloadJob {
     /// ignore it. See `download/tile_cache.rs`.
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
+    /// The seam filter (additive, CONTRACT §9b, changelog 49;
+    /// `aether_converter` 0.2.13). Absent, `null` or `true`: every Terrarium
+    /// tile of zoom 11 or finer the CLI `download` decodes — fetched, from
+    /// the cache, derived, or a parent of the backfill — has the samples of
+    /// a mosaic seam (both row or both column neighbours more than 2,200 m
+    /// higher) turned into voids, which the parent fill then fills from the
+    /// coarser zooms (`download/seam.rs`). `false`: off — the decode of
+    /// 0.2.12, for A/B runs. Mapbox jobs, the in-memory and the browser
+    /// downloaders are never filtered.
+    #[serde(default)]
+    pub seam_filter: Option<bool>,
+}
+
+impl DownloadJob {
+    /// What the buildings post-pass of a full CLI run burns, `None` without
+    /// a `buildings_pbf_dir`: the whole directory, or the tiles its
+    /// `buildings_pbf_list` names there (changelog 51).
+    #[cfg(feature = "native")]
+    fn pbf_source(&self) -> Option<crate::buildings::PbfSource> {
+        let dir = self.buildings_pbf_dir.clone()?;
+        Some(match &self.buildings_pbf_list {
+            Some(list) => crate::buildings::PbfSource::List { list: list.clone(), dir },
+            None => crate::buildings::PbfSource::Dir(dir),
+        })
+    }
 }
 
 /// Region of interest for [`DownloadJob::fetch_bounds`], in degrees.
@@ -317,6 +366,74 @@ fn samples_to_metres(
         }
     }
     out
+}
+
+/// What a derived Terrarium body (raw tile cache, status 3) stores for a
+/// sample the seam filter voided — RGB `0, 0, 1`, a void to every decoder
+/// (−32767.996 m, below `NODATA_M`), where the service's own void is
+/// `0, 0, 0` (changelog 49). [`TileDecoder::decode`] reads it back as
+/// [`SEAM_VOID_M`], so a seam void stays one across runs.
+#[cfg(feature = "native")]
+const SEAM_VOID_RGB: [u8; 3] = [0, 0, 1];
+
+/// How a CLI `download` run turns tile bytes into samples: the encoding's
+/// decoder, and whether the seam filter (changelog 49, [`seam`]) runs on
+/// every tile it decodes. Every decode of the run's tiles goes through
+/// [`Self::decode`] — fetched, cached, the children a derived tile is built
+/// from, the parent fill's coarser tiles — so the filter has one place.
+#[cfg(feature = "native")]
+#[derive(Clone, Copy)]
+struct TileDecoder {
+    dec: fn(u8, u8, u8) -> f32,
+    /// The seam filter is on: a Terrarium job without `seam_filter: false`.
+    seam: bool,
+}
+
+#[cfg(feature = "native")]
+impl TileDecoder {
+    /// The job's decoder: its encoding (an unknown one is an error) and
+    /// `seam_filter` (absent → on; Terrarium only — a Mapbox tile has no
+    /// void value and its services were not surveyed).
+    fn of(job: &DownloadJob) -> Result<Self> {
+        let enc = job.encoding.to_lowercase();
+        let dec: fn(u8, u8, u8) -> f32 = match enc.as_str() {
+            "terrarium" => dec_terrarium,
+            "mapbox" => dec_mapbox,
+            o => anyhow::bail!("Unknown encoding '{o}'"),
+        };
+        Ok(TileDecoder { dec, seam: enc == "terrarium" && job.seam_filter.unwrap_or(true) })
+    }
+
+    /// The decoder without the seam filter (tests; callers outside a run).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn plain(dec: fn(u8, u8, u8) -> f32) -> Self {
+        TileDecoder { dec, seam: false }
+    }
+
+    /// [`decode_tile`], then — with the filter on — a derived body's
+    /// [`SEAM_VOID_RGB`] samples back to [`SEAM_VOID_M`] (`derived`: the
+    /// body is a status-3 entry of the raw tile cache) and the seam filter
+    /// over the zoom-`zoom` tile ([`Self::filter`]).
+    fn decode(&self, body: &[u8], zoom: u32, derived: bool) -> Result<(Vec<f32>, usize)> {
+        let (mut grid, edge) = decode_tile(body, self.dec)?;
+        if self.seam {
+            if derived {
+                let marked = (self.dec)(SEAM_VOID_RGB[0], SEAM_VOID_RGB[1], SEAM_VOID_RGB[2]);
+                for v in grid.iter_mut().filter(|v| **v == marked) {
+                    *v = SEAM_VOID_M;
+                }
+            }
+            self.filter(&mut grid, edge, zoom);
+        }
+        Ok((grid, edge))
+    }
+
+    /// The seam filter over a decoded or derived zoom-`zoom` tile: its seam
+    /// samples become [`SEAM_VOID_M`]; returns how many. Nothing when the
+    /// filter is off, or below [`seam::SEAM_MIN_ZOOM`].
+    fn filter(&self, grid: &mut [f32], edge: usize, zoom: u32) -> usize {
+        if self.seam { seam::void_seam_notches(grid, edge, zoom) } else { 0 }
+    }
 }
 
 // Terrarium NODATA backfill ---------------------------------------------------
@@ -554,13 +671,14 @@ fn recip(n: usize) -> f32 {
     if n < R.len() { R[n] } else { 1.0 / n as f32 }
 }
 
-/// One fetch + decode of a single tile (no retry) -> (grid, tile edge), or
-/// None; with `keep`, also the answer the raw source-tile cache keeps of it
-/// (changelog 38): the body when it decoded, [`Cached::NoTile`] for a 404,
-/// nothing for any other outcome.
+/// One fetch + decode of a single zoom-`zoom` tile (no retry) -> (grid,
+/// tile edge), or None; with `keep`, also the answer the raw source-tile
+/// cache keeps of it (changelog 38): the body when it decoded — as it
+/// arrived, before the seam filter — [`Cached::NoTile`] for a 404, nothing
+/// for any other outcome.
 #[cfg(feature = "native")]
 async fn fetch_decode_raw(
-    client: &reqwest::Client, url: &str, dec: fn(u8, u8, u8) -> f32, keep: bool,
+    client: &reqwest::Client, url: &str, decoder: TileDecoder, zoom: u32, keep: bool,
 ) -> (Option<(Vec<f32>, usize)>, Option<Cached>) {
     let Ok(resp) = client.get(url).send().await else { return (None, None) };
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -570,7 +688,7 @@ async fn fetch_decode_raw(
         return (None, None);
     }
     let Ok(body) = resp.bytes().await else { return (None, None) };
-    match decode_tile(&body, dec) {
+    match decoder.decode(&body, zoom, false) {
         Ok(grid) => (Some(grid), keep.then(|| Cached::Body(body.to_vec()))),
         Err(_) => (None, None),
     }
@@ -646,7 +764,9 @@ struct AncestorState {
 struct AncestorCache {
     client: reqwest::Client,
     url_template: String,
-    dec: fn(u8, u8, u8) -> f32,
+    /// The run's decoder: an ancestor gets the seam filter like every tile
+    /// of the run (changelog 49).
+    decoder: TileDecoder,
     budget: usize,
     state: std::sync::Mutex<AncestorState>,
     /// The run's raw source-tile cache (changelog 38): an ancestor it holds
@@ -656,32 +776,37 @@ struct AncestorCache {
 
 #[cfg(feature = "native")]
 impl AncestorCache {
+    /// Without the seam filter and without a tile cache (tests; callers
+    /// outside a run).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32) -> Arc<Self> {
         Self::with_budget(client, url_template, dec, ANCESTOR_CACHE_BUDGET)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_budget(
         client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32, budget: usize,
     ) -> Arc<Self> {
-        Self::build(client, url_template, dec, budget, None)
+        Self::build(client, url_template, TileDecoder::plain(dec), budget, None)
     }
 
-    /// [`Self::new`] over the run's raw source-tile cache, if it has one.
+    /// The run's ancestor cache: its decoder, and its raw source-tile
+    /// cache if it has one.
     fn with_tile_cache(
-        client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32,
+        client: reqwest::Client, url_template: &str, decoder: TileDecoder,
         tile_cache: Option<Arc<TileCache>>,
     ) -> Arc<Self> {
-        Self::build(client, url_template, dec, ANCESTOR_CACHE_BUDGET, tile_cache)
+        Self::build(client, url_template, decoder, ANCESTOR_CACHE_BUDGET, tile_cache)
     }
 
     fn build(
-        client: reqwest::Client, url_template: &str, dec: fn(u8, u8, u8) -> f32, budget: usize,
+        client: reqwest::Client, url_template: &str, decoder: TileDecoder, budget: usize,
         tile_cache: Option<Arc<TileCache>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             client,
             url_template: url_template.to_owned(),
-            dec,
+            decoder,
             budget,
             state: std::sync::Mutex::new(AncestorState::default()),
             tile_cache,
@@ -704,7 +829,8 @@ impl AncestorCache {
                     return None;
                 }
                 Some(c) => {
-                    if let Some(Ok(grid)) = c.body().map(|b| decode_tile(b, self.dec)) {
+                    let derived = matches!(c, Cached::Derived(_));
+                    if let Some(Ok(grid)) = c.body().map(|b| self.decoder.decode(b, z, derived)) {
                         tc.count(Use::ParentHit);
                         return Some(grid);
                     }
@@ -714,7 +840,7 @@ impl AncestorCache {
             tc.count(Use::ParentFetched);
         }
         let (got, keep) = tokio::time::timeout(
-            PARENT_FILL_DEADLINE, fetch_decode_raw(&self.client, url, self.dec, tc.is_some()),
+            PARENT_FILL_DEADLINE, fetch_decode_raw(&self.client, url, self.decoder, z, tc.is_some()),
         )
         .await
         .unwrap_or((None, None));
@@ -777,6 +903,9 @@ struct ParentFill {
     /// The coarsest zoom that supplied at least one pixel; `None` if no
     /// ancestor supplied any (only possible when the tile itself arrived).
     coarsest_zoom: Option<u32>,
+    /// `(zoom, samples)` each ancestor supplied, finest first, only those
+    /// that supplied any (the `[Backfill]` lines, changelog 49).
+    filled: Vec<(u32, usize)>,
 }
 
 /// [`fill_from_parents_cached`] with a cache of its own — one tile, no
@@ -819,7 +948,7 @@ async fn fill_from_parents_cached(
         (0..grid.len()).filter(|&i| grid[i] <= NODATA_M).collect();
     let had_tile = ts != 0;
     if had_tile && missing.is_empty() {
-        return Some(ParentFill { grid, edge: ts, coarsest_zoom: None });
+        return Some(ParentFill { grid, edge: ts, coarsest_zoom: None, filled: Vec::new() });
     }
 
     let levels = z.saturating_sub(NODATA_FILL_MIN_ZOOM) as usize;
@@ -843,6 +972,7 @@ async fn fill_from_parents_cached(
     }
 
     let mut coarsest_zoom = None;
+    let mut filled = Vec::new();
     for (i, anc) in fetched.into_iter().enumerate() {
         if had_tile && missing.is_empty() { break; }
         let Some(anc) = anc else { continue };
@@ -870,13 +1000,14 @@ async fn fill_from_parents_cached(
             });
             if missing.len() < before {
                 coarsest_zoom = Some(z - level);
+                filled.push((z - level, before - missing.len()));
             }
         }
     }
     // Without the tile itself, an ancestor that decoded to all-void supplied
     // no terrain either: that is a hole, not a repair.
     (had_tile || coarsest_zoom.is_some())
-        .then_some(ParentFill { grid, edge: ts, coarsest_zoom })
+        .then_some(ParentFill { grid, edge: ts, coarsest_zoom, filled })
 }
 
 /// Why a source-tile fetch failed, after all its retries.
@@ -968,6 +1099,47 @@ const DEGRADED_LIST_CAP: usize = 20_000;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // CLI `download` only
 fn degraded_line(z: u32, x: u32, y: u32, why: FetchFailure, filled_from: u32) -> String {
     format!("[Degraded] z={z} x={x} y={y} reason={} filled_from=z{filled_from}", why.reason())
+}
+
+/// How many `[Backfill]` tile lines a run writes to the `AETHER_DIAG_FILE`
+/// before it only counts (changelog 49).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // CLI `download` only
+const BACKFILL_LIST_CAP: usize = 20_000;
+
+/// The per-tile `[Backfill]` line (diagnostic, `AETHER_DIAG_FILE` only;
+/// changelog 49): one arrived tile's void samples — `seam` of them made by
+/// the seam filter — the samples each coarser zoom filled, and those left
+/// void. E.g. `[Backfill] z=15 x=17294 y=11552: 512 void px (512 seam),
+/// 512 filled (z13 512), 0 left void`.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // CLI `download` only
+fn backfill_line(z: u32, x: u32, y: u32, void: usize, seam: usize, left: usize, filled: &[(u32, usize)]) -> String {
+    let from: Vec<String> = filled.iter().map(|(fz, n)| format!("z{fz} {n}")).collect();
+    let from = if from.is_empty() { String::new() } else { format!(" ({})", from.join(", ")) };
+    format!(
+        "[Backfill] z={z} x={x} y={y}: {void} void px ({seam} seam), {} filled{from}, {left} left void",
+        void - left
+    )
+}
+
+/// The in-tile backfill of a run (changelog 49): the tiles that arrived —
+/// fetched, from the raw tile cache or derived — with void samples, the
+/// service's own (at or below `NODATA_M`) and those the seam filter made.
+/// A tile that never arrived and was repaired whole is counted by
+/// `[Stats] Repaired from coarser parent tiles:` as before, not here.
+#[derive(Default)]
+struct BackfillStats {
+    /// Tiles with at least one sample filled, the samples filled, and how
+    /// many of those were seam samples.
+    tiles: AtomicUsize,
+    px: AtomicU64,
+    seam_px: AtomicU64,
+    /// Tiles with void samples no coarser zoom filled, those samples, and
+    /// how many of those were seam samples.
+    left_tiles: AtomicUsize,
+    left_px: AtomicU64,
+    left_seam_px: AtomicU64,
+    /// Tiles noted (the `[Backfill]` lines written, up to the cap).
+    noted: AtomicUsize,
 }
 
 /// The XYZ tile edge this run assembles for, taken from the tiles themselves.
@@ -1065,6 +1237,8 @@ struct DownloadStats {
     /// The raw source-tile cache's `[Stats] Cache…` lines (changelog 38),
     /// printed last in the block; empty when the run had no cache.
     cache_lines: std::sync::Mutex<Vec<String>>,
+    /// The in-tile backfill (`[Stats] Backfill:`, changelog 49).
+    backfill: BackfillStats,
 }
 
 impl DownloadStats {
@@ -1094,6 +1268,7 @@ impl DownloadStats {
             backfilled: AtomicUsize::new(0),
             degraded: AtomicUsize::new(0),
             cache_lines: std::sync::Mutex::new(Vec::new()),
+            backfill: BackfillStats::default(),
         }
     }
 
@@ -1187,6 +1362,60 @@ impl DownloadStats {
         out
     }
 
+    /// Count one arrived tile's void samples and what the parent fill made
+    /// of them (changelog 49): `void` of the tile's samples were void before
+    /// the fill (`seam` of them made by the seam filter), `left` (`seam_left`)
+    /// still are, `filled` says which zoom supplied how many. Each such tile,
+    /// while under [`BACKFILL_LIST_CAP`], gets a `[Backfill]` line in the
+    /// `AETHER_DIAG_FILE` — never on the console, where a GUI showing the
+    /// converter's output would drown in them.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // CLI `download` only
+    #[allow(clippy::too_many_arguments)]
+    fn note_backfill(
+        &self, z: u32, x: u32, y: u32, void: usize, seam: usize, left: usize, seam_left: usize,
+        filled: &[(u32, usize)],
+    ) {
+        let b = &self.backfill;
+        if void > left {
+            b.tiles.fetch_add(1, Ordering::Relaxed);
+            b.px.fetch_add((void - left) as u64, Ordering::Relaxed);
+            b.seam_px.fetch_add(seam.saturating_sub(seam_left) as u64, Ordering::Relaxed);
+        }
+        if left > 0 {
+            b.left_tiles.fetch_add(1, Ordering::Relaxed);
+            b.left_px.fetch_add(left as u64, Ordering::Relaxed);
+            b.left_seam_px.fetch_add(seam_left as u64, Ordering::Relaxed);
+        }
+        if b.noted.fetch_add(1, Ordering::Relaxed) < BACKFILL_LIST_CAP {
+            crate::diag::keep(&backfill_line(z, x, y, void, seam, left, filled));
+        }
+    }
+
+    /// The `[Stats] Backfill:` line (informational, changelog 49), or
+    /// `None` when no arrived tile had a void sample:
+    /// `[Stats] Backfill: <n> px in <m> tile(s) filled from coarser zooms
+    /// (<k> px seam samples)`, followed by `; <l> px in <t> tile(s) left
+    /// void (<s> px seam samples)` when some found no coarser data.
+    fn backfill_summary(&self) -> Option<String> {
+        let b = &self.backfill;
+        let px = b.px.load(Ordering::Relaxed);
+        let left = b.left_px.load(Ordering::Relaxed);
+        if px + left == 0 {
+            return None;
+        }
+        let mut line = format!(
+            "[Stats] Backfill: {} px in {} tile(s) filled from coarser zooms ({} px seam samples)",
+            px, b.tiles.load(Ordering::Relaxed), b.seam_px.load(Ordering::Relaxed)
+        );
+        if left > 0 {
+            line.push_str(&format!(
+                "; {} px in {} tile(s) left void ({} px seam samples)",
+                left, b.left_tiles.load(Ordering::Relaxed), b.left_seam_px.load(Ordering::Relaxed)
+            ));
+        }
+        Some(line)
+    }
+
     /// Count a stalled tile; prints its `[Download] STALL` line for the first
     /// [`STALL_LINES`], then one suppression note (the summary counts all) —
     /// on stderr, and in the `AETHER_DIAG_FILE` too (changelog 46).
@@ -1243,7 +1472,10 @@ impl DownloadStats {
     /// `retries` says what the `[Stats] Retries:` line may claim for the path
     /// that ran: [`Retries::Counted`] with that path's per-tile maximum, or
     /// [`Retries::Browser`] when the browser retried and nothing was counted.
-    fn log_summary(&self, elapsed: f64, retries: Retries) {
+    /// `peak_rss` is the CLI `download`'s `[Stats] Peak RSS:` line
+    /// ([`Self::log_cli_summary`]); `None` on the in-memory and browser paths,
+    /// which run inside another program's process.
+    fn log_summary(&self, elapsed: f64, retries: Retries, peak_rss: Option<&str>) {
         // Every line of the block goes to stderr as before and, when
         // `AETHER_DIAG_FILE` is set, into that file too (changelog 46).
         macro_rules! out {
@@ -1343,12 +1575,56 @@ impl DownloadStats {
             }
         }
 
+        // The in-tile backfill (changelog 49; informational): before the
+        // cache lines, which stay last; every earlier line keeps its place.
+        // Its per-tile lines went to the diagnostic file only, and so does
+        // the note on those past the cap.
+        if let Some(line) = self.backfill_summary() {
+            out!("{line}");
+        }
+        let noted = self.backfill.noted.load(Ordering::Relaxed);
+        if noted > BACKFILL_LIST_CAP {
+            crate::diag::keep(&format!("[Backfill] … {} more tile(s) not listed", noted - BACKFILL_LIST_CAP));
+        }
+
+        // The process's peak memory (changelog 50; informational): after
+        // every other line but the cache lines, which stay last.
+        if let Some(line) = peak_rss {
+            out!("{line}");
+        }
+
         // The raw source-tile cache (changelog 38; informational): last, so
         // every earlier line keeps its place in the block.
         for line in self.cache_lines.lock().map(|l| l.clone()).unwrap_or_default() {
             out!("{line}");
         }
     }
+
+    /// The `[Stats]` block of a CLI `download` pass — a full run, whose
+    /// `ram_budget` it names, or a repair (`None`: a repair has no budget) —
+    /// on success and on the fatal path alike: [`Self::log_summary`] with the
+    /// process's peak resident memory so far ([`peak_rss_line`], changelog
+    /// 50).
+    #[cfg(feature = "native")]
+    fn log_cli_summary(&self, elapsed: f64, ram_budget: Option<usize>) {
+        let peak_rss = peak_rss_line(crate::proc_usage::read().peak_rss, ram_budget);
+        self.log_summary(elapsed, Retries::Counted(STRIP_MAX_RETRIES), peak_rss.as_deref());
+    }
+}
+
+/// The `[Stats] Peak RSS:` line (CLI `download`, changelog 50; informational,
+/// not parsed): `[Stats] Peak RSS: <mb> MB (RAM budget <mb> MB)` — the
+/// process's peak resident memory in MB with one decimal, and the run's RAM
+/// budget as `[Download] RAM budget:` printed it (`>> 20`); a repair, which
+/// has no budget, ends at `MB`. `None` when the OS did not give the peak
+/// ([`crate::proc_usage`]): no line, never 0.
+#[cfg(feature = "native")]
+fn peak_rss_line(peak_rss: Option<u64>, ram_budget: Option<usize>) -> Option<String> {
+    let peak = crate::proc_usage::mb(peak_rss?);
+    Some(match ram_budget {
+        Some(budget) => format!("[Stats] Peak RSS: {peak} MB (RAM budget {} MB)", budget >> 20),
+        None => format!("[Stats] Peak RSS: {peak} MB"),
+    })
 }
 
 /// The per-tile retry budget a `[Stats] Retries:` line describes.
@@ -2113,7 +2389,8 @@ struct FetchCtx {
     client: reqwest::Client,
     url_template: Arc<str>,
     zoom: u32,
-    dec: fn(u8, u8, u8) -> f32,
+    /// The run's decoder, seam filter included (changelog 49).
+    decoder: TileDecoder,
     /// Tile tasks one [`download_tiles`] call keeps alive at once (what its
     /// `buffer_unordered` allowed before changelog 36); the gate decides how
     /// many of them request at once.
@@ -2160,17 +2437,19 @@ struct CacheUse {
 #[cfg(feature = "native")]
 impl CacheUse {
     /// Tile `(x, y)` from the cache, if its entry is there and its body
-    /// still checks out: `Ok` the decoded tile, `Err` a cached HTTP 404. A
-    /// body that fails its CRC or its decode is no hit (`None`): the tile is
+    /// still checks out: `Ok` the decoded tile (the seam filter run on it,
+    /// as on a fetched one — changelog 49), `Err` a cached HTTP 404. A body
+    /// that fails its CRC or its decode is no hit (`None`): the tile is
     /// fetched and its entry rewritten.
-    fn hit(&self, zoom: u32, x: u32, y: u32, dec: fn(u8, u8, u8) -> f32) -> Option<Result<(Vec<f32>, usize)>> {
+    fn hit(&self, zoom: u32, x: u32, y: u32, decoder: TileDecoder) -> Option<Result<(Vec<f32>, usize)>> {
         if !self.read {
             return None;
         }
         let e = self.index.get(&(x, y))?;
         match self.cache.read(zoom, x, y, e)? {
             Cached::NoTile => Some(Err(HttpStatus { code: 404, retry_after: None }.into())),
-            Cached::Body(body) | Cached::Derived(body) => decode_tile(&body, dec).ok().map(Ok),
+            Cached::Body(body) => decoder.decode(&body, zoom, false).ok().map(Ok),
+            Cached::Derived(body) => decoder.decode(&body, zoom, true).ok().map(Ok),
         }
     }
 
@@ -2200,11 +2479,12 @@ fn is_http_404(e: &anyhow::Error) -> bool {
 
 /// Open the job's raw source-tile cache, if it names one (changelog 38). A
 /// directory that cannot be used costs one `[Warn]` line and the run goes on
-/// without a cache — never an error.
+/// without a cache — never an error. It derives with the run's seam filter
+/// (changelog 49).
 #[cfg(feature = "native")]
-fn open_tile_cache(job: &DownloadJob) -> Option<Arc<TileCache>> {
+fn open_tile_cache(job: &DownloadJob, decoder: TileDecoder) -> Option<Arc<TileCache>> {
     let dir = job.cache_dir.as_deref().filter(|d| !d.as_os_str().is_empty())?;
-    match TileCache::open(dir, &job.url_template, &job.encoding) {
+    match TileCache::open_for_run(dir, &job.url_template, &job.encoding, decoder.seam) {
         Ok(c) => Some(c),
         Err(reason) => {
             eprintln!("[Warn] cache_dir {} cannot be used ({reason}); downloading without cache",
@@ -2261,7 +2541,7 @@ async fn download_tiles(ctx: &FetchCtx, coords: Vec<(u32, u32)>) -> Vec<TileResu
 async fn fetch_over_network(
     ctx: &FetchCtx, tx: u32, ty: u32,
 ) -> (Instant, Result<(Vec<f32>, usize)>, Option<FetchTiming>, Option<Vec<u8>>) {
-    let (zoom, dec, tile_deadline) = (ctx.zoom, ctx.dec, ctx.tile_deadline);
+    let (zoom, decoder, tile_deadline) = (ctx.zoom, ctx.decoder, ctx.tile_deadline);
     let (stats, gate) = (&*ctx.stats, &*ctx.gate);
     let url = ctx.url_template
         .replace("{x}", &tx.to_string())
@@ -2329,7 +2609,9 @@ async fn fetch_over_network(
                 // CPUs were the limit (changelog 36).
                 #[cfg(test)]
                 if let Some(hook) = ctx.on_decode { hook(); }
-                let decoded = decode_tile(&body, dec);
+                // The seam filter runs here too (changelog 49); the cache
+                // keeps the body as it arrived.
+                let decoded = decoder.decode(&body, zoom, false);
                 if decoded.is_ok() && ctx.cache.is_some() {
                     kept = Some(body);
                 }
@@ -2363,7 +2645,7 @@ async fn fetch_over_network(
 /// alike, parent-fill, classify, report.
 #[cfg(feature = "native")]
 async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
-    let (zoom, dec, total) = (ctx.zoom, ctx.dec, ctx.total);
+    let (zoom, decoder, total) = (ctx.zoom, ctx.decoder, ctx.total);
     let (stats, gate, progress) = (&*ctx.stats, &*ctx.gate, &*ctx.progress);
 
     // The raw source-tile cache (changelog 38). A hit takes no connection
@@ -2378,7 +2660,7 @@ async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
     // has a tile) goes to the parent fill like a cached one.
     let t_hit = Instant::now();
     let mut used = tile_cache::Use::Hit;
-    let mut hit = ctx.cache.as_ref().and_then(|c| c.hit(zoom, tx, ty, dec));
+    let mut hit = ctx.cache.as_ref().and_then(|c| c.hit(zoom, tx, ty, decoder));
     if hit.is_none() {
         if let Some(c) = &ctx.cache {
             hit = c.derive(zoom, tx, ty).await;
@@ -2434,12 +2716,24 @@ async fn fetch_tile(ctx: &FetchCtx, tx: u32, ty: u32) -> TileResult {
         }
     } else if matches!(&result, Ok((g, _)) if g.iter().any(|&v| v <= NODATA_M)) {
         if let Ok((g, ts)) = result {
-            result = fill_from_parents_cached(
+            // The void samples before the fill — the service's own and the
+            // seam filter's (SEAM_VOID_M, also below NODATA_M) — and after:
+            // `[Stats] Backfill:` and the tile's `[Backfill]` line
+            // (changelog 49). They used to be filled without a word.
+            let seam = |g: &[f32]| if decoder.seam { g.iter().filter(|&&v| v == SEAM_VOID_M).count() } else { 0 };
+            let void = g.iter().filter(|&&v| v <= NODATA_M).count();
+            let seam_before = seam(&g);
+            let fill = fill_from_parents_cached(
                 &ctx.ancestors, zoom, tx, ty, Some((g, ts)), PARENT_FILL_DEADLINE,
             )
-            .await
-            .map(|f| (f.grid, f.edge))
-            .ok_or_else(|| anyhow::anyhow!("unreachable: edge was known"));
+            .await;
+            if let Some(f) = &fill {
+                let left = f.grid.iter().filter(|&&v| v <= NODATA_M).count();
+                stats.note_backfill(zoom, tx, ty, void, seam_before, left, seam(&f.grid), &f.filled);
+            }
+            result = fill
+                .map(|f| (f.grid, f.edge))
+                .ok_or_else(|| anyhow::anyhow!("unreachable: edge was known"));
         }
     }
 
@@ -3432,12 +3726,18 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
 
     let start = Instant::now();
     let conns = job.max_connections.unwrap_or(256);
-    let dec: fn(u8, u8, u8) -> f32 = match job.encoding.to_lowercase().as_str() {
-        "terrarium" => dec_terrarium,
-        "mapbox" => dec_mapbox,
-        o => anyhow::bail!("Unknown encoding '{o}'"),
-    };
+    // The encoding's decoder and the seam filter (changelog 49): a repair
+    // decodes its tiles exactly as the full run did.
+    let decoder = TileDecoder::of(&job)?;
     let tile_deadline = job_tile_deadline(&job)?;
+    // `buildings_pbf_list` (changelog 51) is honoured as by a full run: its
+    // fields checked here, before any request, by the same rules; the list
+    // waited for and decoded at the burn below. Without a list the marker
+    // and its wait are ignored, as always (changelog 45) — not even checked.
+    let list_signal = match &job.buildings_pbf_list {
+        Some(_) => buildings_marker(&job)?,
+        None => None,
+    };
     if list.is_empty() {
         anyhow::bail!("repair_source_tiles is empty — nothing to repair");
     }
@@ -3484,7 +3784,7 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
     // tiles on purpose, so it reads none of them from the cache, and writes
     // their fresh answers over the cached ones. The parent fill uses the
     // cache as in a full run.
-    let tile_cache = open_tile_cache(&job);
+    let tile_cache = open_tile_cache(&job, decoder);
     if tile_cache.is_some() {
         eprintln!("[Download] cache: 0 of {total} source tiles from cache (a repair refetches every listed tile)");
     }
@@ -3500,9 +3800,9 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
             loop { every.tick().await; g.tick(); }
         })
     };
-    let ancestors = AncestorCache::with_tile_cache(client.clone(), &job.url_template, dec, tile_cache.clone());
+    let ancestors = AncestorCache::with_tile_cache(client.clone(), &job.url_template, decoder, tile_cache.clone());
     let ctx = FetchCtx {
-        client, url_template: job.url_template.as_str().into(), zoom, dec, concurrency: conns,
+        client, url_template: job.url_template.as_str().into(), zoom, decoder, concurrency: conns,
         progress: Arc::new(AtomicUsize::new(0)), total, stats: stats.clone(), start_time: start,
         gate: gate.clone(), unstarted: None, ancestors, tile_deadline,
         cache: tile_cache.as_ref().map(|c| CacheUse {
@@ -3525,7 +3825,7 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
     let failed = stats.fatal_errors();
     let attempted = stats.total_tiles();
     if fetch_failure_is_fatal(failed, attempted) {
-        stats.log_summary(start.elapsed().as_secs_f64(), Retries::Counted(STRIP_MAX_RETRIES));
+        stats.log_cli_summary(start.elapsed().as_secs_f64(), None);
         anyhow::bail!(
             "Tile download failed: {} of {} listed repair tiles ({}%) could not be fetched; \
              nothing was written — the existing .abt files are unchanged. Errors: {}.",
@@ -3606,11 +3906,21 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
     // carries the original run's buildings and stays as it is. A repair
     // ignores `buildings_pbf_ready` / `buildings_pbf_wait_s` (changelog 45):
     // it patches a finished run, whose post-pass already waited for the
-    // marker, and reads the directory as it finds it, as before.
-    if let Some(pbf_dir) = &job.buildings_pbf_dir {
+    // marker, and reads the directory as it finds it. A `buildings_pbf_list`
+    // (changelog 51) it honours as a full run's post-pass does: the same
+    // tiles — the listed ones, the directory never listed — and, before
+    // them, the same wait for the list when it is not there (a repair that
+    // rewrote no pixel burns nothing and looks for nothing). A list that
+    // does not come, or names a tile the directory does not hold, fails the
+    // repair here, before any file is written.
+    let mut waited = std::time::Duration::ZERO;
+    if let Some(source) = job.pbf_source() {
         if patched_px > 0 {
-            use crate::buildings::{load_pbf_building_dir, rasterize_buildings, AbtGrid, RasterOpts, TileRef};
-            let set = load_pbf_building_dir(pbf_dir)?;
+            use crate::buildings::{rasterize_buildings, AbtGrid, RasterOpts, TileRef};
+            if let Some((signal, wait)) = &list_signal {
+                waited = wait_for_buildings_marker(signal, *wait).await?;
+            }
+            let set = source.load()?;
             let opts = RasterOpts::default();
             let mut px_b = 0usize;
             for (&sti, mask) in &masks {
@@ -3665,7 +3975,9 @@ async fn run_repair_async(job: DownloadJob, list: Vec<[u32; 3]>) -> Result<()> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    stats.log_summary(elapsed, Retries::Counted(STRIP_MAX_RETRIES));
+    // The wait for the list is not download time (as in a full run): 0
+    // without a list, so such a repair prints exactly what it did before.
+    stats.log_cli_summary(elapsed - waited.as_secs_f64(), None);
     if still_failed > 0 {
         eprintln!("[Download] repair: {} listed tile(s) still failed with no coarser fill; \
                    their pixels were left unchanged", still_failed);
@@ -3757,15 +4069,14 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     let start = Instant::now();
     let conns = job.max_connections.unwrap_or(256);
 
-    let dec: fn(u8, u8, u8) -> f32 = match job.encoding.to_lowercase().as_str() {
-        "terrarium" => dec_terrarium,
-        "mapbox" => dec_mapbox,
-        o => anyhow::bail!("Unknown encoding '{o}'"),
-    };
+    // The encoding's decoder and the seam filter (`seam_filter`, changelog
+    // 49): every tile this run decodes goes through it.
+    let decoder = TileDecoder::of(&job)?;
 
-    // The building-tile hand-over (`buildings_pbf_ready`, changelog 45):
-    // checked here, before any request or file; the directory itself is not
-    // looked at until the buildings post-pass at the end.
+    // The building-tile hand-over (`buildings_pbf_ready`, changelog 45, or
+    // `buildings_pbf_list`, changelog 51): checked here, before any request
+    // or file; neither the directory nor the list is looked at until the
+    // buildings post-pass at the end.
     let marker = buildings_marker(&job)?;
 
     // 1. Full bbox.
@@ -3849,7 +4160,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     //     the latter; an entry whose bytes then fail their CRC or decode, or
     //     a derivation that fails after all, is fetched, which `[Stats]
     //     Cache:` reports.
-    let tile_cache = open_tile_cache(&job);
+    let tile_cache = open_tile_cache(&job, decoder);
     let cache_use = tile_cache.as_ref().map(|c| {
         let tiles = row_tiles.iter().zip(y0..).flat_map(|(cols, ty)| cols.iter().map(move |&tx| (tx, ty)));
         let index = c.index(job.zoom, tiles);
@@ -3973,14 +4284,14 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
 
     let tile_deadline = job_tile_deadline(&job)?;
     let fetch = FetchCtx {
-        client: client.clone(), url_template: job.url_template.as_str().into(), zoom, dec,
+        client: client.clone(), url_template: job.url_template.as_str().into(), zoom, decoder,
         concurrency: conns, progress: Arc::new(AtomicUsize::new(0)), total,
         stats: stats.clone(), start_time: start, gate: gate.clone(),
         unstarted: Some(unstarted.clone()),
         // One ancestor cache for the whole run: the parent fill of every
         // strip shares it, so each ancestor is fetched once (changelog 28) —
         // or not at all when the raw source-tile cache has it (changelog 38).
-        ancestors: AncestorCache::with_tile_cache(client.clone(), &job.url_template, dec, tile_cache.clone()),
+        ancestors: AncestorCache::with_tile_cache(client.clone(), &job.url_template, decoder, tile_cache.clone()),
         tile_deadline,
         cache: cache_use,
         #[cfg(test)]
@@ -4409,7 +4720,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         if let Ok(mut l) = stats.cache_lines.lock() { *l = lines; }
     }
     if fetch_failure_is_fatal(failed, attempted) {
-        stats.log_summary(start.elapsed().as_secs_f64(), Retries::Counted(STRIP_MAX_RETRIES));
+        stats.log_cli_summary(start.elapsed().as_secs_f64(), Some(budget));
         let no_data = stats.no_data_count();
         let degraded = stats.degraded_count();
         anyhow::bail!(
@@ -4442,16 +4753,18 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     }
 
     // With `buildings_pbf_ready` the directory may still be filling while
-    // the terrain came in: wait for its marker first (changelog 45). A
-    // marker that never comes is an error, so `cleanup` removes the outputs
-    // — terrain without the buildings the job asked for is never left
-    // behind to be pooled as terrain with them.
+    // the terrain came in: wait for its marker first (changelog 45) — with
+    // `buildings_pbf_list`, for the list (changelog 51). A marker or list
+    // that never comes is an error, so `cleanup` removes the outputs —
+    // terrain without the buildings the job asked for is never left behind
+    // to be pooled as terrain with them; so is a listed tile that is not in
+    // the directory.
     let mut waited = std::time::Duration::ZERO;
-    if let Some(pbf_dir) = &job.buildings_pbf_dir {
-        if let Some((path, wait)) = &marker {
-            waited = wait_for_buildings_marker(path, *wait).await?;
+    if let Some(source) = job.pbf_source() {
+        if let Some((signal, wait)) = &marker {
+            waited = wait_for_buildings_marker(signal, *wait).await?;
         }
-        apply_buildings_post_pass(pbf_dir, &abt_specs, &mut tile_voids)?;
+        apply_buildings_post_pass(&source, &abt_specs, &mut tile_voids)?;
     }
 
     // Every output is finished: one `[Tile] <name> voids=<n>` line per output,
@@ -4464,7 +4777,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     // The wait for the building tiles is not download time: `[Stats]
     // Downloaded: … in <s>` leaves it out, `TOTAL` keeps it (0 without a
     // marker, so such a run prints exactly what it did before).
-    stats.log_summary(elapsed - waited.as_secs_f64(), Retries::Counted(STRIP_MAX_RETRIES));
+    stats.log_cli_summary(elapsed - waited.as_secs_f64(), Some(budget));
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     cleanup.keep();
     Ok(DownloadReport {
@@ -4490,15 +4803,20 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
 /// valid ground lands on the void samples its footprint reaches (see
 /// [`crate::buildings::RasterizeStats::voids_filled`]).
 #[cfg(feature = "native")]
-fn apply_buildings_post_pass(pbf_dir: &Path, abt_specs: &[(SubTileSpec, PathBuf)], voids: &mut [u64]) -> Result<()> {
-    use crate::buildings::{load_pbf_building_dir, rasterize_buildings, AbtGrid, RasterOpts, TileRef};
+fn apply_buildings_post_pass(
+    source: &crate::buildings::PbfSource,
+    abt_specs: &[(SubTileSpec, PathBuf)],
+    voids: &mut [u64],
+) -> Result<()> {
+    use crate::buildings::{rasterize_buildings, AbtGrid, RasterOpts, TileRef};
 
     let t0 = Instant::now();
 
-    // 1. Decode every PBF tile once. The shared loader also refuses a
-    //    mixed-zoom directory, which would apply every above-ground height
-    //    twice — see `load_pbf_building_dir`.
-    let set = load_pbf_building_dir(pbf_dir)?;
+    // 1. Decode every PBF tile once — the directory's, or with
+    //    `buildings_pbf_list` the listed ones only (changelog 51). The shared
+    //    loader also refuses mixed zooms, which would apply every
+    //    above-ground height twice — see `load_pbf_building_dir`.
+    let set = source.load()?;
 
     if set.buildings.is_empty() {
         eprintln!("[Buildings] {} pbf tile(s), no buildings in extent", set.tiles_read);
@@ -4574,86 +4892,171 @@ fn print_tile_void_lines(abt_specs: &[(SubTileSpec, PathBuf)], voids: &[u64]) {
 pub const BUILDINGS_WAIT_DEFAULT_S: f64 = 1800.0;
 
 /// How often the buildings post-pass looks for the `buildings_pbf_ready`
-/// marker (a batch `ingest`'s watcher too, changelog 48).
+/// marker (a batch `ingest`'s watcher too, changelog 48) or the
+/// `buildings_pbf_list` file (changelog 51).
 #[cfg(feature = "native")]
 pub(crate) const BUILDINGS_MARKER_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The `buildings_pbf_ready` hand-over of a full CLI `download` (changelog
-/// 45): the marker's path and how long to wait for it, or `None` for a job
-/// without the field, whose post-pass runs as it always did.
-///
-/// Checked before any request; nothing here touches the disk — the
-/// directory is not looked at until the post-pass. The marker must be one
-/// plain file name (no separator, not `.`/`..`), and not one the building
-/// loader would take for a `{z}_{x}_{y}.pbf` tile; `buildings_pbf_wait_s`
-/// (absent → [`BUILDINGS_WAIT_DEFAULT_S`]) is a number of seconds from 0 to
-/// 86400 and is not read without a marker.
+/// What declares a job's building tiles complete, by its path — the file
+/// the converter waits for: the `buildings_pbf_ready` marker inside
+/// `buildings_pbf_dir` (changelog 45, 48), or the `buildings_pbf_list` file
+/// itself (changelog 51).
 #[cfg(feature = "native")]
-fn buildings_marker(job: &DownloadJob) -> Result<Option<(PathBuf, std::time::Duration)>> {
-    buildings_ready_marker(
-        job.buildings_pbf_ready.as_deref(),
-        job.buildings_pbf_dir.as_deref(),
-        job.buildings_pbf_wait_s,
-    )
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadySignal {
+    /// `<buildings_pbf_dir>/<buildings_pbf_ready>`.
+    Marker(PathBuf),
+    /// `buildings_pbf_list`.
+    List(PathBuf),
 }
 
-/// The `buildings_pbf_ready` hand-over of a job — the marker's path and how
-/// long to wait for it, or `None` without a marker — from its
-/// `buildings_pbf_ready`, `buildings_pbf_dir` and `buildings_pbf_wait_s`:
-/// the rules and messages of [`buildings_marker`], shared by the CLI
-/// `download` (changelog 45) and a batch `ingest` (changelog 48). Touches
-/// no disk.
+#[cfg(feature = "native")]
+impl ReadySignal {
+    /// The file waited for.
+    pub fn path(&self) -> &Path {
+        match self {
+            ReadySignal::Marker(p) | ReadySignal::List(p) => p,
+        }
+    }
+
+    /// What did not come, in the `Building tiles not ready:` error: `the
+    /// marker file <path> (buildings_pbf_ready)` or `the list file <path>
+    /// (buildings_pbf_list)`.
+    pub fn subject(&self) -> String {
+        match self {
+            ReadySignal::Marker(p) => format!("the marker file {} (buildings_pbf_ready)", p.display()),
+            ReadySignal::List(p) => format!("the list file {} (buildings_pbf_list)", p.display()),
+        }
+    }
+}
+
+/// The building-tile hand-over of a full CLI `download`: the marker's
+/// (`buildings_pbf_ready`, changelog 45) or list's (`buildings_pbf_list`,
+/// changelog 51) path and how long to wait for it, or `None` for a job with
+/// neither, whose post-pass runs as it always did.
+///
+/// Checked before any request. The marker must be one plain file name (no
+/// separator, not `.`/`..`), and not one the building loader would take for
+/// a `{z}_{x}_{y}.pbf` tile; the list an absolute path, not given together
+/// with a marker; either needs `buildings_pbf_dir`; `buildings_pbf_wait_s`
+/// (absent → [`BUILDINGS_WAIT_DEFAULT_S`]) is a number of seconds from 0 to
+/// 86400 and is not read without one of them. Nothing in the directory and
+/// not the list is looked at until the post-pass; only with a list must the
+/// directory itself exist already ([`listed_store_exists`]).
+#[cfg(feature = "native")]
+fn buildings_marker(job: &DownloadJob) -> Result<Option<(ReadySignal, std::time::Duration)>> {
+    let marker = buildings_ready_marker(
+        job.buildings_pbf_ready.as_deref(),
+        job.buildings_pbf_list.as_deref(),
+        job.buildings_pbf_dir.as_deref(),
+        job.buildings_pbf_wait_s,
+    )?;
+    if let (Some((ReadySignal::List(_), _)), Some(dir)) = (&marker, &job.buildings_pbf_dir) {
+        listed_store_exists(dir)?;
+    }
+    Ok(marker)
+}
+
+/// With `buildings_pbf_list` (changelog 51), `buildings_pbf_dir` — the
+/// store the listed tiles are read from — must exist when the job starts:
+/// the caller creates it before launching (the Waveshed plugin does), as a
+/// batch decoding a directory at launch has always needed it. A job naming
+/// one that is not there is refused before it runs, with the directory
+/// loader's message and why; only the directory's existence is looked at,
+/// never its listing. (A `buildings_pbf_ready` directory, by contrast, need
+/// not exist until its marker does.)
+#[cfg(feature = "native")]
+pub(crate) fn listed_store_exists(dir: &Path) -> Result<()> {
+    if !dir.is_dir() {
+        anyhow::bail!(
+            "buildings_pbf_dir {dir:?} is not a directory; with buildings_pbf_list it must exist when the \
+             job starts — the listed tiles are read from it"
+        );
+    }
+    Ok(())
+}
+
+/// The building-tile hand-over of a job — what to wait for and for how
+/// long, or `None` without `buildings_pbf_ready` and `buildings_pbf_list` —
+/// from those two, `buildings_pbf_dir` and `buildings_pbf_wait_s`: the rules
+/// and messages of [`buildings_marker`], shared by the CLI `download`
+/// (changelog 45, 51) and a batch `ingest` (changelog 48, 51). Touches no
+/// disk.
 #[cfg(feature = "native")]
 pub(crate) fn buildings_ready_marker(
     ready: Option<&str>,
+    list: Option<&Path>,
     dir: Option<&Path>,
     wait_s: Option<f64>,
-) -> Result<Option<(PathBuf, std::time::Duration)>> {
-    let Some(name) = ready else { return Ok(None) };
-    let Some(dir) = dir else {
-        anyhow::bail!(
-            "buildings_pbf_ready {name:?} needs buildings_pbf_dir: the marker is a file \
-             inside that directory"
-        );
+) -> Result<Option<(ReadySignal, std::time::Duration)>> {
+    let signal = match (ready, list) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => anyhow::bail!(
+            "buildings_pbf_list and buildings_pbf_ready exclude each other: the list file is \
+             itself the ready signal (it is read once it exists); give buildings_pbf_list alone"
+        ),
+        (None, Some(list)) => {
+            if dir.is_none() {
+                anyhow::bail!(
+                    "buildings_pbf_list {list:?} needs buildings_pbf_dir: the listed tile names \
+                     are files inside that directory"
+                );
+            }
+            if !list.is_absolute() {
+                anyhow::bail!("buildings_pbf_list must be the absolute path of a file, got {list:?}");
+            }
+            ReadySignal::List(list.to_path_buf())
+        }
+        (Some(name), None) => {
+            let Some(dir) = dir else {
+                anyhow::bail!(
+                    "buildings_pbf_ready {name:?} needs buildings_pbf_dir: the marker is a file \
+                     inside that directory"
+                );
+            };
+            let mut parts = Path::new(name).components();
+            let plain = !name.contains(['/', '\\'])
+                && matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None));
+            if !plain {
+                anyhow::bail!("buildings_pbf_ready must be a file name inside buildings_pbf_dir, got {name:?}");
+            }
+            if crate::ingest::parse_pbf_tile_name(name).is_some() {
+                anyhow::bail!(
+                    "buildings_pbf_ready {name:?} is named like a building tile ({{z}}_{{x}}_{{y}}.pbf) \
+                     and would be decoded as one; choose another name"
+                );
+            }
+            ReadySignal::Marker(dir.join(name))
+        }
     };
-    let mut parts = Path::new(name).components();
-    let plain = !name.contains(['/', '\\'])
-        && matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None));
-    if !plain {
-        anyhow::bail!("buildings_pbf_ready must be a file name inside buildings_pbf_dir, got {name:?}");
-    }
-    if crate::ingest::parse_pbf_tile_name(name).is_some() {
-        anyhow::bail!(
-            "buildings_pbf_ready {name:?} is named like a building tile ({{z}}_{{x}}_{{y}}.pbf) \
-             and would be decoded as one; choose another name"
-        );
-    }
     let secs = wait_s.unwrap_or(BUILDINGS_WAIT_DEFAULT_S);
     if !(secs.is_finite() && (0.0..=86_400.0).contains(&secs)) {
         anyhow::bail!("buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got {secs}");
     }
-    Ok(Some((dir.join(name), std::time::Duration::from_secs_f64(secs))))
+    Ok(Some((signal, std::time::Duration::from_secs_f64(secs))))
 }
 
-/// Whether the `buildings_pbf_ready` marker *marker* is there: a regular
-/// file, not merely an entry — a directory of that name is no marker
-/// (changelog 45; a batch `ingest` looks the same way, changelog 48).
+/// Whether the `buildings_pbf_ready` marker (or `buildings_pbf_list` file)
+/// *marker* is there: a regular file, not merely an entry — a directory of
+/// that name is no marker (changelog 45; a batch `ingest` looks the same
+/// way, changelog 48; the list too, changelog 51).
 #[cfg(feature = "native")]
 pub(crate) fn buildings_marker_present(marker: &Path) -> bool {
     fs::metadata(marker).is_ok_and(|m| m.is_file())
 }
 
-/// Wait until the `buildings_pbf_ready` marker *marker* exists as a file
-/// (changelog 45): one look at once, then one every
-/// [`BUILDINGS_MARKER_POLL`]. When it is not there at the first look the
-/// wait is announced once, `[Buildings] waiting for the building tiles
-/// (<marker>)`, and its end once, `[Buildings] building tiles ready after
-/// <s.s> s`; a marker there at once prints nothing. One still missing after
-/// *wait* fails the run — the job asked for buildings, and a run without
-/// them is never silent. Returns the time waited (zero when the marker was
-/// there at once).
+/// Wait until *signal* — the `buildings_pbf_ready` marker (changelog 45) or
+/// the `buildings_pbf_list` file (changelog 51) — exists as a file: one look
+/// at once, then one every [`BUILDINGS_MARKER_POLL`]. When it is not there
+/// at the first look the wait is announced once, `[Buildings] waiting for
+/// the building tiles (<path>)`, and its end once, `[Buildings] building
+/// tiles ready after <s.s> s`; a file there at once prints nothing. One
+/// still missing after *wait* fails the run — the job asked for buildings,
+/// and a run without them is never silent. Returns the time waited (zero
+/// when the file was there at once).
 #[cfg(feature = "native")]
-async fn wait_for_buildings_marker(marker: &Path, wait: std::time::Duration) -> Result<std::time::Duration> {
+async fn wait_for_buildings_marker(signal: &ReadySignal, wait: std::time::Duration) -> Result<std::time::Duration> {
+    let marker = signal.path();
     let t0 = Instant::now();
     let mut announced = false;
     loop {
@@ -4673,10 +5076,9 @@ async fn wait_for_buildings_marker(marker: &Path, wait: std::time::Duration) -> 
         let waited = t0.elapsed();
         if waited >= wait {
             anyhow::bail!(
-                "Building tiles not ready: the marker file {} (buildings_pbf_ready) did not \
-                 appear within {} s (buildings_pbf_wait_s); the download fails rather than \
-                 leave terrain without its buildings",
-                marker.display(),
+                "Building tiles not ready: {} did not appear within {} s (buildings_pbf_wait_s); \
+                 the download fails rather than leave terrain without its buildings",
+                signal.subject(),
                 wait.as_secs_f64()
             );
         }
@@ -5072,7 +5474,7 @@ pub async fn run_download_mem(
     let retries = Retries::Counted(RAW_MAX_RETRIES);
     #[cfg(target_arch = "wasm32")]
     let retries = Retries::Browser(WEB_MAX_RETRIES);
-    stats.log_summary(elapsed, retries);
+    stats.log_summary(elapsed, retries, None);
     eprintln!("[DownloadMem] TOTAL: {:.1}s", elapsed);
     Ok(result)
 }
@@ -5770,7 +6172,8 @@ mod tests {
 
         // No void on that terrain, and the burn makes none.
         let mut voids = [0u64];
-        apply_buildings_post_pass(&pbf_dir, &[(spec, path.clone())], &mut voids).unwrap();
+        let source = crate::buildings::PbfSource::Dir(pbf_dir.clone());
+        apply_buildings_post_pass(&source, &[(spec, path.clone())], &mut voids).unwrap();
         assert_eq!(voids, [0]);
 
         // 200 m ground + a 12 m render_height = 212 m = 424 half-metres.
@@ -5798,7 +6201,8 @@ mod tests {
         fs::write(dir.path().join("14_8531_5752.pbf"), synthetic_building_tile()).unwrap();
         fs::write(dir.path().join("15_17062_11504.pbf"), synthetic_building_tile()).unwrap();
 
-        let err = apply_buildings_post_pass(dir.path(), &[], &mut []).unwrap_err().to_string();
+        let source = crate::buildings::PbfSource::Dir(dir.path().to_path_buf());
+        let err = apply_buildings_post_pass(&source, &[], &mut []).unwrap_err().to_string();
         assert!(err.contains("buildings_pbf_dir mixes zoom levels"), "got {err:?}");
     }
 
@@ -6576,7 +6980,7 @@ mod tests {
         let coords: Vec<(u32, u32)> = (0..32u32).map(|i| (8640 + i % 8, 5700 + i / 8)).collect();
         let ctx = |n: usize| FetchCtx {
             client: client.clone(), url_template: tpl.as_str().into(), zoom: 14,
-            dec: dec_terrarium, concurrency: 32, progress: Arc::new(AtomicUsize::new(0)),
+            decoder: TileDecoder::plain(dec_terrarium), concurrency: 32, progress: Arc::new(AtomicUsize::new(0)),
             total: n, stats: Arc::new(DownloadStats::new()), start_time: Instant::now(),
             gate: Arc::new(ConnGate::new(32)), unstarted: None,
             ancestors: AncestorCache::new(client.clone(), &tpl, dec_terrarium),
@@ -6666,5 +7070,166 @@ mod tests {
         } else {
             assert_eq!(got, None, "reported {got:?} B — the root disk's space, not /dev/shm's");
         }
+    }
+
+    // -- The seam filter at the decode (changelog 49) ---------------------------
+
+    /// A 256 px Terrarium PNG of `f(px, py)` metres (1/256-m steps).
+    fn terrarium_png_of(f: impl Fn(usize, usize) -> f64) -> Vec<u8> {
+        let rgb: Vec<u8> = (0..256 * 256).flat_map(|i| enc_terrarium(f(i % 256, i / 256))).collect();
+        let mut out = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut out, 256, 256);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgb).unwrap();
+        }
+        out
+    }
+
+    /// Terrain at 2,400 m with the 10°E seam in columns 52 (−9,300 m) and
+    /// 53 (−500 m), and Terrarium voids in columns 0 … 9.
+    fn seam_tile() -> Vec<u8> {
+        terrarium_png_of(|px, py| match px {
+            0..=9 => -32768.0,
+            52 => -9300.0,
+            53 => -500.0,
+            _ => 2400.0 + px as f64 * 0.5 - py as f64 * 0.25,
+        })
+    }
+
+    fn job_with(encoding: &str, seam_filter: Option<bool>) -> DownloadJob {
+        let mut j = serde_json::json!({
+            "url_template": "http://t/{z}/{x}/{y}.png", "encoding": encoding,
+            "output_dir": "out", "zoom": 15, "tiles": [],
+        });
+        if let Some(on) = seam_filter {
+            j["seam_filter"] = serde_json::json!(on);
+        }
+        serde_json::from_value(j).unwrap()
+    }
+
+    #[test]
+    fn the_seam_filter_is_on_for_terrarium_unless_the_job_turns_it_off() {
+        assert!(TileDecoder::of(&job_with("terrarium", None)).unwrap().seam, "absent: on");
+        assert!(TileDecoder::of(&job_with("Terrarium", Some(true))).unwrap().seam);
+        assert!(!TileDecoder::of(&job_with("terrarium", Some(false))).unwrap().seam);
+        // `null` is "absent".
+        let j: DownloadJob = serde_json::from_str(r#"{"url_template": "u", "encoding": "terrarium",
+            "output_dir": "o", "zoom": 15, "tiles": [], "seam_filter": null}"#).unwrap();
+        assert!(TileDecoder::of(&j).unwrap().seam);
+        // Mapbox is never filtered, whatever the job says.
+        assert!(!TileDecoder::of(&job_with("mapbox", Some(true))).unwrap().seam);
+        assert!(TileDecoder::of(&job_with("lerc", None)).is_err());
+    }
+
+    #[test]
+    fn the_decoder_voids_the_seam_and_with_the_filter_off_decodes_as_before() {
+        let body = seam_tile();
+        let (plain, edge) = decode_tile(&body, dec_terrarium).unwrap();
+        // Off: exactly `decode_tile`, every sample, for a service body and a
+        // derived one alike.
+        let off = TileDecoder::of(&job_with("terrarium", Some(false))).unwrap();
+        for derived in [false, true] {
+            let (g, e) = off.decode(&body, 15, derived).unwrap();
+            assert_eq!(e, edge);
+            assert!(g.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        // On: columns 52 and 53 become seam voids — 53 in the second pass —
+        // and nothing else changes; the service's own voids stay theirs.
+        let on = TileDecoder::of(&job_with("terrarium", None)).unwrap();
+        let (g, _) = on.decode(&body, 15, false).unwrap();
+        for (i, (a, b)) in g.iter().zip(&plain).enumerate() {
+            match i % 256 {
+                52 | 53 => assert_eq!(*a, SEAM_VOID_M, "sample {i}"),
+                _ => assert_eq!(a.to_bits(), b.to_bits(), "sample {i}"),
+            }
+        }
+        assert_eq!(g.iter().filter(|&&v| v == -32768.0).count(), 10 * 256);
+        // Below zoom 11 the decode is `decode_tile`'s.
+        let (g, _) = on.decode(&body, 10, false).unwrap();
+        assert!(g.iter().zip(&plain).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    #[test]
+    fn a_derived_body_keeps_its_seam_voids_across_runs() {
+        // A derived Terrarium body writes a seam void as 0, 0, 1: a void to
+        // every decoder (an older converter's too), a seam void again to a
+        // filtering run, and a plain void to a run without the filter.
+        let marked = dec_terrarium(SEAM_VOID_RGB[0], SEAM_VOID_RGB[1], SEAM_VOID_RGB[2]);
+        assert!(marked <= NODATA_M && marked != -32768.0);
+        assert_eq!(enc_terrarium(marked as f64), SEAM_VOID_RGB);
+        let body = terrarium_png_of(|px, _| if px == 7 { marked as f64 } else { 1000.0 });
+        let on = TileDecoder::of(&job_with("terrarium", None)).unwrap();
+        let (g, _) = on.decode(&body, 14, true).unwrap();
+        assert!((0..256).all(|r| g[r * 256 + 7] == SEAM_VOID_M));
+        // The same value in a body the service sent is the service's void.
+        let (g, _) = on.decode(&body, 14, false).unwrap();
+        assert!((0..256).all(|r| g[r * 256 + 7] == marked));
+        let off = TileDecoder::of(&job_with("terrarium", Some(false))).unwrap();
+        let (g, _) = off.decode(&body, 14, true).unwrap();
+        assert!((0..256).all(|r| g[r * 256 + 7] == marked));
+    }
+
+    #[test]
+    fn the_backfill_is_counted_and_described_per_tile() {
+        // The per-tile line (AETHER_DIAG_FILE only) and the [Stats] line.
+        assert_eq!(
+            backfill_line(15, 17294, 11552, 512, 512, 0, &[(13, 512)]),
+            "[Backfill] z=15 x=17294 y=11552: 512 void px (512 seam), 512 filled (z13 512), 0 left void"
+        );
+        assert_eq!(
+            backfill_line(15, 1, 2, 70, 6, 10, &[(14, 50), (12, 10)]),
+            "[Backfill] z=15 x=1 y=2: 70 void px (6 seam), 60 filled (z14 50, z12 10), 10 left void"
+        );
+        assert_eq!(backfill_line(15, 1, 2, 9, 0, 9, &[]), "[Backfill] z=15 x=1 y=2: 9 void px (0 seam), 0 filled, 9 left void");
+        let stats = DownloadStats::new();
+        assert_eq!(stats.backfill_summary(), None, "nothing void: no line");
+        stats.note_backfill(15, 17293, 11552, 65536, 0, 0, 0, &[(13, 65536)]);
+        stats.note_backfill(15, 17294, 11552, 512, 512, 0, 0, &[(13, 512)]);
+        assert_eq!(
+            stats.backfill_summary().as_deref(),
+            Some("[Stats] Backfill: 66048 px in 2 tile(s) filled from coarser zooms (512 px seam samples)")
+        );
+        // Samples no coarser zoom had: a clause of their own.
+        stats.note_backfill(15, 1, 2, 100, 40, 30, 10, &[(14, 70)]);
+        stats.note_backfill(15, 1, 3, 8, 0, 8, 0, &[]);
+        assert_eq!(
+            stats.backfill_summary().as_deref(),
+            Some("[Stats] Backfill: 66118 px in 3 tile(s) filled from coarser zooms (542 px seam samples); \
+                  38 px in 2 tile(s) left void (10 px seam samples)")
+        );
+    }
+
+    #[test]
+    fn the_peak_rss_line_names_the_budget_of_a_full_run_and_is_omitted_when_unknown() {
+        assert_eq!(
+            peak_rss_line(Some(4_323_803_136), Some(2048 << 20)).as_deref(),
+            Some("[Stats] Peak RSS: 4123.5 MB (RAM budget 2048 MB)")
+        );
+        // The budget as `[Download] RAM budget:` prints it: whole MB, rounded down.
+        assert_eq!(
+            peak_rss_line(Some(812 << 20), Some((1024 << 20) + 12345)).as_deref(),
+            Some("[Stats] Peak RSS: 812.0 MB (RAM budget 1024 MB)")
+        );
+        // A repair has no budget.
+        assert_eq!(peak_rss_line(Some(4_323_803_136), None).as_deref(), Some("[Stats] Peak RSS: 4123.5 MB"));
+        // The OS did not say: no line, never `0`.
+        assert_eq!(peak_rss_line(None, Some(2048 << 20)), None);
+        assert_eq!(peak_rss_line(None, None), None);
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn the_peak_rss_line_of_this_process_is_plausible() {
+        let line = peak_rss_line(crate::proc_usage::read().peak_rss, Some(256 << 20))
+            .expect("Linux, macOS and Windows report a peak RSS");
+        let mb: f64 = line
+            .strip_prefix("[Stats] Peak RSS: ")
+            .and_then(|v| v.strip_suffix(" MB (RAM budget 256 MB)"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("not a Peak RSS line: {line:?}"));
+        let ram_mb = crate::proc_usage::total_ram() as f64 / (1u64 << 20) as f64;
+        assert!(mb > 1.0 && mb < ram_mb, "peak {mb} MB is not between 1 MB and the RAM ({ram_mb} MB): {line}");
     }
 }

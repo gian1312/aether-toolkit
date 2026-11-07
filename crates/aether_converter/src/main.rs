@@ -10,6 +10,7 @@ mod ingest;
 mod mvt;
 mod plan;
 mod probe;
+mod proc_usage;
 mod tiff_io;
 
 // The native Windows binary allocates through mimalloc (CONTRACT changelog
@@ -189,22 +190,55 @@ fn pbf_decoded_line(set: &buildings::PbfBuildingSet, secs: f64) -> String {
     )
 }
 
-/// Decode the building directory *dir* for a batch, with its lines (CONTRACT
-/// §9a, changelog 44): the start line, a progress line every
-/// [`PBF_PROGRESS_EVERY`] tiles, the summary line. On *pool* — the batch's
-/// at launch; a pool of its size beside it when the directory is decoded
-/// late (`buildings_pbf_ready`, changelog 48) — or, without one, on rayon's
-/// global pool.
+/// The start line of a `buildings_pbf_list` decode (CONTRACT §9a,
+/// changelog 51): `<n>` the distinct names the list names, a plain integer;
+/// `<dir>` the job's `buildings_pbf_dir` exactly as given, between quotes —
+/// not the `Debug` form the directory's start line prints, which doubles a
+/// Windows path's backslashes.
+fn pbf_list_decode_line(n: usize, dir: &std::path::Path) -> String {
+    format!("[Rust] Decoding {n} listed building tiles from \"{}\" (once for the run)...", dir.display())
+}
+
+/// Decode the building source *source* for a batch, with its lines
+/// (CONTRACT §9a, changelog 44): the start line, a progress line every
+/// [`PBF_PROGRESS_EVERY`] tiles, the summary line. A directory starts with
+/// `[Rust] Decoding building tiles in "<dir>" (once for the run)...`; a
+/// `buildings_pbf_list` (changelog 51) is read first and starts with
+/// `[Rust] Decoding <n> listed building tiles from "<dir>" (once for the
+/// run)...`, `<n>` the distinct names it lists — only those are read. On
+/// *pool* — the batch's at launch; a pool of its size beside it when the
+/// source is decoded late (`buildings_pbf_ready`, changelog 48, or a list
+/// that was missing at launch) — or, without one, on rayon's global pool.
 #[cfg(feature = "native")]
-fn decode_building_dir(pool: Option<&rayon::ThreadPool>, dir: &std::path::Path) -> anyhow::Result<buildings::PbfBuildingSet> {
+fn decode_building_source(
+    pool: Option<&rayon::ThreadPool>,
+    source: &buildings::PbfSource,
+) -> anyhow::Result<buildings::PbfBuildingSet> {
     use std::io::Write;
-    println!("[Rust] Decoding building tiles in {:?} (once for the run)...", dir);
-    let t0 = std::time::Instant::now();
-    let load = || buildings::load_pbf_building_dir_with_progress(dir, &print_pbf_decode_progress);
-    let set = match pool {
-        Some(pool) => pool.install(load),
-        None => load(),
-    }?;
+    let (set, t0) = match source {
+        buildings::PbfSource::Dir(dir) => {
+            println!("[Rust] Decoding building tiles in {:?} (once for the run)...", dir);
+            let t0 = std::time::Instant::now();
+            let load = || buildings::load_pbf_building_dir_with_progress(dir, &print_pbf_decode_progress);
+            let set = match pool {
+                Some(pool) => pool.install(load),
+                None => load(),
+            }?;
+            (set, t0)
+        }
+        buildings::PbfSource::List { list, dir } => {
+            // The whole load is timed: the list's read too.
+            let t0 = std::time::Instant::now();
+            let list = buildings::read_pbf_list(list)?;
+            println!("{}", pbf_list_decode_line(list.names().len(), dir));
+            let load = || buildings::load_pbf_building_list_with_progress(dir, &list, &print_pbf_decode_progress);
+            let set = match pool {
+                Some(pool) => pool.install(load),
+                None => load(),
+            }?;
+            (set, t0)
+        }
+    };
     println!("{}", pbf_decoded_line(&set, t0.elapsed().as_secs_f64()));
     let _ = std::io::stdout().flush();
     Ok(set)
@@ -273,8 +307,9 @@ fn main() -> anyhow::Result<()> {
                     job.effective_sources()?;
                 }
                 // The building-tile hand-over (`buildings_pbf_ready`,
-                // changelog 48): every job's fields, and one hand-over per
-                // directory, checked before anything is read.
+                // changelog 48; `buildings_pbf_list`, changelog 51): every
+                // job's fields, and one hand-over per directory or list,
+                // checked before anything is read.
                 let markers = ingest::buildings_ready::batch_markers(&jobs)?;
 
                 // --- THREAD COUNT FROM A PER-JOB MEMORY ESTIMATE ---
@@ -344,18 +379,21 @@ fn main() -> anyhow::Result<()> {
                 // this first look (changelog 48) is not decoded here: it is
                 // watched while the tiles start, and decoded when the marker
                 // appears. A marker that is there decodes now, as without one.
-                let mut pbf_sets: HashMap<PathBuf, buildings::PbfBuildingSet> = HashMap::new();
+                // A `buildings_pbf_list` (changelog 51) is a source of its
+                // own — the listed tiles of its directory, never the
+                // directory's listing — and its file is its marker.
+                let mut pbf_sets: HashMap<buildings::PbfSource, buildings::PbfBuildingSet> = HashMap::new();
                 let mut watched: Vec<ingest::buildings_ready::Watched> = Vec::new();
                 for job in &jobs {
-                    if let Some(dir) = &job.buildings_pbf_dir {
-                        if pbf_sets.contains_key(dir) || watched.iter().any(|w| &w.dir == dir) {
+                    if let Some(source) = job.pbf_source() {
+                        if pbf_sets.contains_key(&source) || watched.iter().any(|w| w.source == source) {
                             continue;
                         }
-                        if let Some(Some((marker, wait))) = markers.get(dir) {
+                        if let Some(Some((marker, wait))) = markers.get(&source) {
                             let first_look = std::time::Instant::now();
-                            if !download::buildings_marker_present(marker) {
+                            if !download::buildings_marker_present(marker.path()) {
                                 watched.push(ingest::buildings_ready::Watched {
-                                    dir: dir.clone(),
+                                    source,
                                     marker: marker.clone(),
                                     wait: *wait,
                                     first_look,
@@ -363,15 +401,16 @@ fn main() -> anyhow::Result<()> {
                                 continue;
                             }
                         }
-                        let set = decode_building_dir(Some(&pool), dir)?;
-                        pbf_sets.insert(dir.clone(), set);
+                        let set = decode_building_source(Some(&pool), &source)?;
+                        pbf_sets.insert(source, set);
                     }
                 }
                 // The tiles finished before their building set is decoded are
                 // held, up to this budget (changelog 48).
                 let handover = (!watched.is_empty()).then(|| {
-                    let dirs: Vec<PathBuf> = watched.iter().map(|w| w.dir.clone()).collect();
-                    let budget = ingest::buildings_ready::hold_budget(&jobs, &dirs, available_ram, safe_threads, per_job);
+                    let sources: Vec<buildings::PbfSource> = watched.iter().map(|w| w.source.clone()).collect();
+                    let budget =
+                        ingest::buildings_ready::hold_budget(&jobs, &sources, available_ram, safe_threads, per_job);
                     ingest::buildings_ready::BuildingsHandOver::new(budget, safe_threads, watched)
                 });
 
@@ -391,17 +430,17 @@ fn main() -> anyhow::Result<()> {
                 // buffers are reused by the next tiles (one per thread).
                 let writer = ingest::TileWriter::new((safe_threads / 2).clamp(1, 4), safe_threads);
 
-                // A watched directory is decoded on a pool of the batch's
+                // A watched source is decoded on a pool of the batch's
                 // size beside the batch's own, whose threads may be waiting
                 // for that very set (changelog 48).
-                let decode_late = |dir: &std::path::Path| -> anyhow::Result<buildings::PbfBuildingSet> {
+                let decode_late = |source: &buildings::PbfSource| -> anyhow::Result<buildings::PbfBuildingSet> {
                     match rayon::ThreadPoolBuilder::new()
                         .num_threads(safe_threads)
                         .thread_name(|i| format!("aether-pbf-{i}"))
                         .build()
                     {
-                        Ok(late_pool) => decode_building_dir(Some(&late_pool), dir),
-                        Err(_) => decode_building_dir(None, dir),
+                        Ok(late_pool) => decode_building_source(Some(&late_pool), source),
+                        Err(_) => decode_building_source(None, source),
                     }
                 };
                 let handed_over: anyhow::Result<()> = std::thread::scope(|s| {
@@ -428,9 +467,10 @@ fn main() -> anyhow::Result<()> {
                                 .unwrap_or_else(|| job.output_path.display().to_string());
                             let tally = tally.clone();
                             let done: ingest::TileDone = Box::new(move |result| tally.tile_done(&tile_name, result));
+                            let source = job.pbf_source();
                             let gate = handover
                                 .as_ref()
-                                .and_then(|h| Some((h, h.gate_of(job.buildings_pbf_dir.as_deref()?)?)));
+                                .and_then(|h| Some((h, h.gate_of(source.as_ref()?)?)));
                             match gate {
                                 Some((h, g)) => h.process(g, job, texture_cache.clone(), &opts, &writer, done),
                                 None => {
@@ -439,10 +479,7 @@ fn main() -> anyhow::Result<()> {
                                     if handover.as_ref().is_some_and(|h| h.aborted()) {
                                         return;
                                     }
-                                    let pbf = match &job.buildings_pbf_dir {
-                                        Some(dir) => pbf_sets.get(dir),
-                                        None => None,
-                                    };
+                                    let pbf = source.as_ref().and_then(|s| pbf_sets.get(s));
                                     ingest::process_tile_batched(job, texture_cache.clone(), pbf, &opts, &writer, done);
                                 }
                             }
@@ -580,6 +617,21 @@ mod tests {
         for line in due(2500) {
             assert!(!line.contains("Progress:"), "{line:?}");
         }
+    }
+
+    #[test]
+    fn the_list_decode_line_names_the_directory_as_given_and_counts_plainly() {
+        // The Waveshed plugin compares the line with the one it expects.
+        assert_eq!(
+            pbf_list_decode_line(21000, std::path::Path::new(r"C:\Users\me\cache\pool\0a1b2c")),
+            r#"[Rust] Decoding 21000 listed building tiles from "C:\Users\me\cache\pool\0a1b2c" (once for the run)..."#
+        );
+        assert_eq!(
+            pbf_list_decode_line(0, std::path::Path::new("/cache//pool/./0a1b2c")),
+            r#"[Rust] Decoding 0 listed building tiles from "/cache//pool/./0a1b2c" (once for the run)..."#
+        );
+        assert!(!pbf_list_decode_line(1_234_567, std::path::Path::new("p")).contains("Progress:"));
+        assert!(pbf_list_decode_line(1_234_567, std::path::Path::new("p")).contains(" 1234567 listed "));
     }
 
     #[test]

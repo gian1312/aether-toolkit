@@ -1258,6 +1258,379 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    the three fields and reads the directory at launch — `buildings_pbf_dir
 >    … is not a directory` when it does not exist yet, else whatever it
 >    holds then — and keeps the voids lines off the diag file.
+> 49. **CLI `download`: the seam filter — samples of a tile service's mosaic
+>    seam become voids, which the parent fill fills; `seam_filter` job field;
+>    the backfill reported — `[Stats] Backfill:`, and `[Backfill]` lines per
+>    tile in `AETHER_DIAG_FILE` (§1.2, §1.5, §2, §6, §9b; additive;
+>    `aether_converter` 0.2.13; 2026-11-05).** Motivation: AWS Terrarium's
+>    zoom-15 mosaic has a seam at the 1° source boundary just west of 10°E.
+>    Over lat 46.7 – 46.9 the tile column x = 17294 holds −8,956 … −9,717 m in
+>    pixel column 52 (lon 9.9998) and −1,184 … +149 m in column 53 between
+>    terrain of 1,500 – 3,000 m — valid samples blended into a −32768 m nodata
+>    area by the service's resampling (≈ 0.33 and ≈ 0.08 of −32768 m, measured)
+>    — and the zoom-14 tile above them one column of −3,524 … −4,709 m; the
+>    tiles beside them are blank (z15 x = 17292, 17293, 17295, 17296 in places,
+>    z14 8646 and 8648 nearly whole). The blank samples (at or below −11000 m)
+>    were filled from coarser zooms without a word; the seam samples, being
+>    above that, were written into the `.abt` as a 9 km trench beside a 1 km
+>    one (the Waveshed plugin's −2500 m floor caught the first and filled it
+>    with 0 m; nothing caught the second). The same seams were found elsewhere:
+>    z15 rows at 28°N over Everest (−6,555 / +3,680 m between 8,260 m), z15
+>    columns at 70°W over Aconcagua (−8,142 / +1,544 m between 6,070 m),
+>    single-sample lines at z14/z15 near Trollveggen (one of them slanting
+>    across its tile), at 95°E over Yarlung Tsangpo, and around the Dead Sea's
+>    −410 m surface. (a) **The rule** (`download/seam.rs`). A valid sample is a
+>    *seam notch* when both its row neighbours are more than **D = 2,200 m**
+>    higher, or both its column neighbours are — per axis: a seam is a line,
+>    and the samples along it are its neighbours on the other axis. A neighbour
+>    is the nearest valid sample within **W = 2** samples in that direction,
+>    inside the tile: a void is skipped, never a neighbour; the tile edge or a
+>    run of voids ends the search, and an axis without a neighbour on both
+>    sides is not judged (no sample is judged across a blank area or the tile
+>    edge). Each pass finds its notches against the tile as it found it and
+>    voids them together; the rule runs again on the result, at most W passes,
+>    stopping at the first that finds none — a two-sample seam whose inner
+>    sample is the lower (column 52 below column 53) goes in two: column 53's
+>    left neighbour is column 52 in the first pass, column 51 in the second.
+>    Only tiles of zoom ≥ **11** are filtered. (b) **Where.** One decoder
+>    (`TileDecoder`) decodes every tile a CLI `download` run uses — fetched,
+>    read from the raw tile cache, the children a cached tile is derived from
+>    (changelog 40), and the coarser tiles the parent fill reads — and runs the
+>    rule on each right after the decode, so the voided samples reach the
+>    parent fill as voids (it fills samples at or below −11000 m; a seam void
+>    is −65536 m in memory) and a seam in a parent (the z14 column above the
+>    10°E seam) is skipped there, the fill going on to the next coarser zoom.
+>    Repair jobs decode the same way. The cache keeps the service's bytes
+>    exactly as they arrived. A tile the cache derives is built from filtered
+>    children and then filtered at its own zoom (exactly what decoding its
+>    stored body gives); a sample that is void because its children's seam
+>    samples were voided is stored as Terrarium RGB `0, 0, 1` (−32767.996 m, a
+>    void to every converter, an older one included) instead of the service's
+>    void `0, 0, 0`, and read back as a seam void by a filtering run, so a
+>    later run reporting on a stored derived tile counts its seam samples as
+>    the run that derived it did. Not filtered: Mapbox jobs (no void value, not
+>    surveyed), zooms ≤ 10 (below), and the in-memory and browser downloaders
+>    (`run_download_mem`, the WASM `download_terrain` and `assemble_terrain`),
+>    which have no in-tile backfill to fill a void. (c) **`seam_filter`**
+>    (§9b): absent, `null` or `true` → on; `false` → off, every tile decoded
+>    exactly as by 0.2.12 — for A/B runs, which need a `cache_dir` of their own
+>    (a tile a filtering run derived and stored holds its filtered samples).
+>    The Waveshed plugin does not set it. (d) **Lines** (informational, not
+>    parsed). Last in the `[Stats]` block but for the cache lines, which stay
+>    last: `[Stats] Backfill: <n> px in <m> tile(s) filled from coarser zooms
+>    (<k> px seam samples)` — `<n>` the void samples of the tiles that arrived
+>    (fetched, cached or derived) that a coarser zoom filled, `<m>` those
+>    tiles, `<k>` how many of the `<n>` the seam filter had voided — plus `;
+>    <l> px in <t> tile(s) left void (<s> px seam samples)` when some had no
+>    coarser data (they stay void, as before, and are counted by the `[Tile] …
+>    voids=` lines). Printed on stderr and kept in `AETHER_DIAG_FILE` like the
+>    whole block; omitted when no arrived tile had a void sample. A tile that
+>    never arrived and was repaired whole is counted by `[Stats] Repaired from
+>    coarser parent tiles:` as before, not here. With `AETHER_DIAG_FILE` set,
+>    each such tile also gets one line in the file only — never on the console,
+>    which a GUI shows its users: `[Backfill] z=<z> x=<x> y=<y>: <v> void px
+>    (<s> seam), <f> filled (z<a> <n>, z<b> <n>, …), <l> left void` (the zooms
+>    that filled, finest first), at most 20,000 per run, then `[Backfill] … <n>
+>    more tile(s) not listed`. (e) **The survey behind D, W and the zoom
+>    floor** (the converter's own `seam.rs`, compiled into a survey tool; AWS
+>    Terrarium tiles fetched 2026-11-05). Deepest both-sided single-sample
+>    notch, metres, by zoom — 6 × 6 tiles at z15/z14, 4 × 4 at z13 – z11, 2 × 2
+>    at z10 – z6, around Matterhorn, Eiger/Lauterbrunnen, Aareschlucht,
+>    Dolomites, Verdon gorge, Trollveggen, Geirangerfjord, Yosemite, Grand
+>    Canyon, Zion, Everest, Aconcagua, Monterey Canyon, the Dead Sea, Yarlung
+>    Tsangpo and Kali Gandaki; 8 × 8 at z12/z11 around 17 high-relief regions
+>    (Himalaya, Karakoram, Pamir, Andes, Alaska, Alps, Norway, New Zealand,
+>    Caucasus, US); and **every** z11 tile of 68 – 98°E × 27 – 38°N (13,072
+>    tiles). Outside the seams and the corrupted samples named below: z15 ≤ 17
+>    (Yosemite 9.6, Zion 8.3), z14 ≤ 51 (Grand Canyon 50.1), z13 ≤ 141
+>    (Everest), z12 ≤ 439 (Southern Alps 438.9, Denali 433.7), z11 ≤ 1,030 (a
+>    gorge at 84.15°E 28.5°N that the service's z12 and z13 tiles show too: 935
+>    m in z12 2 × 2 means, 645 m in z13 4 × 4 means) — D is 2.14× the deepest.
+>    Everything deeper at z11 – z15 is a seam (above) or a single corrupted
+>    sample: holes at the shores of flat-filled lakes (Tibet, Karakul), pits
+>    beside +6 … +21 km spikes (Piz Buin z11, Cordillera Blanca), isolated pits
+>    (Denali z11: 658 m between 2,160 – 2,202 m), isolated pits in Monterey
+>    Bay, where Terrarium has no bathymetry above z10 (0.0 m at z14/z15, flat 0
+>    m with a few pits at z11 – z13). The seam's shallowest sample at 10°E is
+>    2,793 m deep (column 53, pass 1; 2,800 m in pass 2), the z14 column 6,317
+>    m. Every sample the rule voids in the survey tiles — 8,692 outside the
+>    10°E ones — lies on such a line (one sample per row or column of its tile)
+>    or is a corrupted sample: at z11 – z13 each is absent from the 2 × 2 means
+>    of the service's own next finer tiles or holds a negative elevation in
+>    high mountains (Tibet, Silvretta); of the 110 z11 notches deeper than
+>    1,000 m, 103 are absent from those means, 6 of the other 7 are such
+>    corruption and one is the 1,030 m gorge. At zooms 7 – 9 the service's own
+>    tiles hold single-sample pits of 3.7 – 6.0 km (Kali Gandaki z8: 540 m
+>    between 6,573 m samples), so no depth there tells a seam from the data:
+>    the floor is z11. What the rule leaves: columns 54 – 56 of the 10°E seam
+>    lie −0.54 / −0.36 / −0.18 m below a fit through the clean columns on both
+>    sides (5th percentile −5.7 / −4.2 / −2.7 m; the same fit at two seam-free
+>    places of those tiles: 0.00 / −0.15 m, 5th percentile ≈ −2.5 m); the
+>    isolated −88 m pit at 5°E 45.9°N (375 m deep) and notches under D in
+>    general; spikes. (f) **Measured** (release build, the container, AWS S3,
+>    2026-11-05). The owner's job — lat 46.7 – 46.9, lon 9.95 – 10.05 at 2 m:
+>    four 5,556 px tiles from 532 z15 source tiles and 76 parents. 0.2.12
+>    writes `voids=5007` and `voids=5019` into the two E9.90 tiles (the −9 km
+>    column) and 15,011 / 15,825 samples below 0 m; 0.2.13 writes `voids=0` and
+>    none below 0 m, prints `[Stats] Backfill: 7092426 px in 137 tile(s) filled
+>    from coarser zooms (8943 px seam samples)` and 137 `[Backfill]` lines in
+>    the diagnostic file (8,943 = the 6,895 + 2,048 samples the survey's two
+>    passes void there, in 27 tiles; the other 110 tiles hold 7,083,483 of the
+>    service's own void samples, which 0.2.12 filled without a word). It
+>    changes 16,119 and 15,825 samples in the E9.90 tiles — columns 5544 – 5548
+>    — from −9,717 … +149.5 m to 1,619.5 … 3,051.5 m; the E10.00 tiles are
+>    `cmp`-identical. 31,919 of the 31,944 changed samples equal the z13 sample
+>    under them to the half-metre (the z14 column above the seam is voided
+>    too), the other 25 the z13 sample one row over (the assembly places rows
+>    linearly in latitude within a tile-row); they lie a median 9 m, at most 55
+>    m, from the mean of the output samples three columns west and east of the
+>    changed band (columns 5541 and 5551, which differ from each other by a
+>    median 7 m, at most 33 m). The same job with `seam_filter: false` is
+>    `cmp`-identical to 0.2.12 on all four tiles (`[Stats] Backfill: 7083483 px
+>    in 110 tile(s) … (0 px seam samples)`), and fetched and cached runs of
+>    0.2.13 are identical. Clean ground: a 2 m tile over the Matterhorn (140
+>    source tiles, no void sample — no `Backfill` line) and four over 5°E
+>    45.9°N (513 source tiles, 108 of them blank: `Backfill: 7077888 px in 108
+>    tile(s) … (0 px seam samples)`) are `cmp`-identical to 0.2.12, fetched and
+>    from the cache. The filter costs 136 – 244 µs per 256 px tile (one core,
+>    release; 222 µs over the 13,072 z11 tiles), beside a decode of ~1.6 ms
+>    (changelog 36). Tested: `download/seam.rs` (a one-sample notch on either
+>    axis; the measured two-sample 10°E seam, which needs the second pass and W
+>    = 2; a 6,000 m cliff, a spike, a 2-sample-wide 5,000 m trench and gorges
+>    1,030 and 2,200 m deep left alone, 2,201 m voided; a void skipped, a void
+>    run and the tile edge ending the search, the service's voids untouched; a
+>    bathymetry slope from −10,900 m with a canyon and a trench; the zoom
+>    floor; the shortcut equal to the rule on 200 random tiles at four depths
+>    and reaches), `download.rs` (`seam_filter` absent/`null`/`true`/`false`,
+>    Mapbox; with the filter off the decode is `decode_tile`'s bit for bit; the
+>    derived-body seam void read back; the `[Backfill]` and `[Stats] Backfill:`
+>    lines), `tile_cache.rs` (a tile derived from children with the seam: its
+>    samples, its stored body, read back; without the filter the seam averaged
+>    to −4,900 m; a trench that is a notch only at the parent's zoom: derived
+>    and read back alike), `tests/test_seam_filter.rs` (the real 10°E tiles as
+>    fixtures, the real CLI: with the filter, fetched, from the cache, derived
+>    from the cached z15 tiles and read back as a stored derived tile, every
+>    `.abt` byte equals a run without it over the same tiles with their seam
+>    samples blanked; the `[Stats] Backfill:` counts; without it the seam
+>    reaches the output; the `[Backfill]` lines in the diagnostic file only).
+>    Every mechanism was broken once on purpose and a test failed for each.
+>    **Gate** on `aether_converter` 0.2.13 (§1.5): an older build ignores
+>    `seam_filter`, writes the seam into its tiles and prints neither line.
+> 50. **The process's peak resident memory at the end of a run: `[Rust]
+>    run: … peak rss <mb> MB` and `[Stats] Peak RSS:` (§1.2, §1.5, §2;
+>    additive, informational — NOT parsed; `aether_converter` 0.2.13;
+>    2026-11-07).** No job-JSON change; `.abt` bytes, exit codes and every
+>    parsed line are unchanged. Motivation: the converter printed what it
+>    budgets and estimates — `[Download] RAM budget: <mb> MB …`, `[Rust]
+>    Rayon Pool: <n> threads (System RAM: …, ~<mb> MB per tile)` — but never
+>    what the process used, so a log could not say whether a run stayed
+>    inside its budget, or whether memory made it slow or made it fail.
+>    (a) **`ingest`:** the `[Rust] run:` line (item 31, 37) ends with `,
+>    peak rss <mb> MB`, after `blocked ~<s>s`; every earlier field keeps its
+>    place and shape. (b) **CLI `download`:** every pass — a full run, a
+>    repair job, and a run that fails the majority rule, before its `Tile
+>    download failed:` — prints once in its `[Stats]` block `[Stats] Peak
+>    RSS: <mb> MB (RAM budget <m> MB)`, after every other line of the block
+>    but the `[Stats] Cache…` lines, which stay last; `<m>` = the run's
+>    budget as its `[Download] RAM budget: <m> MB` line printed it. A repair
+>    job has no RAM budget (it holds its listed tiles at once): its line
+>    ends at `MB`. Kept in `AETHER_DIAG_FILE` like the whole block (item
+>    46). The in-memory and browser downloaders (`run_download_mem`, the
+>    WASM `download_terrain`) print neither: they run inside another
+>    program's process. `<mb>` = the peak of the process's resident memory
+>    so far, in MB (2^20 bytes, the `MB` of every converter line) with one
+>    decimal; where the OS does not give it the field (ingest, with its
+>    comma) or the line (download) is omitted — never 0. (c) **What is
+>    read:** Linux: `VmHWM` of `/proc/self/status`; macOS: `getrusage`
+>    `ru_maxrss` (bytes there, kilobytes on the BSDs); Windows:
+>    `GetProcessMemoryInfo` `PeakWorkingSetSize` — one reader for both
+>    commands (`proc_usage.rs`, which also reads the `[Rust] run:` line's
+>    CPU time and page faults, moved there from `ingest.rs`; on macOS and
+>    Windows the peak comes from those very calls). Not `ru_maxrss` on
+>    Linux: the kernel carries the parent's peak into a child's `ru_maxrss`
+>    at `exec` — after `fork`, `vfork` and `posix_spawn` alike — so a
+>    converter started by QGIS would report QGIS's peak. Measured (the
+>    container, debug build, the 2-tile batch `ingest` of
+>    `tests/test_diag_file.rs`; two runs each): started by a Python process
+>    holding 1,500 MB, the converter's `ru_maxrss` (the parent's
+>    `getrusage(RUSAGE_CHILDREN)` after it exited) is 1,510 MB while its
+>    line says `peak rss` 13.6 / 13.9 MB; started by a 10 MB one, 13.75 MB
+>    and `peak rss` 13.8 / 13.6 MB. Examples (debug build, from a test
+>    process holding 256 MB):
+>    `[Rust] run: wall 0.1s, cpu user 0.0s sys 0.1s, page faults 979,
+>    threads 4, blocked ~0.3s, peak rss 13.2 MB`; a download of two 256 px
+>    tiles from 12 z12 source tiles `[Stats] Peak RSS: 24.6 MB (RAM budget
+>    2048 MB)`, a repair of one of them `[Stats] Peak RSS: 17.8 MB`, a run
+>    whose tiles all fail to decode `[Stats] Peak RSS: 18.1 MB (RAM budget
+>    2048 MB)`. Tested: `proc_usage.rs` (this platform's peak above the 64
+>    MB the test process wrote and below the RAM, and still that after the
+>    free; `VmHWM` read in KiB, a missing, zero or non-kB value unknown; MB
+>    = 2^20 bytes), `ingest.rs` (the `[Rust] run:` line: the field last,
+>    omitted with its comma when unknown, this process's value plausible),
+>    `download.rs` (the line with and without a budget, none when unknown,
+>    this process's value plausible), `tests/test_peak_rss.rs` (the real
+>    CLI, started by a test process holding 256 MB: a batch and a single
+>    `ingest` — one `[Rust] run:` line, still last on stdout, its old fields
+>    in order and shape, `peak rss` last with one decimal, above 1 MB, below
+>    the RAM and below the parent's 256 MB; a full download with `cache_dir`
+>    and `AETHER_DIAG_FILE`, a repair of one of its source tiles, and a
+>    download that fails — one line per pass, the full and the failed run's
+>    with the budget of their `[Download] RAM budget:` line, the repair's
+>    without, after every other `[Stats]` line and followed by exactly the
+>    cache lines, and — full run and repair — once, byte for byte, in the
+>    diagnostic file); `tests/test_download_cache.rs` still finds `[Stats]
+>    Cache:` last in the block. Every mechanism was broken once on purpose
+>    and a test failed for each (`ru_maxrss` on Linux included). Not run
+>    here: macOS and Windows — `proc_usage.rs` type-checks for
+>    `aarch64-apple-darwin` (and `wasm32-unknown-unknown`); the Windows
+>    branch is read only: `PeakWorkingSetSize` is a `usize` field of
+>    windows-sys 0.61's `PROCESS_MEMORY_COUNTERS`, the struct the `[Rust]
+>    run:` line already filled. **Gate:** none — no consumer may parse
+>    either; `aether_converter` 0.2.13 (§1.5) prints both, an older build
+>    neither.
+> 51. **`buildings_pbf_list`: the building tiles a job needs, named in a
+>    list file and read straight from the caller's store — `download` and
+>    batch `ingest` (§1.2, §1.5, §9a, §9b; additive; `aether_converter`
+>    0.2.14; 2026-11-07).** Motivation: the converter decodes a whole
+>    `buildings_pbf_dir`, so the Waveshed plugin built, before each converter
+>    batch, a directory of hard links holding exactly the building tiles the
+>    batch needs, out of its store `<cache>/pool/<md5>/{z}_{x}_{y}.pbf`
+>    (~49,000 files and growing): 21,000 links took 24 s on the owner's NTFS
+>    HDD (2026-11-05). The owner approved a list instead (2026-11-07). (a)
+>    **The field.** `buildings_pbf_list`: the **absolute** path of a UTF-8
+>    text file, one building tile file name per line (`{z}_{x}_{y}.pbf` or
+>    `.mvt`, no directory part; `\n` or `\r\n`; blank lines, `#` lines, blanks
+>    around a name and a byte-order mark ignored; a name listed twice decoded
+>    once). The names resolve inside `buildings_pbf_dir`, which is **never
+>    listed**: exactly the listed files are read, in name order, through the
+>    directory's loader (changelog 44/47) — the same building list,
+>    duplicate filter, counts and `[Warn] buildings <name>: …` skips, hence
+>    the `.abt` bytes and lines of the same job whose `buildings_pbf_dir`
+>    holds exactly the listed tiles. A name with a path separator, or a line
+>    that is no tile name, fails the run naming the list and the line; an
+>    **empty list** (no byte, or blank/comment lines only) is no error and
+>    decodes nothing, exactly as an empty directory (`[Info]
+>    buildings_pbf_dir: 0 tile(s), no buildings in extent` per ingest tile,
+>    `[Buildings] 0 pbf tile(s), no buildings in extent` on a download). On
+>    `download` jobs — full runs **and repair jobs** (`repair_source_tiles`),
+>    every pass — and `ingest` batch jobs; the single-job ingest form refuses
+>    it, as `buildings_pbf_ready`; the in-memory/WASM downloaders ignore it.
+>    A repair honours the list exactly as a first pass: the listed tiles
+>    burnt onto its repaired pixels, the same checks, the same wait for a
+>    list that is not there, the same failures (it still ignores the
+>    marker, `buildings_pbf_ready`; §9b *Repair jobs*). (b)
+>    **Checked before anything runs** (exit 1, no request, no tile, nothing
+>    written): the list needs `buildings_pbf_dir`, excludes
+>    `buildings_pbf_ready` and must be absolute; `buildings_pbf_wait_s` and
+>    (ingest) `buildings_hold_mb` are read and checked as with a marker;
+>    `buildings_pbf_dir` must **exist at launch** — the one look at the disk,
+>    never its listing (the plugin creates its store before launching); a
+>    batch's jobs naming one list must give the same directory and wait (one
+>    decode per distinct list; jobs may name one list or several). Messages:
+>    §9a. (c) **The list is the ready signal**: the marker's hand-over of
+>    changelog 45 (download) and 48 (batch), step for step — the same
+>    watcher, 250 ms polls, `buildings_pbf_wait_s`, hold budget, clock and
+>    lines, the list's path exactly as the job gives it in place of the
+>    marker's: `[Buildings] waiting for the building tiles (<list path>)`,
+>    `[Buildings] building tiles ready after <s.s> s`, the held line, and on
+>    timeout `Error: Building tiles not ready: the list file <list path>
+>    (buildings_pbf_list) did not appear within <w> s (buildings_pbf_wait_s);
+>    …`, nothing written. Write the list last, under another name, then
+>    rename it into place: it is read once, right after it is seen. (d)
+>    **Lines.** A batch's decode starts with `[Rust] Decoding <n> listed
+>    building tiles from "<dir>" (once for the run)...` (`<n>` the distinct
+>    listed names, a plain integer; `<dir>` as the job gives it, between
+>    quotes — not the `Debug` form of the directory's start line, which
+>    doubles a Windows path's backslashes); `[Rust] Decoding building tiles:
+>    <n>/<m>`, `[Rust] Building tiles decoded: …`, `[Info]
+>    buildings_pbf_dir: …` and `[Buildings] <n> pbf tile(s) → …` are
+>    unchanged (`<n>` there: the listed tiles that decoded). A listed tile not
+>    in the directory, or unreadable, fails the run — `Error: Building tile
+>    <name> listed in <list> is not in <dir>`, exit 1, nothing written (a
+>    download's outputs removed); two zooms listed: `buildings_pbf_list
+>    <list> mixes zoom levels (…)`. (e) **Tested**: `buildings.rs` (the
+>    list's CRLF/LF lines, blanks, comments, BOM, duplicates and name order;
+>    directory parts and non-tile names refused with their line; a missing
+>    or non-UTF-8 list; the listed tiles of a 400-tile store with an
+>    undecodable tile, across the 9999|10000 seam where name order picks the
+>    duplicate filter's survivor, decoded bit for bit as a directory of
+>    exactly those tiles on 1, 3 and 8 threads, with the same progress
+>    calls; a missing listed tile — one line — and an unreadable one — its
+>    OS error as cause; two zooms; an empty list reading nothing),
+>    `buildings_ready.rs` (the checks and their messages, one decode per
+>    list, a list and its directory whole as two sources, the hold budget of
+>    a watched list, the watcher's timeout naming the list), `main.rs` (the
+>    start line: `<dir>` as given, `<n>` plain) and
+>    `tests/test_buildings_pbf_list.rs` (the real CLI: batch `ingest` and
+>    `download` with a list over a store that also holds a needed tile the
+>    list leaves out, an undecodable tile and a z15 tile → the bytes and
+>    lines of a directory of exactly the listed tiles, no `[Warn]`, other
+>    bytes than with the left-out tile; the list written after launch → the
+>    wait, ready (and held) lines naming the list as the job spells it — the
+>    store spelt `<dir>/cache//./pool\0a1b2c` and named so in the start
+>    line — and the same bytes; a list that never comes, a listed tile
+>    missing (present at launch and arriving late), a directory part → the
+>    errors, no tile written, a download's outputs removed; empty lists of
+>    no byte and of comments only → an empty directory's bytes and lines;
+>    two lists in one batch → two decodes; bad fields and a missing store →
+>    refused before any tile or request; the single-job form refused, a
+>    one-job array taken; a repair pass with the list over that store → the
+>    `[Buildings] repair:` line and bytes of a repair over a directory of
+>    exactly the listed tiles, other bytes than with the left-out tile, no
+>    `[Warn]`; a repair whose list comes late → the wait lines, the same
+>    bytes; one whose list never comes or names a missing tile → the error,
+>    the existing files unchanged; a repair's bad fields → refused before
+>    any request). On unix the store also holds a FIFO named like a tile:
+>    a run that opened any unlisted file would block until the test kills
+>    it. Every mechanism was broken once on purpose and a test failed for
+>    each: decoding the store's listing instead of the names, keeping
+>    duplicate names, list order instead of name order, the start line's
+>    `Debug` path, a normalised path in the wait line, an empty list
+>    refused, the store's check skipped, a repair ignoring the list, a
+>    repair not waiting for it, opening every file of the store (12 tests
+>    blocked on the FIFO). (f) **Measured** (release build, 4
+>    threads, the container's Windows-backed 9p mount): a store of 49,005
+>    files — 21,000 copies of the OpenFreeMap tile 14/8651/5782 (470
+>    buildings) at their own addresses, listed, and 28,000 undecodable files
+>    and five z15 tiles, unlisted; a batch of six 1000 px tiles at 5 m.
+>    The old way's preparation, 21,000 hard links: 227.1 s on this mount
+>    (24 s on the owner's HDD); the list, 378,032 bytes: 0.041 s. `[Rust]
+>    Building tiles decoded: 21000 tile(s), 9870000 building(s) in`: from
+>    the link directory 52.5 s (0.2.13), 52.3 – 55.2 s (0.2.14, five runs);
+>    from the store through the list 54.4 – 57.6 s (seven runs; one more at
+>    65.6 s with twice the system time); the list over the link directory
+>    51.6 / 52.1 s — the list costs nothing, the 2 – 4 s are the larger
+>    directory on this mount (a `readdir` of the store first changed
+>    nothing: 57.6 / 57.1 s). Peak RSS 2,586 – 2,590 MB in every run. All
+>    six `.abt` of every run `cmp`-identical to 0.2.13's from the link
+>    directory, `[Info] buildings_pbf_dir` lines identical, stderr empty in
+>    every list run (none of the 28,000 undecodable files read); `strace` of
+>    a list run: no `getdents64` at all, the store never opened as a
+>    directory, 21,000 `openat` inside it — the listed files, each once. A
+>    CLI `download` (AWS Terrarium z14 from a raw-tile cache, two 1000 px
+>    tiles at 5 m, the 20 building tiles under them listed from the same
+>    store): `[Buildings] 20 pbf tile(s) → 9400 building(s) (0 dup dropped)
+>    → 2/2 abt tile(s), 51287 px in 0.2s`, as 0.2.13's from a directory of
+>    links to those 20, `.abt` `cmp`-identical; the list renamed into place
+>    4 s after launch: the wait line, `[Buildings] building tiles ready
+>    after 3.8 s`, the same bytes; an empty list: the empty-directory line,
+>    the terrain-only bytes. A repair of the z14 source tile under them
+>    (over a terrain-only first pass; a store of the 20 listed tiles, 2,000
+>    undecodable and five z15 files): `[Buildings] repair: 9400 building(s),
+>    1406 repaired px raised`, `[Download] repair: 68172 px rewritten in 1
+>    output tile(s)` — the lines and `cmp`-identical `.abt` of 0.2.13's and
+>    0.2.14's repair over a directory of links to the 20 —; `strace`: no
+>    `getdents64`, 20 `openat` in the store, the listed files; the list
+>    renamed into place 4 s in: the wait, `[Buildings] building tiles ready
+>    after 3.3 s`, the same bytes; a list that never comes: the error, the
+>    files unchanged; the same repair with the store as its directory and no
+>    list fails `buildings_pbf_dir mixes zoom levels (14 and 15)`. The
+>    owner's machine is not measured. **Gate** on `aether_converter` 0.2.14
+>    (§1.5): an older build ignores the field — it decodes the whole
+>    `buildings_pbf_dir` (the store: every file) without waiting for the
+>    list, a batch at launch, a download after its terrain and a repair
+>    before its burn; slow, burning the store's every building, and failing
+>    on a store of two zooms or with an unreadable file.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -1415,10 +1788,18 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   Neither contains `Progress:`. A directory whose `buildings_pbf_ready`
   marker is missing at launch (≥ 0.2.12, changelog 48) prints the same lines
   when the marker appears, while tiles are being sampled — still before any
-  `[Rust] Progress:` line of a tile that burns it.
+  `[Rust] Progress:` line of a tile that burns it. A `buildings_pbf_list`
+  (≥ 0.2.14, changelog 51) prints them too, once per list, after its own
+  start line `[Rust] Decoding <n> listed building tiles from "<dir>" (once
+  for the run)...` (`<n>` = the distinct listed names, a plain integer;
+  `<dir>` = `buildings_pbf_dir` exactly as the job gives it) in place of
+  the directory's `[Rust] Decoding building tiles in "<dir>" (once for the
+  run)...`; `<m>` counts the listed tiles.
 * **Building-tile hand-over lines** (stdout, batch ingest with
   `buildings_pbf_ready` whose marker was missing at launch;
-  `aether_converter` ≥ 0.2.12, changelog 48; informational, prefixes stable
+  `aether_converter` ≥ 0.2.12, changelog 48 — or with a `buildings_pbf_list`
+  whose list was, ≥ 0.2.14, changelog 51, the list's path, exactly as the
+  job gives it, in place of `<marker path>`; informational, prefixes stable
   — match the prefix, as for the download's `[Buildings]` wait lines):
 
   ```
@@ -1462,7 +1843,7 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   result, also when the run fails — on stdout:
 
   ```
-  [Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>, blocked ~<s>s
+  [Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>, blocked ~<s>s, peak rss <mb> MB
   ```
 
   (`getrusage` on Unix: minor + major faults; `GetProcessTimes` /
@@ -1471,7 +1852,12 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   its comma are omitted when no batch ran (a single-job file). `blocked`
   (≥ 0.2.8) is wall × threads − (user + sys), floored at 0: thread time
   spent waiting rather than computing (a single job counts rayon's global
-  pool). Neither line contains `Progress:` or starts with `[Tile]`.
+  pool). `peak rss` (≥ 0.2.13, changelog 50) is the process's peak
+  resident memory, MB (2^20 bytes) with one decimal — read as for the
+  download's *Peak RSS line* below — last, so every earlier field keeps
+  its place; the field and its comma are omitted where the OS does not
+  give it, never `0`. Neither line contains `Progress:` or starts with
+  `[Tile]`.
 
   **`AETHER_DIAG_FILE` (≥ 0.2.8, changelog 37).** When this environment
   variable names a path, the `[Rust] tile …` lines (and `download`'s
@@ -1494,7 +1880,12 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   the file for the rest. Since 0.2.12 (changelog 48) the `[Tile] <name>
   voids=<n>` lines are appended **as well** — a download's from stderr, a
   batch ingest's from stdout (not its `covered=` line) — byte for byte, in
-  the stream's order; both streams are unchanged.
+  the stream's order; both streams are unchanged. Since 0.2.13 (changelog
+  49) it also gets a download's per-tile `[Backfill] …` lines, which go to
+  the file **only** (see *Backfill line* below). The download's `[Stats]
+  Peak RSS:` line (≥ 0.2.13, changelog 50) is a line of the `[Stats]` block
+  and is kept like the rest of it; `ingest`'s `[Rust] run:` line, its `peak
+  rss` included, stays on stdout only.
 * **Per-tile coverage line** (stdout, batch ingest only; `aether_converter`
   ≥ 0.2.7, changelog 33). After each tile that was written:
 
@@ -1570,9 +1961,10 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   cause chain**, `: `-joined outermost first (changelog 23), and the run
   ends with `<n> of <total> tiles failed to convert`. A batch whose
   building-tile hand-over fails (`buildings_pbf_ready`, changelog 48: the
-  marker did not come, or the directory did not decode) ends with that
-  error instead and prints no line for the tiles it dropped, none of which
-  was written (§9a).
+  marker did not come, or the directory did not decode; `buildings_pbf_list`,
+  changelog 51: the list did not come, does not parse, or names a tile the
+  directory does not hold) ends with that error instead and prints no line
+  for the tiles it dropped, none of which was written (§9a).
 * **An ingest that covered nothing: batch warns and exits 0; a single job
   still exits non-zero (changelog item 18, 2026-08-31).** A **batch** whose
   tiles took not one pixel from any source keeps its tiles — void, or
@@ -1760,6 +2152,62 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   (changelog 39), `[Download] launch gate closed for <s> s (assembly behind
   the network)`: the time the run waited with no strip downloading because
   the next one did not fit the budget.
+* **Backfill line** (stderr, CLI `download` full runs and repair jobs;
+  `aether_converter` ≥ 0.2.13, changelog 49; **informational, not parsed**):
+
+  ```
+  [Stats] Backfill: <n> px in <m> tile(s) filled from coarser zooms (<k> px seam samples)[; <l> px in <t> tile(s) left void (<s> px seam samples)]
+  ```
+
+  In the `[Stats]` block after every line older builds print there but the
+  `[Stats] Cache…` lines, which stay last; omitted when no source tile that
+  arrived had a void sample. `<n>` = the void samples — the service's own (at
+  or below −11000 m) and those the seam filter made (§9b *Seam filter*) — of
+  the source tiles that arrived (fetched, from the raw tile cache or derived)
+  that a coarser zoom filled, `<m>` = those tiles, `<k>` = how many of the
+  `<n>` were seam samples. The clause after `;`, only when `<l>` > 0, counts
+  the void samples no coarser zoom had: they stay void, as before, and the
+  `[Tile] … voids=` lines count them in the output. A source tile that never
+  arrived and was filled whole is counted by `[Stats] Repaired from coarser
+  parent tiles:` as before, not here. Like the whole block, it is kept in
+  `AETHER_DIAG_FILE` too. With `AETHER_DIAG_FILE` set, each such tile also
+  gets one diagnostic line **in the file only** — never on the console, which
+  a GUI shows its users:
+
+  ```
+  [Backfill] z=<z> x=<x> y=<y>: <v> void px (<s> seam), <f> filled (z<a> <n>, z<b> <n>, …), <l> left void
+  ```
+
+  (the zooms that filled, finest first; at most 20,000 lines per run, then
+  `[Backfill] … <n> more tile(s) not listed`; not parsed, wording may
+  change). A converter before 0.2.13 prints neither and fills in-tile voids
+  without a word.
+* **Peak RSS line** (stderr, CLI `download` full runs and repair jobs;
+  `aether_converter` ≥ 0.2.13, changelog 50; **informational, not
+  parsed**):
+
+  ```
+  [Stats] Peak RSS: <mb> MB (RAM budget <m> MB)
+  [Stats] Peak RSS: <mb> MB
+  ```
+
+  Once per pass, in the `[Stats]` block — on the fatal path too, before
+  `Tile download failed:`; a run that fails before its block (a write
+  error, a building-tile marker that never came) prints neither, as
+  before — after every line older builds print there (and after `[Stats]
+  Backfill:`) but the `[Stats] Cache…` lines, which stay last. `<mb>` = the converter process's peak resident memory so far,
+  MB (2^20 bytes) with one decimal: on Linux `VmHWM` of
+  `/proc/self/status` — not `getrusage`'s `ru_maxrss`, which on Linux
+  includes the peak of the process that started the converter (changelog
+  50) —, on macOS `getrusage` `ru_maxrss`, on Windows
+  `GetProcessMemoryInfo` `PeakWorkingSetSize`. `<m>` = the run's RAM
+  budget exactly as its `[Download] RAM budget: <m> MB` line printed it; a
+  repair job, which has no budget, prints the second form. No line where
+  the OS does not give the peak — never `0`. Like the whole block, it is
+  kept in `AETHER_DIAG_FILE` too. The in-memory and browser downloaders
+  print none (they run inside another program's process). The same peak
+  ends `ingest`'s `[Rust] run:` line (above). A converter before 0.2.13
+  prints neither.
 * **Per-tile void line** (stderr, CLI `download` full runs; `aether_converter`
   ≥ 0.2.11, changelog 46; parsed). Once every output is finished — the strip
   assembly, the tail fill and the buildings post-pass (§9b) done — and
@@ -2123,6 +2571,9 @@ Known capability gates consumers rely on:
 | `AETHER_DIAG_FILE` also keeps `download`'s `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and `[Stats]` lines, which stay on stderr (§1.2, changelog 46; older builds keep them on stderr only) | `aether_converter 0.2.11` |
 | Batch `ingest` job fields `buildings_pbf_ready`, `buildings_pbf_wait_s` and `buildings_hold_mb` — fetch the building tiles while the batch samples its terrain (§9a, changelog 48; older builds ignore all three and read `buildings_pbf_dir` at launch: they fail with `buildings_pbf_dir … is not a directory` when it does not exist yet, else burn whatever it holds then; a single job refuses `buildings_pbf_ready` from this version on) | `aether_converter 0.2.12` |
 | `AETHER_DIAG_FILE` also keeps the `[Tile] <name> voids=<n>` lines of `download` (stderr) and batch `ingest` (stdout), which stay on their streams (§1.2, changelog 48; older builds keep them on their streams only) | `aether_converter 0.2.12` |
+| `download` seam filter and its job field `seam_filter` — a Terrarium mosaic seam's samples become voids the parent fill fills (§9b, changelog 49; older builds ignore the field and write the seam into the `.abt` as terrain, e.g. −9,300 m at 10°E) — with the informational `[Stats] Backfill:` line and the per-tile `[Backfill]` lines in `AETHER_DIAG_FILE` (§1.2; older builds print neither) | `aether_converter 0.2.13` |
+| The converter's peak resident memory: `[Stats] Peak RSS: <mb> MB (RAM budget <m> MB)` once per CLI `download` pass (a repair's without the budget), in the `[Stats]` block before the cache lines and kept in `AETHER_DIAG_FILE` with it, and `, peak rss <mb> MB` at the end of `ingest`'s `[Rust] run:` line (§1.2, changelog 50; informational, not parsed — nothing to gate; older builds print neither) | `aether_converter 0.2.13` |
+| `download` and batch `ingest` job field `buildings_pbf_list` — only the building tiles a list file names are read from `buildings_pbf_dir` (the caller's store, never listed), and the list file is their ready signal (§9a, §9b, changelog 51; older builds ignore the field: they decode the whole `buildings_pbf_dir` — the store, every file — without waiting for the list: a batch at launch, a download after its terrain, a repair before its burn; slow, and a store holding two zooms or an unreadable file fails the run) | `aether_converter 0.2.14` |
 
 ---
 
@@ -2132,7 +2583,7 @@ Known capability gates consumers rely on:
 |----------|---------|---------|
 | `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key — **v1 or v2** (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
 | `RUST_LOG` | `aether_core`, toolkit CLIs | `env_logger` level filter. **Must be `info` (or lower)** for the log-line progress diagnostics of §1.1(b) to appear. Markers in §1.1(a) do not depend on it. |
-| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines (and, ≥ 0.2.9, `download`'s once-per-run `[Download] launch gate closed for …`, changelog 39) are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move; since 0.2.11 (changelog 46) `download`'s `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and `[Stats]` lines are copied into the file as well, staying on stderr unchanged. |
+| `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines (and, ≥ 0.2.9, `download`'s once-per-run `[Download] launch gate closed for …`, changelog 39) are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move; since 0.2.11 (changelog 46) `download`'s `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and `[Stats]` lines are copied into the file as well, staying on stderr unchanged. Since 0.2.13 (changelog 49) a download also writes one `[Backfill] …` line per source tile whose void samples the parent fill filled to the file **only** (never to the console); the block's `[Stats] Peak RSS:` line (≥ 0.2.13, changelog 50) is copied like every `[Stats]` line. |
 | `AETHER_BIN_DIR` | consumers only | Convention for locating the engine binaries. **Not read by any engine/toolkit code** — it is purely a consumer-side discovery hint. Do not add engine logic that depends on it. |
 | `PYTHONUNBUFFERED` | consumers only | Set by Python consumers so a child process's stdout markers/log lines arrive line-by-line rather than block-buffered. Not read by Rust code. |
 
@@ -2543,6 +2994,10 @@ but a bathymetric source below -2500 m would be discarded.
 > The `download` path has a different no-data convention on its *input* side: a
 > Terrarium tile pixel decoding below **-11000 m** is a void and is backfilled
 > from a coarser parent tile. That is an input rule and never reaches `.abt`.
+> Since `aether_converter` 0.2.13 (changelog 49) so is a sample of a mosaic
+> seam — both row or both column neighbours more than 2,200 m higher, in a
+> Terrarium tile of zoom 11 or finer (§9b *Seam filter*; `seam_filter: false`
+> turns it off).
 
 **Resampling — how a source elevation becomes a pixel.** Both converter paths
 **area-average**. An output pixel is the mean of every source sample whose
@@ -2760,8 +3215,9 @@ a **single object** or a **JSON array** of such objects (batch).
 | `buildings_file` | string? | optional | FlatGeobuf building footprints to burn in — one `.fgb`, or a directory of them (a directory holding no `.fgb` is an error, not an empty burn). Height follows the **building height ladder** below: geometry Z as an **absolute roof elevation (AMSL)** where the geometry has one, else the attribute rungs as **above-ground** metres. A source that cannot be opened, parsed or scanned fails the run rather than silently producing building-less tiles. |
 | `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Vector tiles carry no geometry Z, so height starts at the ladder's attribute rungs and is always **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
 | `buildings_pbf_ready` | string? | optional | Additive, changelog 48, `aether_converter` ≥ 0.2.12 (older builds ignore it: gate on §1.5). **Batch only.** One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the batch samples its terrain — the download job's hand-over (§9b, changelog 45), same name rules and messages. There at launch: the directory is decoded at once, exactly as without the field. Missing at launch: see *Building tiles fetched during the batch* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the batch before any tile; so do jobs naming one directory with different `buildings_pbf_ready` / `buildings_pbf_wait_s`. The single-job form (a JSON object) refuses it. Absent or `null`: unchanged. |
-| `buildings_pbf_wait_s` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Seconds a batch waits for `buildings_pbf_ready`, counted from its first look, at launch; absent or `null` → **1800**. Must be 0 … 86400, else the batch fails before any tile: `ingest job for "<output_path>": buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` (alone it is not even checked). |
-| `buildings_hold_mb` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Megabytes (MiB) of finished tiles a batch may hold in memory while it waits for `buildings_pbf_ready` — a held tile costs `size_px² × 2` bytes; a tile that does not fit waits on its worker thread. The batch's budget is the smallest value its watched jobs give, taken as given (`0` holds nothing); absent on all of them: half of the available memory the batch measures for its pool once the pool's reservation is taken off (threads × the per-tile estimate of the `[Rust] Rayon Pool:` line, plus the 192 MB chunk cache), at most 4096 MB, never below one tile (the largest watched tile). Must be 0 … 1048576, else the batch fails before any tile: `ingest job for "<output_path>": buildings_hold_mb must be a number of megabytes from 0 to 1048576, got <v>`. Read only together with `buildings_pbf_ready`. |
+| `buildings_pbf_wait_s` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Seconds a batch waits for `buildings_pbf_ready` — or, ≥ 0.2.14, for the `buildings_pbf_list` file (changelog 51) — counted from its first look, at launch; absent or `null` → **1800**. Must be 0 … 86400, else the batch fails before any tile: `ingest job for "<output_path>": buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` or `buildings_pbf_list` (alone it is not even checked). |
+| `buildings_hold_mb` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Megabytes (MiB) of finished tiles a batch may hold in memory while it waits for `buildings_pbf_ready` — a held tile costs `size_px² × 2` bytes; a tile that does not fit waits on its worker thread. The batch's budget is the smallest value its watched jobs give, taken as given (`0` holds nothing); absent on all of them: half of the available memory the batch measures for its pool once the pool's reservation is taken off (threads × the per-tile estimate of the `[Rust] Rayon Pool:` line, plus the 192 MB chunk cache), at most 4096 MB, never below one tile (the largest watched tile). Must be 0 … 1048576, else the batch fails before any tile: `ingest job for "<output_path>": buildings_hold_mb must be a number of megabytes from 0 to 1048576, got <v>`. Read only together with `buildings_pbf_ready` or (≥ 0.2.14, changelog 51) `buildings_pbf_list`, whose wait it budgets the same way. |
+| `buildings_pbf_list` | string? | optional | Additive, changelog 51, `aether_converter` ≥ 0.2.14 (older builds ignore it and decode the whole `buildings_pbf_dir` at launch, without waiting: gate on §1.5). **Batch only.** The **absolute** path of a UTF-8 text file naming, one per line, the building tile files of `buildings_pbf_dir` the job burns (`{z}_{x}_{y}.pbf`, no directory part): only those files are read — the directory is never listed, so it may be a store of far more tiles (the Waveshed plugin's `<cache>/pool/<md5>/`). The file is also the **ready signal**: missing when the batch looks, it is waited for exactly as `buildings_pbf_ready`'s marker (same watcher, `buildings_pbf_wait_s`, `buildings_hold_mb`, lines and timeout). Requires `buildings_pbf_dir`, which must **exist when the batch starts**; excludes `buildings_pbf_ready`; jobs naming one list must give the same `buildings_pbf_dir` and `buildings_pbf_wait_s`. Every rule, line and message: *Building tiles named by a list* below. The single-job form (a JSON object) refuses it. Absent or `null`: unchanged. |
 
 Both building fields are optional and additive; a job that omits them behaves
 exactly as before. They may be combined, in which case FlatGeobuf is applied
@@ -2940,7 +3396,11 @@ failed to apply buildings from buildings_file "<path>" to "<output>": <cause>; r
 `[Rust] Decoding building tiles in "<dir>" (once for the run)...` — a
 directory whose `buildings_pbf_ready` marker is missing at launch when the
 marker appears, with the same lines (≥ 0.2.12; *Building tiles fetched
-during the batch* below). The
+during the batch* below). A `buildings_pbf_list` (≥ 0.2.14, changelog 51)
+is decoded the same way, once per distinct list, with its own start line
+`[Rust] Decoding <n> listed building tiles from "<dir>" (once for the
+run)...` and only the listed files taken (*Building tiles named by a
+list* below). The
 directory's tile files — every name `{z}_{x}_{y}.pbf` or `{z}_{x}_{y}.mvt`;
 anything else is ignored — are taken in **name order** (byte-wise) and read
 and decoded in parallel on the batch's worker pool (the `[Rust] Rayon Pool:`
@@ -3085,6 +3545,110 @@ buildings_pbf_ready "<v>" is read by a batch ingest only (a JSON array of jobs):
 marker would burn a directory that is still being fetched; a one-job array
 takes the field).
 
+**Building tiles named by a list (`buildings_pbf_list`, changelog 51,
+`aether_converter` ≥ 0.2.14).** A caller that keeps every building tile it
+has fetched in one store directory (the Waveshed plugin:
+`<cache>/pool/<md5>/{z}_{x}_{y}.pbf`, ~49,000 files and growing) names the
+tiles a batch needs in a list file instead of building a directory holding
+exactly those tiles: `buildings_pbf_dir` is the store, `buildings_pbf_list`
+the list. The batch reads exactly the listed files from the store — it
+never lists the store's directory — and writes what it writes from a
+directory holding exactly the listed tiles: the same `.abt` bytes and the
+same lines, but the decode's start line.
+
+* **The list file**: UTF-8 text, one building tile file name per line —
+  `{z}_{x}_{y}.pbf` (or `.mvt`), the name only — lines ending in `\n` or
+  `\r\n`. Blank lines, lines whose first non-blank character is `#`,
+  blanks around a name and a leading byte-order mark are ignored; a name
+  listed twice is decoded once. A name with a directory part fails the
+  batch: `buildings_pbf_list <list>: line <k>: "<name>" has a directory
+  part; list the tile file names inside buildings_pbf_dir
+  ({z}_{x}_{y}.pbf), one per line`; any other line that is no tile name:
+  `buildings_pbf_list <list>: line <k>: "<line>" is not a building tile name
+  ({z}_{x}_{y}.pbf)`; a file that is not UTF-8: `buildings_pbf_list <list>
+  is not UTF-8 text`. An **empty list** — no byte at all, or blank and
+  comment lines only — is no error: it decodes nothing, exactly as an empty
+  directory does (every tile's `[Info] buildings_pbf_dir: 0 tile(s), no
+  buildings in extent`, `[Rust] Building tiles decoded: 0 tile(s), 0
+  building(s) in <s.s> s`, no progress line).
+* **Checked before any tile**, with the marker's fields (exit 1, no tile
+  started, no output directory created; each message prefixed `ingest job
+  for "<output_path>": `):
+
+  ```
+  buildings_pbf_list "<v>" needs buildings_pbf_dir: the listed tile names are files inside that directory
+  buildings_pbf_list and buildings_pbf_ready exclude each other: the list file is itself the ready signal (it is read once it exists); give buildings_pbf_list alone
+  buildings_pbf_list must be the absolute path of a file, got "<v>"
+  buildings_pbf_dir "<dir>" is not a directory; with buildings_pbf_list it must exist when the job starts — the listed tiles are read from it
+  ```
+
+  `buildings_pbf_wait_s` and `buildings_hold_mb` are read and checked as
+  with a marker. The last check is the one look at the disk: **the store
+  must exist at launch** (the Waveshed plugin creates it before launching);
+  its listing is never read. Jobs naming one list must give the same
+  `buildings_pbf_dir` and `buildings_pbf_wait_s` — the list is decoded once
+  for the run: `buildings_pbf_list "<list>": the jobs for "<a>" and "<b>"
+  give it different buildings_pbf_dir ("<x>" against "<y>"); the list is
+  decoded once for the run, so every job naming it must give the same` (or
+  `… different buildings_pbf_wait_s (<x> s against <y> s); …`). Jobs may
+  name one list or different lists (one decode per distinct list); a job
+  naming the same directory without a list is a source of its own, the
+  whole directory, decoded as before.
+* **The list is the ready signal** — the marker's hand-over above, step for
+  step, with the list's path, exactly as the job gives it (no canonical
+  form, no quotes), in place of `<marker path>`: there when the batch looks
+  at launch → read and decoded at once, before the first tile; missing →
+  every tile's terrain starts, the list is looked for every 250 ms, finished
+  tiles are held within `buildings_hold_mb`, and stdout gets
+  `[Buildings] waiting for the building tiles (<list path>)`, `[Buildings]
+  building tiles ready after <s.s> s` and the held line. A list still
+  missing `buildings_pbf_wait_s` after the first look fails the batch, no
+  tile of the list written:
+
+  ```
+  Error: Building tiles not ready: the list file <list path> (buildings_pbf_list) did not appear within <w> s (buildings_pbf_wait_s); the ingest fails rather than write tiles without their buildings
+  ```
+
+  The list is read **once**, right after it is seen: write it under another
+  name and rename it into place when it is complete — a list read while it
+  is being written is read short.
+* **The decode**: the distinct listed names, in name (byte) order, read and
+  decoded by the directory's loader — the same parallel decode on the same
+  pool, the same building order and duplicate filter, the same counts and
+  `[Warn] buildings <name>: <error>` skips — after the start line
+
+  ```
+  [Rust] Decoding <n> listed building tiles from "<dir>" (once for the run)...
+  ```
+
+  (`<n>` = the distinct listed names, a plain integer; `<dir>` =
+  `buildings_pbf_dir` exactly as the job gives it, between quotes — where
+  the directory's start line prints Rust's `Debug` form, which doubles a
+  Windows path's backslashes). `[Rust] Decoding building tiles: <n>/<m>`,
+  `[Rust] Building tiles decoded: <m> tile(s), …` (`<m>` = the distinct
+  listed names) and every tile's `[Info] buildings_pbf_dir: <n> tile(s), …`
+  are unchanged. A listed tile missing from `buildings_pbf_dir`, or one that
+  cannot be read, fails the batch — the caller guarantees the files, so a
+  missing one is a bug or a store cleared under the run:
+
+  ```
+  Error: Building tile <name> listed in <list> is not in <dir>
+  ```
+
+  (the first such name in name order; `<list>` and `<dir>` as the job gives
+  them; for a file that is there but cannot be read, the OS error follows
+  as `Caused by:`), exit 1, no tile of the list written. Listed names of two
+  zooms fail before any tile is read: `buildings_pbf_list <list> mixes zoom
+  levels (<a> and <b>); expected exactly one`.
+
+**Not affected:** a batch without `buildings_pbf_list`, byte for byte and
+line for line. The single-job form refuses the field before anything is
+read (exit 1) — it would decode the whole directory, the caller's store:
+
+```
+buildings_pbf_list "<v>" is read by a batch ingest only (a JSON array of jobs): a single job decodes its whole buildings_pbf_dir before its tile, as it finds it, and would ignore the list — pass the job as a one-job array
+```
+
 **Building write rule (both sources).** Every height off the ladder above is
 normalised to an absolute roof elevation — an above-ground rung by adding the
 terrain under its own footprint, read before anything is written — and
@@ -3118,14 +3682,16 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
 | `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). A full run (not a repair) also keeps its output files open for the run, so the raise asks for one descriptor per output tile on top; where they do not fit beside the connections' descriptors, the connections keep theirs and each write opens its file instead, printing `[Download] open-file limit <l>: <n> output tiles are opened for each write instead of held open (<d> descriptors would not fit)` (changelog 39). |
-| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes (with `buildings_pbf_ready`, once its marker exists). All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
+| `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes (with `buildings_pbf_ready`, once its marker exists; with `buildings_pbf_list`, ≥ 0.2.14, only the listed tiles, once the list exists). All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `buildings_pbf_ready` | string? | optional | Additive, changelog 45, `aether_converter` ≥ 0.2.10 (older builds ignore it: gate on §1.5). One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the job downloads the terrain: nothing reads the directory before the buildings post-pass (it need not exist at launch), and the post-pass first waits for the file — see *Building tiles fetched during the download* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the job before any request. Absent or `null`: the post-pass reads the directory as it finds it, as before. CLI `download` full runs only; repair jobs and the in-memory/WASM downloaders ignore it. A batch `ingest` takes the same field, with the same meaning, since 0.2.12 (§9a, changelog 48). |
-| `buildings_pbf_wait_s` | number? | optional | Additive, changelog 45, ≥ 0.2.10. Seconds the post-pass waits for `buildings_pbf_ready`, counted from its first look; absent or `null` → **1800**. Must be 0 … 86400, else the job fails before any request: `buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` (alone it changes nothing). |
+| `buildings_pbf_wait_s` | number? | optional | Additive, changelog 45, ≥ 0.2.10. Seconds the post-pass waits for `buildings_pbf_ready` — or, ≥ 0.2.14, for the `buildings_pbf_list` file (changelog 51) — counted from its first look; absent or `null` → **1800**. Must be 0 … 86400, else the job fails before any request: `buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` or `buildings_pbf_list` (alone it changes nothing). |
+| `buildings_pbf_list` | string? | optional | Additive, changelog 51, `aether_converter` ≥ 0.2.14 (older builds ignore it and burn the whole `buildings_pbf_dir` as they find it after the terrain, without waiting: gate on §1.5). The **absolute** path of a UTF-8 text file naming, one per line, the building tile files of `buildings_pbf_dir` the post-pass burns (`{z}_{x}_{y}.pbf`, no directory part): only those files are read — the directory is never listed, so it may be a store of far more tiles. The file is also the **ready signal**: the post-pass waits for it exactly as for `buildings_pbf_ready`'s marker (same lines, `buildings_pbf_wait_s`, timeout), then reads it and decodes the listed tiles. Requires `buildings_pbf_dir`, which must **exist when the job starts**; excludes `buildings_pbf_ready`. CLI `download` full runs **and repair jobs** — a repair honours the list exactly as a first pass (selection, wait, errors; it ignores only the marker); the in-memory/WASM downloaders ignore it. Rules, lines and messages: *Building tiles named by a list* below and §9a. |
 | `fetch_bounds` | object? | optional | `{south, north, west, east}` in degrees (additive, 2026-09-05). Only source tiles intersecting it are fetched/decoded; every pixel outside keeps the `-9999` void pre-fill. Output grid, geometry and `.abt` layout unchanged — this trims the fetch set, nothing else. **In-memory downloader only**: the file-based `download` CLI rejects jobs carrying it (`fetch_bounds is not supported by the file-based download path …`), because its sparse writer would read skipped rows as 0 m sea level. Callers pass the area they actually need, inflated ≥ 2 % (covers the engine's own 1 % bounds margin). |
 | `tiles` | array of `SubTileSpec` | **required** | One entry per output `.abt`. |
 | `tile_deadline_s` | number? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6. Wall-clock cap per source tile, in seconds, across all its attempts, back-offs and `Retry-After` waits; absent → **20** (changelog 30; was 60). At expiry the tile stops as a `timeout` failure and goes to the parent fill (`[Degraded] … reason=timeout` when an ancestor fills it). Must be a positive number ≤ 86400, else the job fails `tile_deadline_s must be a positive number of seconds, got <v>` before any request. CLI `download` only; the in-memory downloaders ignore it. |
 | `repair_source_tiles` | array of `[z, x, y]`? | optional | Additive, changelog 28, `aether_converter` ≥ 0.2.6 (gate on `--version`, §1.5: older builds ignore the field and download the whole job). Fetch **only** these source tiles and patch them into the job's **existing** `.abt` files — see *Repair jobs* below. |
 | `cache_dir` | string? | optional | Additive, changelog 38, `aether_converter` ≥ 0.2.8 (older builds ignore it). Directory of the raw source-tile cache, shared by every job, service and zoom that names it and by concurrent converter processes; absent, `null` or `""` → no cache. Every source tile is looked up there before any request and every HTTP 200 body that decoded and every 404 the run fetches is written there; since 0.2.9 (changelog 40) a tile without an entry is derived from the cached tiles of up to four finer zooms when they cover it, without a request — see *Raw source-tile cache* below. A directory that cannot be used is one `[Warn]` line, never an error. CLI `download` only (repair jobs refetch their listed tiles and rewrite their entries); the in-memory downloaders ignore it. |
+| `seam_filter` | bool? | optional | Additive, changelog 49, `aether_converter` ≥ 0.2.13 (older builds ignore it and filter nothing: gate on §1.5). Absent, `null` or `true`: **on** — every Terrarium tile of zoom 11 or finer the CLI `download` decodes (fetched, read from the raw tile cache, derived from cached finer tiles, or a coarser parent of the backfill) has its mosaic-seam samples turned into voids before the parent fill, which fills them from the coarser zooms like the service's own voids — see *Seam filter* below. `false`: off — every tile decoded exactly as 0.2.12 decodes it, for A/B runs (give them a `cache_dir` of their own: a tile a filtering run derived and stored holds the filtered samples). Mapbox jobs are never filtered; nor are the in-memory and browser downloaders, which ignore the field. The Waveshed plugin does not set it. |
 
 `SubTileSpec`:
 
@@ -3182,7 +3748,7 @@ What becomes of each source tile, and how the `[Stats]` block counts it
 
 | Fetch outcome (after retries) | Coarser ancestor supplied pixels? | Output pixels | `<ok>` of `[Stats] Tiles:` | Error tally | Fatal majority | Extra line |
 |---|---|---|---|---|---|---|
-| arrived | — (in-tile voids may be filled) | the tile | counted | — | — | — |
+| arrived | — (in-tile voids may be filled; since 0.2.13 a Terrarium tile's seam samples are voided first, *Seam filter* below) | the tile | counted | — | — | `[Stats] Backfill: …` (≥ 0.2.13) when it had void samples |
 | HTTP 404 | yes | upsampled ancestor | counted | — | — | `[Stats] Repaired …` |
 | HTTP 404 | no | `-9999` void | not counted | `HTTP_404_no_data` | never | `[Stats] NO-DATA (HTTP 404): …` |
 | any other failure | yes | upsampled ancestor | **not counted** | its class | **no** | `[Degraded] …`, `[Stats] DEGRADED: …`, `[Stats] Repaired …` |
@@ -3194,6 +3760,45 @@ classifier as the tally: `timeout`, `connect`, `http_<code>` (any status),
 `decode`, `other`. This table describes the file-based CLI `download`; the
 in-memory/WASM downloaders never fill a failed tile from parents, so for them
 every failure is the last row.
+
+**Seam filter (`seam_filter`, changelog 49, `aether_converter` ≥ 0.2.13).**
+A tile service's mosaic can blend its nodata into the valid samples beside a
+source boundary: AWS Terrarium's zoom-15 tiles at 10°E (lat 46.7 – 46.9) hold
+a column of −8,956 … −9,717 m and one of −1,184 … +149 m between terrain of
+1,500 – 3,000 m, its zoom-14 tile above them one column of −3,524 … −4,709 m
+(more such seams in changelog 49). Such samples are above the void threshold
+(−11000 m), so before 0.2.13 they reached the `.abt` as terrain. With the
+filter on (`seam_filter` absent, `null` or `true`; Terrarium only), every
+tile of zoom ≥ 11 the CLI `download` decodes — fetched, read from the raw
+tile cache, the children a cached tile is derived from, the coarser tiles
+the parent fill reads — has its **seam notches** turned into voids right
+after the decode, so the parent fill fills them from the coarser zooms
+exactly like the service's own voids (a notch in a parent is skipped there
+and the next coarser zoom fills). A valid sample is a seam notch when **both
+its row neighbours, or both its column neighbours, are more than 2,200 m
+higher**; a neighbour is the nearest valid sample within 2 samples in that
+direction inside the tile — voids are skipped and are never neighbours, the
+tile edge or a run of voids ends the search, and an axis without a neighbour
+on both sides is not judged (no sample is judged across a blank area). Each
+pass voids all the notches it finds against the tile as it found it; the
+rule runs again on the result, at most 2 passes, stopping at the first that
+finds none — so a two-sample seam whose inner sample is the lower goes in
+two. Real terrain's deepest both-sided single-sample notch in the survey of
+changelog 49 is 1,030 m (z11; ≤ 439 m at z12, ≤ 51 m at z14, ≤ 17 m at
+z15); the shallowest 10°E seam sample is 2,793 m deep. Zooms ≤ 10 are not
+filtered: the service's own tiles there hold single-sample pits of 3.7 –
+6.0 km. The cache keeps the service's bytes as they arrived; a tile it
+derives is built from filtered children and filtered at its own zoom — what
+decoding its stored body gives — and a sample void because its children's
+seam samples were voided is stored as Terrarium RGB `0, 0, 1` (−32767.996 m,
+a void to every converter) instead of `0, 0, 0`, read back as a seam sample
+by a filtering run. `seam_filter: false` decodes every tile exactly as 0.2.12
+did. The backfill is reported either way (§1.2): `[Stats] Backfill: <n> px in
+<m> tile(s) filled from coarser zooms (<k> px seam samples)` in the `[Stats]`
+block, and with `AETHER_DIAG_FILE` set one `[Backfill] z=<z> x=<x> y=<y>: …`
+line per tile in that file only. Mapbox jobs and the in-memory and browser
+downloaders are never filtered (they have no in-tile backfill to fill a
+void).
 
 **Repair jobs (`repair_source_tiles`, changelog 28).** A job carrying
 `repair_source_tiles: [[z, x, y], …]` is the full job (same `url_template`,
@@ -3237,7 +3842,12 @@ The CLI `download` then:
 5. with `buildings_pbf_dir`, rasterizes buildings onto the repaired terrain
    and takes only the repaired pixels from it (`[Buildings] repair: …`); a
    building straddling the repair edge is resolved over a mix of repaired
-   and already-built pixels.
+   and already-built pixels. The directory is read as the repair finds it —
+   a repair ignores `buildings_pbf_ready` — but with `buildings_pbf_list`
+   (≥ 0.2.14, changelog 51) only the listed tiles are read, after the same
+   wait for the list as a full run's post-pass, before any file is written
+   (*Building tiles named by a list* below). A repair that rewrote no pixel
+   burns nothing and reads neither.
 
 `fetch_bounds` stays rejected on this path, as for every file-based run.
 
@@ -3364,7 +3974,14 @@ sent (services build their pyramids their own way), so the `.abt` bytes of
 a job that derives can differ from a run that fetched; they equal those of
 a run served coarser tiles that hold those very means. The pack version
 stays 1: a converter before 0.2.9 reads status 3 as unknown, a miss, and
-refetches the tile (rewriting the entry as status 1).
+refetches the tile (rewriting the entry as status 1). Since 0.2.13, with the
+seam filter on (changelog 49, *Seam filter* above), the children are decoded
+with it and the result is filtered at its own zoom; a sample void only
+because its children's seam samples were voided is written `0, 0, 1`
+(−32767.996 m) instead of `0, 0, 0` — a void to every converter, and read
+back as a seam sample by a filtering run. A Terrarium tile derived with the
+filter on therefore differs from one derived without it wherever its
+children held a seam.
 
 What a run prints (stderr, informational, **not parsed** — consumers may log
 them): after the pass header and before the first request,
@@ -3475,8 +4092,64 @@ download.
 line for line; `buildings_pbf_wait_s` alone is not read); repair jobs
 (`repair_source_tiles`), which ignore both fields — they patch a finished
 run, whose post-pass already saw the marker, and read the directory as they
-find it; and the in-memory/WASM downloaders, which never burn
-`buildings_pbf_dir` and ignore both fields.
+find it (a repair with `buildings_pbf_list` reads `buildings_pbf_wait_s` for
+the list, changelog 51); and the in-memory/WASM downloaders, which never
+burn `buildings_pbf_dir` and ignore both fields.
+
+**Building tiles named by a list (`buildings_pbf_list`, changelog 51,
+`aether_converter` ≥ 0.2.14).** The batch ingest's list (§9a), on a CLI
+`download` — a full run, and a repair (below): `buildings_pbf_dir` is the caller's store,
+`buildings_pbf_list` names the tiles this job burns, and the post-pass reads
+exactly those files — never the store's listing — and writes what a job
+whose `buildings_pbf_dir` holds exactly the listed tiles writes: the same
+`.abt` bytes, the same `[Buildings] <n> pbf tile(s) → …` line (`<n>` = the
+listed tiles that decoded — all of them, normally; never the store's
+count), the same `[Tile] … voids=` lines. An empty list (no byte, or blank
+and comment lines only) burns nothing, as an empty directory does:
+`[Buildings] 0 pbf tile(s), no buildings in extent`. The list file's format,
+the field checks — before any request, `output_dir` not created — and their
+messages are §9a's, unprefixed; among them, the store must exist when the
+job starts (`buildings_pbf_dir "<dir>" is not a directory; with
+buildings_pbf_list it must exist when the job starts — the listed tiles are
+read from it`), and nothing in it is read before the post-pass. The list is
+the ready signal of the steps above, step for step: the post-pass looks for
+it where it would look for the marker; when it has to wait, stderr gets
+`[Buildings] waiting for the building tiles (<list path>)` and `[Buildings]
+building tiles ready after <s.s> s` (the list's path exactly as the job
+gives it); a list that does not come fails the run:
+
+```
+Error: Building tiles not ready: the list file <list path> (buildings_pbf_list) did not appear within <w> s (buildings_pbf_wait_s); the download fails rather than leave terrain without its buildings
+```
+
+A listed tile that is not in `buildings_pbf_dir` (or cannot be read) fails
+it too: `Error: Building tile <name> listed in <list> is not in <dir>` (§9a).
+Either failure removes a full run's `.abt` files (`[Download] Removed <n>
+incomplete .abt file(s) …`) and prints no burn line and no `[Stats]` block
+(a repair keeps its files unchanged, below).
+Write the list last and atomically (complete under another name, then
+renamed into place): it is read once, right after it is seen.
+
+**Repair jobs honour `buildings_pbf_list`** exactly as a first pass does —
+the caller puts the list on every pass, and it is the tile selection; only
+the marker (`buildings_pbf_ready`) is pointless on a repair and still
+ignored. A repair with the list: its fields are checked before any request
+by the rules above (needs `buildings_pbf_dir`, which must exist; excludes
+`buildings_pbf_ready`; absolute; `buildings_pbf_wait_s` 0 … 86400), with
+the same messages; once its pixels are rewritten in memory, it waits for
+the list when it is not there — the same `[Buildings] waiting for the
+building tiles (<list path>)` / `[Buildings] building tiles ready after
+<s.s> s` lines and timeout — then reads it and decodes exactly the listed
+tiles, never the store's listing, and burns them onto the repaired pixels:
+the `[Buildings] repair: <b> building(s), <p> repaired px raised` line and
+the bytes of a repair whose `buildings_pbf_dir` holds exactly the listed
+tiles. A list that does not come, or names a tile the directory does not
+hold, fails the repair with the first pass's error before any file is
+written: the existing `.abt` files are unchanged (a repair never removes
+one). `[Stats] Downloaded: … in <s>s` leaves the wait out, as in a full
+run. A repair that rewrote no pixel burns nothing and does not look for
+the list. Without the list, a repair is unchanged: it reads
+`buildings_pbf_dir` whole, as it finds it.
 
 ---
 
@@ -3709,6 +4382,9 @@ Every release from the first signed engine release on also publishes
 | `.abt` writer, disk-space string, download job | `crates/aether_converter/src/{download.rs,ingest.rs}` |
 | `probe` (`aether-probe/1`), its GDAL cross-check | `crates/aether_converter/src/probe.rs`, `tools/probe_vs_gdal.py`, `schemas/probe_output.schema.json` |
 | `[Tile]` lines (ingest coverage and voids; `download` voids), atomic tile replacement | `crates/aether_converter/src/{main.rs,ingest.rs}` (`TileFile`, `TileStats::void_px`), `crates/aether_converter/src/download.rs` (`print_tile_void_lines`) |
+| `download` seam filter (`seam_filter`), `[Stats] Backfill:` / `[Backfill]` lines, derived-tile seam voids | `crates/aether_converter/src/download/seam.rs` (the rule and its constants), `crates/aether_converter/src/download.rs` (`TileDecoder`, `DownloadStats::note_backfill`), `crates/aether_converter/src/download/tile_cache.rs` (`Codec::seam_void`, `TileCache::open_for_run`); fixtures `crates/aether_converter/tests/fixtures/terrarium_seam_10e/` |
+| `[Rust] run: … peak rss`, `[Stats] Peak RSS:` (the process's peak resident memory) | `crates/aether_converter/src/proc_usage.rs` (the OS reads, shared with the `[Rust] run:` CPU time and page faults), `crates/aether_converter/src/ingest.rs` (`run_line`), `crates/aether_converter/src/download.rs` (`peak_rss_line`, `DownloadStats::log_cli_summary`) |
+| `buildings_pbf_list` — the list file and its checks, the decode of the listed tiles only, the list as the ready signal, the decode's start line | `crates/aether_converter/src/buildings.rs` (`read_pbf_list`, `load_pbf_building_list_with_progress`, `PbfSource`), `crates/aether_converter/src/download.rs` (`buildings_ready_marker`, `listed_store_exists`, `ReadySignal`, `wait_for_buildings_marker`), `crates/aether_converter/src/ingest/buildings_ready.rs` (`batch_markers`, `BuildingsHandOver`), `crates/aether_converter/src/main.rs` (`pbf_list_decode_line`, `decode_building_source`) |
 | ATIL reader, GeoTIFF export | `crates/aether_export/src/main.rs` |
 | `.vix` writer, ATIL reader, COG output | `crates/aether_aggregate/src/{aggregate.rs,reader.rs,writer.rs}` |
 | `.vix` reader (consumer) | `MPT_SIGMA/…/core/vix_reader.py` |

@@ -21,7 +21,9 @@
 //! set, are ALSO appended to the file ([`err_kept`]) — a GUI that shows only
 //! every tenth progress line loses nothing. So, since changelog 48, are the
 //! `[Tile] <name> voids=<n>` lines of `download` (stderr, [`err_kept`]) and
-//! of a batch `ingest` (stdout, [`keep`]).
+//! of a batch `ingest` (stdout, [`keep`]). A download's per-tile
+//! `[Backfill] …` lines (changelog 49) go to the file only ([`keep`]):
+//! nothing when the variable is unset.
 
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};

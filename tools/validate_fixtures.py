@@ -22,6 +22,7 @@ script exits 1. Nothing here is wired into CI yet.
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 
@@ -121,8 +122,38 @@ def validate_job(obj, ctx):
             check(pr["radio_climate"] in range(1, 8), f"{ctx}.propagation.radio_climate: expected 1..7")
 
 
+def _is_abs_path(p):
+    """Absolute on the platform that wrote it: POSIX `/…`, a Windows drive
+    `C:\\…` / `C:/…`, or a UNC `\\\\server\\share\\…`."""
+    return isinstance(p, str) and (p.startswith("/") or p.startswith("\\\\")
+                                   or re.match(r"^[A-Za-z]:[\\/]", p) is not None)
+
+
+def validate_pbf_list(j, c, batch):
+    """Additive, changelog 51 (aether_converter >= 0.2.14): `buildings_pbf_list`
+    on a download job or a batch ingest job — the absolute path of the list
+    file; needs `buildings_pbf_dir`, excludes `buildings_pbf_ready`; a single
+    ingest job (not an array) refuses it."""
+    lst = j.get("buildings_pbf_list")
+    if lst is None:
+        return
+    check(isinstance(lst, str) and lst != "", f"{c}.buildings_pbf_list: non-empty string or null")
+    check(_is_abs_path(lst), f"{c}.buildings_pbf_list: must be an absolute path, got {lst!r}")
+    check(isinstance(j.get("buildings_pbf_dir"), str),
+          f"{c}: buildings_pbf_list needs buildings_pbf_dir (the listed names are files inside it)")
+    check(j.get("buildings_pbf_ready") is None,
+          f"{c}: buildings_pbf_list and buildings_pbf_ready exclude each other (the list is the ready signal)")
+    check(batch, f"{c}: buildings_pbf_list is read by a batch ingest only (a JSON array of jobs)")
+    w = j.get("buildings_pbf_wait_s")
+    if w is not None:
+        check(_is_num(w) and 0 <= w <= 86400, f"{c}.buildings_pbf_wait_s: number in [0, 86400]")
+
+
 def validate_ingest(obj, ctx):
     jobs = obj if isinstance(obj, list) else [obj]
+    # One decode per list (changelog 51): every job naming it gives the same
+    # buildings_pbf_dir and buildings_pbf_wait_s.
+    lists = {}
     for i, j in enumerate(jobs):
         c = f"{ctx}[{i}]" if isinstance(obj, list) else ctx
         check(isinstance(j, dict), f"{c}: must be object")
@@ -165,6 +196,13 @@ def validate_ingest(obj, ctx):
                 check(isinstance(j.get("swiss_tifs"), list), f"{c}.swiss_tifs: array (may be empty)")
         if j.get("void_fill_m") is not None:
             check(_is_num(j["void_fill_m"]), f"{c}.void_fill_m: number")
+        validate_pbf_list(j, c, isinstance(obj, list))
+        if isinstance(j.get("buildings_pbf_list"), str):
+            mine = (j.get("buildings_pbf_dir"), j.get("buildings_pbf_wait_s"))
+            first = lists.setdefault(j["buildings_pbf_list"], (c, mine))
+            check(first[1] == mine,
+                  f"{c}: buildings_pbf_list {j['buildings_pbf_list']!r} named with another "
+                  f"buildings_pbf_dir / buildings_pbf_wait_s than in {first[0]}")
 
 
 def validate_download(obj, ctx):
@@ -190,6 +228,11 @@ def validate_download(obj, ctx):
                 check(_is_num(t.get("ul_lon")), f"{c}.ul_lon: number")
                 check(isinstance(t.get("size_px"), int) and not isinstance(t.get("size_px"), bool), f"{c}.size_px: integer")
                 check(_is_num(t.get("resolution_m")) and t.get("resolution_m", 0) > 0, f"{c}.resolution_m: positive number")
+    # Additive, changelog 51 (aether_converter >= 0.2.14).
+    validate_pbf_list(obj, ctx, True)
+    # Additive, changelog 49 (aether_converter >= 0.2.13): the seam filter.
+    if obj.get("seam_filter") is not None:
+        check(isinstance(obj["seam_filter"], bool), f"{ctx}.seam_filter: boolean or null")
     # Additive, changelog 28 (aether_converter >= 0.2.6).
     if obj.get("tile_deadline_s") is not None:
         v = obj["tile_deadline_s"]

@@ -30,15 +30,24 @@ fn version_flag_prints_name_and_semver() {
 /// `ingest` job fields `buildings_pbf_ready` / `buildings_pbf_wait_s` /
 /// `buildings_hold_mb` (changelog 48: building tiles fetched while the batch
 /// samples its terrain) and the `[Tile] … voids=` lines kept in
-/// `AETHER_DIAG_FILE`. Bump the crate version — and the §1.5 table — with
-/// the next capability.
+/// `AETHER_DIAG_FILE`, 0.2.13 the `download` job field `seam_filter` and the
+/// seam filter it switches (changelog 49; also the `[Stats] Backfill:` line)
+/// and the process's peak memory at the end of a run — `[Stats] Peak RSS:`
+/// and `[Rust] run: … peak rss` (changelog 50; informational, no gate of its
+/// own), 0.2.14 the job field `buildings_pbf_list` of `download` and batch
+/// `ingest` (changelog 51: only the listed building tiles are read from
+/// `buildings_pbf_dir`, and the list file is their ready signal). Bump the
+/// crate version — and the §1.5 table — with the next capability.
 #[test]
 fn version_covers_the_documented_capability_gates() {
     let v: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|p| p.parse().unwrap()).collect();
     assert_eq!(
         v,
-        [0, 2, 12],
-        "CONTRACT §1.5 gates ingest `buildings_pbf_ready` on aether_converter 0.2.12 \
+        [0, 2, 14],
+        "CONTRACT §1.5 gates `buildings_pbf_list` (download and batch ingest) on \
+         aether_converter 0.2.14 (changelog 51), the download seam filter (`seam_filter`) on \
+         0.2.13 (changelog 49; the peak-RSS lines of changelog 50 came with it), \
+         ingest `buildings_pbf_ready` on 0.2.12 \
          (changelog 48), the `[Tile] … voids=` lines on 0.2.11 (changelog 46), \
          download `buildings_pbf_ready` on 0.2.10 (changelog 45), \
          AETHER_DIAG_FILE and download `cache_dir` on 0.2.8 \

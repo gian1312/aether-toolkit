@@ -47,7 +47,11 @@
 //! of the service's finer tiles, NOT the service's own coarser tile. Pack
 //! version stays 1: a converter before 0.2.9 reads status 3 as unknown, a
 //! miss, and refetches the tile (rewriting the entry as status 1). Nothing
-//! is ever requested for a child.
+//! is ever requested for a child. With the run's seam filter on (changelog
+//! 49, [`TileCache::open_for_run`]) the children are decoded with it and
+//! each built tile is filtered at its own zoom; a sample void only because
+//! its children's seam samples were voided is written `0, 0, 1` instead of
+//! the void `0, 0, 0` ([`Codec::seam_void`]) and read back as a seam void.
 //!
 //! **Writing** (one writer thread per run, [`writer`]): the pack is locked
 //! (`flock` on unix, an exclusive-write open on Windows — see [`lock`]), the
@@ -682,19 +686,37 @@ pub(super) struct TileCache {
     /// (changelog 40); `None` for an encoding without one — nothing is
     /// derived then.
     codec: Option<Codec>,
+    /// The run's seam filter (changelog 49): the children a tile is derived
+    /// from are decoded with it, and so is each tile built from them.
+    seam: bool,
 }
 
 impl TileCache {
     /// Open (creating as needed) the cache of tile service `url_template` /
     /// `encoding` under `dir` and start its writer; the error is the reason
     /// for the `[Warn] cache_dir …` line (the run then goes without cache).
+    #[cfg_attr(not(test), allow(dead_code))] // a run opens with `open_for_run`
     pub(super) fn open(dir: &Path, url_template: &str, encoding: &str) -> Result<Arc<Self>, String> {
         Self::open_with(dir, url_template, encoding, LOCK_TIMEOUT)
     }
 
+    /// [`Self::open`] for a run whose seam filter is `seam` (changelog 49):
+    /// with it on, a tile is derived from children decoded with the filter.
+    /// [`Self::open`] derives without it.
+    pub(super) fn open_for_run(dir: &Path, url_template: &str, encoding: &str, seam: bool) -> Result<Arc<Self>, String> {
+        Self::create(dir, url_template, encoding, LOCK_TIMEOUT, seam)
+    }
+
     /// [`Self::open`] with its own lock timeout (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn open_with(
         dir: &Path, url_template: &str, encoding: &str, lock_timeout: Duration,
+    ) -> Result<Arc<Self>, String> {
+        Self::create(dir, url_template, encoding, lock_timeout, false)
+    }
+
+    fn create(
+        dir: &Path, url_template: &str, encoding: &str, lock_timeout: Duration, seam: bool,
     ) -> Result<Arc<Self>, String> {
         let encoding = encoding.to_lowercase();
         let root = dir.join(service_key(url_template, &encoding));
@@ -739,6 +761,7 @@ impl TileCache {
             counts,
             readers: Mutex::new(std::collections::VecDeque::new()),
             codec: Codec::of(&encoding),
+            seam,
         }))
     }
 
@@ -940,6 +963,12 @@ pub(super) struct Codec {
     /// hold a void (a 404 child beside children with data) is not derived;
     /// it is fetched.
     pub void: Option<[u8; 3]>,
+    /// The RGB a sample is written as when it is void because the seam
+    /// filter voided the child samples under it (changelog 49): Terrarium's
+    /// `0, 0, 1` (−32767.996 m — a void to every decoder, read back as a
+    /// seam void by a filtering run, [`super::TileDecoder::decode`]). The
+    /// filter never runs on Mapbox tiles.
+    pub seam_void: Option<[u8; 3]>,
 }
 
 impl Codec {
@@ -947,8 +976,11 @@ impl Codec {
     /// not know.
     pub(super) fn of(encoding: &str) -> Option<Self> {
         match encoding.to_lowercase().as_str() {
-            "terrarium" => Some(Codec { dec: super::dec_terrarium, enc: super::enc_terrarium, void: Some([0, 0, 0]) }),
-            "mapbox" => Some(Codec { dec: super::dec_mapbox, enc: super::enc_mapbox, void: None }),
+            "terrarium" => Some(Codec {
+                dec: super::dec_terrarium, enc: super::enc_terrarium, void: Some([0, 0, 0]),
+                seam_void: Some(super::SEAM_VOID_RGB),
+            }),
+            "mapbox" => Some(Codec { dec: super::dec_mapbox, enc: super::enc_mapbox, void: None, seam_void: None }),
             _ => None,
         }
     }
@@ -1059,30 +1091,40 @@ impl Parent {
     /// Quadrant `(dx, dy)` from `child` (of the same edge; `None`: a 404):
     /// pixel `(i, j)` of the quadrant is the mean of the child's samples
     /// `(2i + {0, 1}, 2j + {0, 1})` that are not void (`> NODATA_M`, so NaN
-    /// is left out too), encoded with `codec`; void where none is. `None`
+    /// is left out too), encoded with `codec`; void where none is — a seam
+    /// void (`codec.seam_void`, [`super::SEAM_VOID_M`] in the grid) where one
+    /// of the four is one (changelog 49), else the encoding's void. `None`
     /// when a void is needed and the encoding has none.
     fn fill(&mut self, codec: &Codec, dx: u32, dy: u32, child: Option<&[f32]>) -> Option<()> {
         let (e, h) = (self.edge, self.edge / 2);
         for j in 0..h {
             for i in 0..h {
-                let mean = child.and_then(|c| {
+                let (mut sum, mut n, mut seam) = (0f64, 0u32, false);
+                if let Some(c) = child {
                     let o = 2 * j * e + 2 * i;
-                    let (mut sum, mut n) = (0f64, 0u32);
                     for v in [c[o], c[o + 1], c[o + e], c[o + e + 1]] {
                         if v > super::NODATA_M {
                             sum += v as f64;
                             n += 1;
+                        } else if v == super::SEAM_VOID_M {
+                            seam = true;
                         }
                     }
-                    (n > 0).then(|| sum / n as f64)
-                });
-                let rgb = match mean {
-                    Some(m) => (codec.enc)(m),
-                    None => codec.void?,
-                };
+                }
                 let p = (dy as usize * h + j) * e + dx as usize * h + i;
+                let (rgb, v) = match (n > 0, seam.then_some(codec.seam_void).flatten()) {
+                    (true, _) => {
+                        let rgb = (codec.enc)(sum / n as f64);
+                        (rgb, (codec.dec)(rgb[0], rgb[1], rgb[2]))
+                    }
+                    (false, Some(rgb)) => (rgb, super::SEAM_VOID_M),
+                    (false, None) => {
+                        let rgb = codec.void?;
+                        (rgb, (codec.dec)(rgb[0], rgb[1], rgb[2]))
+                    }
+                };
                 self.rgb[3 * p..3 * p + 3].copy_from_slice(&rgb);
-                self.grid[p] = (codec.dec)(rgb[0], rgb[1], rgb[2]);
+                self.grid[p] = v;
             }
         }
         Some(())
@@ -1155,8 +1197,12 @@ impl TileCache {
                 return Some(Got::NoTile);
             }
             // A body that fails its CRC or its decode counts as no entry.
+            // Decoded as the run decodes its tiles — the seam filter
+            // included (changelog 49) — so a derived tile inherits it.
             let body = self.reader((zoom, x, y / SLOTS)).and_then(|f| read_body_from(&f, &e));
-            if let Some(Ok((grid, edge))) = body.map(|b| super::decode_tile(&b, codec.dec)) {
+            let decoder = super::TileDecoder { dec: codec.dec, seam: self.seam };
+            let derived = e.status == STATUS_DERIVED;
+            if let Some(Ok((grid, edge))) = body.map(|b| decoder.decode(&b, zoom, derived)) {
                 return Some(Got::Body(grid, edge));
             }
         }
@@ -1199,6 +1245,10 @@ impl TileCache {
             p.fill(codec, dx, dy, None)?;
         }
         made.push((zoom, x, y, Cached::Derived(png_rgb(&p.rgb, p.edge)?)));
+        // The built tile is a decoded tile like any other: the seam filter
+        // runs on it (changelog 49) — on what its stored body decodes to, so
+        // a later run that reads that body back gets these very samples.
+        super::TileDecoder { dec: codec.dec, seam: self.seam }.filter(&mut p.grid, p.edge, zoom);
         Some(Got::Body(p.grid, p.edge))
     }
 }
@@ -2318,5 +2368,94 @@ mod tests {
             if cfg!(debug_assertions) { "debug build" } else { "release build" },
         );
         cache.finish();
+    }
+
+    #[test]
+    fn with_the_seam_filter_a_tile_is_derived_from_cleaned_children_and_keeps_their_seam_voids() {
+        // z14 tile (8647, 5776) from its four z15 children (edge 16); the two
+        // west children carry the 10°E seam: columns 6 (−9,300 m) and 7
+        // (−500 m) between terrain of ~2,400 m (changelog 49).
+        let (z, x, y, edge) = (14u32, 8647u32, 5776u32, 16usize);
+        let ground = |dx: u32, px: usize, py: usize| 2400.0 + (dx as usize * edge + px) as f64 * 0.5 - py as f64 * 0.25;
+        let child_m = |dx: u32, dy: u32, px: usize, py: usize| -> f64 {
+            match (dx, px) {
+                (0, 6) => -9300.0,
+                (0, 7) => -500.0,
+                _ => ground(dx, px, py) + dy as f64 * 4.0,
+            }
+        };
+        let kids = kids_of(z, x, y, |dx, dy| Cached::Body(terrarium(edge, |px, py| Some(child_m(dx, dy, px, py)))));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(service_key(TPL, "terrarium"));
+        put_tiles(&root, &kids);
+
+        // What the definition gives from children whose seam samples are
+        // voids: the seam's parent column (3 in the west half) is void.
+        let cleaned: [[Option<Vec<f32>>; 2]; 2] = [0u32, 1].map(|dx| [0u32, 1].map(|dy| Some(
+            (0..edge * edge).map(|i| match (dx, i % edge) {
+                (0, 6) | (0, 7) => -32768.0,
+                _ => child_m(dx, dy, i % edge, i / edge) as f32,
+            }).collect::<Vec<f32>>()
+        )));
+        let want = expected_parent(&cleaned, edge);
+
+        let on = TileCache::open_for_run(dir.path(), TPL, "terrarium", true).unwrap();
+        let mut made = Vec::new();
+        let Some(Derived::Body(grid, 16)) = on.derive_now(z, x, y, &mut made) else { panic!("not derived") };
+        for (i, (g, w)) in grid.iter().zip(&want).enumerate() {
+            if i % edge == 3 {
+                assert_eq!(*g, super::super::SEAM_VOID_M, "sample {i}: a seam void, told from the service's");
+                assert_eq!(*w, -32768.0);
+            } else {
+                assert_eq!(g, w, "sample {i}");
+            }
+        }
+        // The stored body writes that void as 0, 0, 1 — a void to any
+        // decoder — and a filtering run reading it back gets the very grid.
+        let (_, _, _, Cached::Derived(png)) = made.last().unwrap() else { panic!("a derived body") };
+        let (raw, _) = decode_tile(png, dec_terrarium).unwrap();
+        assert!((0..edge).all(|r| raw[r * edge + 3] == dec_terrarium(0, 0, 1)));
+        assert!(raw.iter().all(|&v| v != -32768.0), "no service void in this tile");
+        let decoder = super::super::TileDecoder { dec: dec_terrarium, seam: true };
+        let (back, _) = decoder.decode(png, z, true).unwrap();
+        assert!(back.iter().zip(&grid).all(|(a, b)| a.to_bits() == b.to_bits()));
+        on.finish();
+
+        // Without the filter the seam is averaged into its parent column — a
+        // −4,900 m trench a coarser pass would keep: why children are
+        // decoded with it.
+        let off = TileCache::open(dir.path(), TPL, "terrarium").unwrap();
+        let Some(Derived::Body(plain, 16)) = off.derive_now(z, x, y, &mut Vec::new()) else { panic!("not derived") };
+        assert!((0..edge).all(|r| (-4950.0..-4850.0).contains(&plain[r * edge + 3])), "{:?}", &plain[3..4]);
+        off.finish();
+    }
+
+    #[test]
+    fn a_derived_tile_is_filtered_at_its_own_zoom_as_a_read_back_one_would_be() {
+        // A trench two samples wide (−5,000 m in child columns 6 and 7) is
+        // no notch at z15 — each floor sample has the other beside it — but
+        // its parent column 3 is one sample at −5,000 m between ~2,400 m: a
+        // notch at z14. The derived grid must be what decoding its stored
+        // body gives a filtering run, or a fresh derivation and a cached one
+        // would write different terrain (changelog 49).
+        let (z, x, y, edge) = (14u32, 8647u32, 5776u32, 16usize);
+        let kids = kids_of(z, x, y, |dx, dy| Cached::Body(terrarium(edge, |px, py| Some(match (dx, px) {
+            (0, 6) | (0, 7) => -5000.0,
+            _ => 2400.0 + px as f64 * 0.5 - py as f64 * 0.25 + dy as f64 * 4.0,
+        }))));
+        let dir = tempfile::tempdir().unwrap();
+        put_tiles(&dir.path().join(service_key(TPL, "terrarium")), &kids);
+        let on = TileCache::open_for_run(dir.path(), TPL, "terrarium", true).unwrap();
+        let mut made = Vec::new();
+        let Some(Derived::Body(grid, 16)) = on.derive_now(z, x, y, &mut made) else { panic!("not derived") };
+        let (_, _, _, Cached::Derived(png)) = made.last().unwrap() else { panic!("a derived body") };
+        // Stored as the mean it is; voided in the grid, as on the way back.
+        let (raw, _) = decode_tile(png, dec_terrarium).unwrap();
+        assert!((0..edge / 2).all(|r| raw[r * edge + 3] == -5000.0));
+        assert!((0..edge / 2).all(|r| grid[r * edge + 3] == super::super::SEAM_VOID_M));
+        let decoder = super::super::TileDecoder { dec: dec_terrarium, seam: true };
+        let (back, _) = decoder.decode(png, z, true).unwrap();
+        assert!(back.iter().zip(&grid).all(|(a, b)| a.to_bits() == b.to_bits()));
+        on.finish();
     }
 }

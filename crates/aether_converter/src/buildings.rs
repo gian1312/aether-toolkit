@@ -19,9 +19,9 @@
 //! their own footprint before anything is written.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::ingest::{point_in_poly, VOID_FLOOR};
 
@@ -810,7 +810,8 @@ pub fn rasterize_buildings<G: ElevGrid>(
     stats
 }
 
-/// Every building in a directory of `{z}_{x}_{y}.pbf` vector tiles, decoded once.
+/// Every building in a directory of `{z}_{x}_{y}.pbf` vector tiles — or in
+/// the tiles of it a `buildings_pbf_list` names (changelog 51) — decoded once.
 ///
 /// The set does not depend on which output tile it will be drawn onto, so both
 /// pipelines that consume such a directory — `ingest`'s per-tile rasterization
@@ -820,7 +821,8 @@ pub struct PbfBuildingSet {
     /// Deduplicated buildings, in tile-file **name** order (and, within a
     /// tile, in the tile's own feature order).
     pub buildings: Vec<Building>,
-    /// `{z}_{x}_{y}` tile files in the directory, decoded or skipped.
+    /// `{z}_{x}_{y}` tile files in the directory (with a list: the distinct
+    /// names it lists), decoded or skipped.
     pub tiles_found: usize,
     /// PBF tiles that decoded successfully.
     pub tiles_read: usize,
@@ -838,6 +840,155 @@ impl PbfBuildingSet {
     }
 }
 
+/// Where a job's vector-tile buildings come from: every tile file of its
+/// `buildings_pbf_dir`, or only the tiles its `buildings_pbf_list` names
+/// there (CONTRACT §9a/§9b, changelog 51). A batch `ingest` decodes each
+/// distinct one once for the run.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PbfSource {
+    /// `buildings_pbf_dir` alone: the directory's tile files.
+    Dir(PathBuf),
+    /// `buildings_pbf_list` (*list*) with its `buildings_pbf_dir` (*dir*):
+    /// the listed names, read from *dir*, which is never listed itself.
+    List { list: PathBuf, dir: PathBuf },
+}
+
+impl PbfSource {
+    /// The `buildings_pbf_dir` the tiles are read from.
+    pub fn dir(&self) -> &Path {
+        match self {
+            PbfSource::Dir(dir) | PbfSource::List { dir, .. } => dir,
+        }
+    }
+
+    /// Decode it, without progress lines: [`load_pbf_building_dir`] or
+    /// [`load_pbf_building_list`].
+    pub fn load(&self) -> Result<PbfBuildingSet> {
+        match self {
+            PbfSource::Dir(dir) => load_pbf_building_dir(dir),
+            PbfSource::List { list, dir } => load_pbf_building_list(dir, list),
+        }
+    }
+}
+
+/// The tile names of a `buildings_pbf_list` file (changelog 51), as
+/// [`read_pbf_list`] found them: each a `{z}_{x}_{y}.pbf` (or `.mvt`) name
+/// without a directory part, every name once, in name (byte) order — the
+/// order a directory's tile files are decoded in.
+#[derive(Debug, Clone)]
+pub struct PbfList {
+    path: PathBuf,
+    names: Vec<String>,
+}
+
+impl PbfList {
+    /// The distinct tile names, in name order.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+}
+
+/// Read the `buildings_pbf_list` file *list* (changelog 51): UTF-8 text, one
+/// building tile file name per line (`{z}_{x}_{y}.pbf`, no directory part),
+/// lines ending in `\n` or `\r\n`. Blank lines and lines starting with `#`
+/// are ignored, as is whitespace around a name and a leading byte-order
+/// mark; a name listed twice counts once. A name with a path separator (`/`
+/// or `\`), or one that is no building tile name, is an error naming the
+/// list and the line — so is a list that cannot be read or is not UTF-8.
+pub fn read_pbf_list(list: &Path) -> Result<PbfList> {
+    let raw = fs::read(list).with_context(|| format!("reading buildings_pbf_list {}", list.display()))?;
+    let text = String::from_utf8(raw)
+        .map_err(|_| anyhow::anyhow!("buildings_pbf_list {} is not UTF-8 text", list.display()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut names = std::collections::BTreeSet::new();
+    for (i, line) in text.split('\n').enumerate() {
+        // `trim` also takes the `\r` of a CRLF line.
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('#') {
+            continue;
+        }
+        if name.contains(['/', '\\']) {
+            anyhow::bail!(
+                "buildings_pbf_list {}: line {}: {name:?} has a directory part; list the tile \
+                 file names inside buildings_pbf_dir ({{z}}_{{x}}_{{y}}.pbf), one per line",
+                list.display(),
+                i + 1
+            );
+        }
+        if crate::ingest::parse_pbf_tile_name(name).is_none() {
+            anyhow::bail!(
+                "buildings_pbf_list {}: line {}: {name:?} is not a building tile name ({{z}}_{{x}}_{{y}}.pbf)",
+                list.display(),
+                i + 1
+            );
+        }
+        names.insert(name.to_owned());
+    }
+    // A `BTreeSet<String>` iterates in byte order, the directory's name order.
+    Ok(PbfList { path: list.to_path_buf(), names: names.into_iter().collect() })
+}
+
+/// Decode the tiles the `buildings_pbf_list` file *list* names in *pbf_dir*:
+/// [`read_pbf_list`], then [`load_pbf_building_list_with_progress`] without
+/// the progress callback.
+pub fn load_pbf_building_list(pbf_dir: &Path, list: &Path) -> Result<PbfBuildingSet> {
+    load_pbf_building_list_with_progress(pbf_dir, &read_pbf_list(list)?, &|_, _| {})
+}
+
+/// Decode exactly the tiles *list* names, read from *pbf_dir* — which is
+/// never listed (changelog 51: the plugin's store holds ~49,000 tiles, a
+/// batch needs a few thousand) — into one building set.
+///
+/// The set, its counts, the `[Warn] buildings <name>: <error>` lines and the
+/// progress calls are exactly those of [`load_pbf_building_dir_with_progress`]
+/// over a directory holding exactly the listed tiles: the same names in the
+/// same (name) order through the same decode. `tiles_found` is the number of
+/// distinct listed names. Two differences: listed names of two zooms fail
+/// with `buildings_pbf_list <list> mixes zoom levels (…)` (before any tile is
+/// read, as for a directory), and a listed tile that cannot be read — not
+/// there, or unreadable — fails the load with `Building tile <name> listed
+/// in <list> is not in <dir>` (with the OS error as its cause when the file
+/// is there but unreadable); a directory decode would never have listed a
+/// missing file.
+pub fn load_pbf_building_list_with_progress(
+    pbf_dir: &Path,
+    list: &PbfList,
+    on_progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<PbfBuildingSet> {
+    let files: Vec<PbfTileFile> = list
+        .names
+        .iter()
+        .map(|name| {
+            let (z, x, y) = crate::ingest::parse_pbf_tile_name(name)
+                .expect("read_pbf_list keeps building tile names only");
+            PbfTileFile { name: name.clone(), path: pbf_dir.join(name), z, x, y }
+        })
+        .collect();
+    decode_pbf_tile_files(
+        files,
+        on_progress,
+        |z0, z| {
+            anyhow::anyhow!(
+                "buildings_pbf_list {} mixes zoom levels ({z0} and {z}); expected exactly one",
+                list.path.display()
+            )
+        },
+        |f, e| {
+            let msg = format!(
+                "Building tile {} listed in {} is not in {}",
+                f.name,
+                list.path.display(),
+                pbf_dir.display()
+            );
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(msg)
+            } else {
+                anyhow::Error::new(e).context(msg)
+            }
+        },
+    )
+}
+
 /// Decode every `{z}_{x}_{y}.pbf` tile in *pbf_dir* into one shared building set.
 ///
 /// [`load_pbf_building_dir_with_progress`] without the progress callback.
@@ -845,7 +996,7 @@ pub fn load_pbf_building_dir(pbf_dir: &Path) -> Result<PbfBuildingSet> {
     load_pbf_building_dir_with_progress(pbf_dir, &|_, _| {})
 }
 
-/// One `{z}_{x}_{y}` tile file of a building directory.
+/// One `{z}_{x}_{y}` tile file of a building directory (or list).
 struct PbfTileFile {
     name: String,
     path: std::path::PathBuf,
@@ -925,9 +1076,6 @@ pub fn load_pbf_building_dir_with_progress(
     pbf_dir: &Path,
     on_progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<PbfBuildingSet> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
     if !pbf_dir.is_dir() {
         anyhow::bail!("buildings_pbf_dir {:?} is not a directory", pbf_dir);
     }
@@ -941,14 +1089,34 @@ pub fn load_pbf_building_dir_with_progress(
     }
     files.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
+    decode_pbf_tile_files(
+        files,
+        on_progress,
+        |z0, z| anyhow::anyhow!("buildings_pbf_dir mixes zoom levels ({z0} and {z}); expected exactly one"),
+        |_, e| e.into(),
+    )
+}
+
+/// The decode of [`load_pbf_building_dir_with_progress`] and
+/// [`load_pbf_building_list_with_progress`]: *files*, in name order, read
+/// and decoded in parallel and taken in that order (see the former). Two
+/// zooms fail with *mixed_zooms(first, other)* before any file is read; the
+/// first file, in name order, that cannot be read fails the load with
+/// *unreadable(file, its read error)*.
+fn decode_pbf_tile_files(
+    files: Vec<PbfTileFile>,
+    on_progress: &(dyn Fn(usize, usize) + Sync),
+    mixed_zooms: impl Fn(u32, u32) -> anyhow::Error,
+    unreadable: impl Fn(&PbfTileFile, std::io::Error) -> anyhow::Error,
+) -> Result<PbfBuildingSet> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     let mut set = PbfBuildingSet { tiles_found: files.len(), ..Default::default() };
     for f in &files {
         match set.zoom {
             None => set.zoom = Some(f.z),
-            Some(z0) if z0 != f.z => anyhow::bail!(
-                "buildings_pbf_dir mixes zoom levels ({z0} and {}); expected exactly one",
-                f.z
-            ),
+            Some(z0) if z0 != f.z => return Err(mixed_zooms(z0, f.z)),
             _ => {}
         }
     }
@@ -1000,7 +1168,7 @@ pub fn load_pbf_building_dir_with_progress(
                 set.buildings.extend(buildings);
             }
             PbfTileOutcome::Undecodable(e) => eprintln!("[Warn] buildings {}: {e}", f.name),
-            PbfTileOutcome::Unreadable(e) => return Err(e.into()),
+            PbfTileOutcome::Unreadable(e) => return Err(unreadable(f, e)),
             PbfTileOutcome::NotReached => {
                 unreachable!("a tile past an unreadable one is never walked to")
             }
@@ -1878,6 +2046,203 @@ pub(crate) mod tests {
         std::fs::write(dir.path().join("15_19980_11400.pbf"), synthetic_building_tile()).unwrap();
         let err = load_pbf_building_dir(dir.path()).unwrap_err().to_string();
         assert!(err.contains("buildings_pbf_dir mixes zoom levels (14 and 15)"), "got {err:?}");
+    }
+
+    // ── buildings_pbf_list (changelog 51) ──────────────────────────────────
+
+    /// Writes *text* as the list file *name* in *dir*; returns its path.
+    fn write_list(dir: &Path, name: &str, text: &[u8]) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_list_takes_each_name_once_in_name_order_whatever_its_line_ends_blanks_and_comments() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A byte-order mark, CRLF and LF lines, a last line without an end,
+        // blank and whitespace-only lines, comments (one indented), a name
+        // with blanks around it and one listed twice, `.mvt` beside `.pbf`.
+        let text = "\u{feff}# batch 7 of the Map Converter\r\n\
+                    14_9999_5700.pbf\r\n\
+                    \r\n\
+                    \x20  \t\n\
+                    14_10000_5700.pbf\n\
+                    \x20 # 14_1_1.pbf is commented out\n\
+                    \t14_9999_5700.pbf  \r\n\
+                    14_10000_5701.mvt";
+        let p = write_list(tmp.path(), "list.txt", text.as_bytes());
+        let list = read_pbf_list(&p).unwrap();
+        // Byte order, as a directory's tile files are taken: "14_10000_…"
+        // before "14_9999_…".
+        assert_eq!(list.names(), ["14_10000_5700.pbf", "14_10000_5701.mvt", "14_9999_5700.pbf"]);
+
+        // Nothing but blanks and comments: an empty list, no error.
+        let p = write_list(tmp.path(), "empty.txt", b"# no building tiles here\r\n\r\n");
+        assert!(read_pbf_list(&p).unwrap().names().is_empty());
+        let p = write_list(tmp.path(), "zero.txt", b"");
+        assert!(read_pbf_list(&p).unwrap().names().is_empty());
+    }
+
+    #[test]
+    fn a_list_refuses_a_directory_part_and_any_other_name_naming_the_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sep = "has a directory part; list the tile file names inside buildings_pbf_dir \
+                   ({z}_{x}_{y}.pbf), one per line";
+        let other = "is not a building tile name ({z}_{x}_{y}.pbf)";
+        for (i, (name, why)) in [
+            ("pool/14_1_2.pbf", sep),
+            ("..\\14_1_2.pbf", sep),
+            ("/cache/pool/14_1_2.pbf", sep),
+            ("C:\\cache\\pool\\14_1_2.pbf", sep),
+            ("./14_1_2.pbf", sep),
+            ("README.txt", other),
+            ("14_1_2.png", other),
+            ("14_1.pbf", other),
+            ("14_1_2_3.pbf", other),
+            ("..", other),
+            ("_ready", other),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let p = write_list(tmp.path(), &format!("bad{i}.txt"), format!("14_0_0.pbf\r\n# fine so far\r\n{name}\r\n14_0_1.pbf\r\n").as_bytes());
+            let e = read_pbf_list(&p).unwrap_err().to_string();
+            assert_eq!(e, format!("buildings_pbf_list {}: line 3: {name:?} {why}", p.display()), "case {i}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_is_missing_or_not_utf8_is_an_error_naming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("batch_3.txt");
+        let e = read_pbf_list(&missing).unwrap_err();
+        assert_eq!(e.to_string(), format!("reading buildings_pbf_list {}", missing.display()));
+        let io = e.downcast_ref::<std::io::Error>().expect("the read error is the cause");
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+
+        let p = write_list(tmp.path(), "latin1.txt", b"14_1_2.pbf\n\xe4\n");
+        assert_eq!(
+            read_pbf_list(&p).unwrap_err().to_string(),
+            format!("buildings_pbf_list {} is not UTF-8 text", p.display())
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn a_list_decodes_exactly_what_a_directory_of_its_tiles_decodes_and_nothing_else() {
+        // The store: 400 tiles (tile 77 undecodable) and a README, plus an
+        // undecodable tile and one of another zoom that are NOT listed — a
+        // decode of the whole store would warn about the one and refuse the
+        // store for the other (mixed zooms).
+        let store = many_tile_dir(400, &[77]);
+        std::fs::write(store.path().join("14_20000_5700.pbf"), b"\x1a\xff\xff\xff\x0fnot a tile").unwrap();
+        std::fs::write(store.path().join("15_19980_11400.pbf"), synthetic_building_tile()).unwrap();
+        let err = load_pbf_building_dir(store.path()).unwrap_err().to_string();
+        assert!(err.contains("buildings_pbf_dir mixes zoom levels (14 and 15)"), "{err}");
+
+        // Listed: the columns x = 9995 … 10004 of every row — across the
+        // 9999|10000 seam, where name order picks which copy of a house
+        // survives the duplicate filter — and the undecodable tile 77, in
+        // reverse order, the first one twice.
+        let listed: Vec<usize> = (0..400).filter(|i| (15..25).contains(&(i % 40)) || *i == 77).collect();
+        let name = |i: usize| {
+            let (x, y) = many_tile_xy(i);
+            format!("14_{x}_{y}.pbf")
+        };
+        let mut text = String::from("# the tiles of one converter batch\r\n");
+        for &i in listed.iter().rev() {
+            text += &format!("{}\r\n", name(i));
+        }
+        text += &format!("{}\r\n", name(listed[0]));
+        let tmp = tempfile::tempdir().unwrap();
+        let list_path = write_list(tmp.path(), "batch.txt", text.as_bytes());
+
+        // The old way: a directory holding exactly those tiles.
+        let only = tempfile::tempdir().unwrap();
+        for &i in &listed {
+            std::fs::copy(store.path().join(name(i)), only.path().join(name(i))).unwrap();
+        }
+        let reference = load_pbf_building_dir(only.path()).unwrap();
+        let expected = building_bits(&reference);
+        assert_eq!((reference.tiles_found, reference.tiles_read), (listed.len(), listed.len() - 1));
+        assert!(reference.duplicates_dropped() > 50, "{} dropped", reference.duplicates_dropped());
+
+        let list = read_pbf_list(&list_path).unwrap();
+        assert_eq!(list.names().len(), listed.len(), "the name listed twice counts once");
+        for threads in [1, 3, 8] {
+            let calls = std::sync::Mutex::new(Vec::new());
+            let set = pool(threads)
+                .install(|| {
+                    load_pbf_building_list_with_progress(store.path(), &list, &|done, total| {
+                        calls.lock().unwrap().push((done, total))
+                    })
+                })
+                .unwrap();
+            assert!(building_bits(&set) == expected, "{threads} thread(s): building list differs");
+            assert_eq!(
+                (set.tiles_found, set.tiles_read, set.decoded, set.zoom),
+                (reference.tiles_found, reference.tiles_read, reference.decoded, reference.zoom),
+                "{threads} thread(s)"
+            );
+            let n = listed.len();
+            assert_eq!(calls.into_inner().unwrap(), (1..=n).map(|d| (d, n)).collect::<Vec<_>>());
+        }
+        // The convenience loader and the source say the same.
+        let source = PbfSource::List { list: list_path.clone(), dir: store.path().to_path_buf() };
+        assert_eq!(source.dir(), store.path());
+        assert!(building_bits(&source.load().unwrap()) == expected);
+        assert!(building_bits(&load_pbf_building_list(store.path(), &list_path).unwrap()) == expected);
+        assert!(building_bits(&PbfSource::Dir(only.path().to_path_buf()).load().unwrap()) == expected);
+    }
+
+    #[test]
+    fn a_listed_tile_that_is_not_in_the_directory_fails_the_load_naming_it() {
+        let store = pbf_dir_with_two_tiles();
+        let tmp = tempfile::tempdir().unwrap();
+        // Two listed tiles are missing: the first in name order is named.
+        let p = write_list(
+            tmp.path(),
+            "batch.txt",
+            b"14_8531_5752.pbf\n14_8541_5752.pbf\n14_8540_5752.pbf\n14_8532_5752.pbf\n",
+        );
+        let e = load_pbf_building_list(store.path(), &p).unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            format!("Building tile 14_8540_5752.pbf listed in {} is not in {}", p.display(), store.path().display()),
+            "one line, no cause, for a file that is not there"
+        );
+
+        // There, but no read of it succeeds (a directory of that name): the
+        // same message, the read error as its cause.
+        std::fs::create_dir(store.path().join("14_8540_5752.pbf")).unwrap();
+        std::fs::write(store.path().join("14_8541_5752.pbf"), synthetic_building_tile()).unwrap();
+        let e = load_pbf_building_list(store.path(), &p).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("Building tile 14_8540_5752.pbf listed in {} is not in {}", p.display(), store.path().display())
+        );
+        assert!(e.downcast_ref::<std::io::Error>().is_some(), "{e:#}");
+
+        // Two zooms listed: refused before any tile is read, so this error
+        // wins over the unreadable tile.
+        let p = write_list(tmp.path(), "mixed.txt", b"14_8540_5752.pbf\n15_17062_11504.pbf\n");
+        assert_eq!(
+            load_pbf_building_list(store.path(), &p).unwrap_err().to_string(),
+            format!("buildings_pbf_list {} mixes zoom levels (14 and 15); expected exactly one", p.display())
+        );
+
+        // An empty list reads nothing — the directory need not even exist.
+        let p = write_list(tmp.path(), "none.txt", b"# nothing to burn\n");
+        let calls = std::sync::Mutex::new(0);
+        let set = load_pbf_building_list_with_progress(
+            &tmp.path().join("no_such_dir"),
+            &read_pbf_list(&p).unwrap(),
+            &|_, _| *calls.lock().unwrap() += 1,
+        )
+        .unwrap();
+        assert_eq!((set.tiles_found, set.tiles_read, set.buildings.len(), set.zoom), (0, 0, 0, None));
+        assert_eq!(calls.into_inner().unwrap(), 0);
     }
 
     #[test]

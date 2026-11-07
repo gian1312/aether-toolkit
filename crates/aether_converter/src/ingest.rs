@@ -17,8 +17,8 @@ use proj4rs::transform::transform;
 use flatgeobuf::{FeatureProperties, FgbReader, GeometryType};
 use crate::buildings::{
     load_pbf_building_dir, parse_leading_metres, rasterize_buildings, resolve_building_height,
-    Building, BuildingHeight, HeightSource, I16Grid, PbfBuildingSet, RasterOpts, Rounding, TileRef,
-    DEFAULT_HEIGHT_M,
+    Building, BuildingHeight, HeightSource, I16Grid, PbfBuildingSet, PbfSource, RasterOpts, Rounding,
+    TileRef, DEFAULT_HEIGHT_M,
 };
 use fallible_streaming_iterator::FallibleStreamingIterator;
 use crate::tiff_io::{read_full_at, BlockReader, ChunkHeader, DirectChunks};
@@ -141,13 +141,6 @@ impl TileDiag {
     }
 }
 
-/// CPU time and page faults of this process.
-struct ProcUsage {
-    user_s: f64,
-    sys_s: f64,
-    page_faults: u64,
-}
-
 /// The batch's rayon pool size, noted by `main` when it builds the pool;
 /// 0 = no batch ran (single job). The `[Rust] run:` line reports it: at exit
 /// the pool is gone, so a live thread count would always read 1.
@@ -158,77 +151,45 @@ pub fn note_batch_threads(n: usize) {
     BATCH_THREADS.store(n, Ordering::Relaxed);
 }
 
-#[cfg(unix)]
-fn proc_usage() -> ProcUsage {
-    // SAFETY: getrusage fills the zeroed struct it is handed; on failure it
-    // stays zeroed and reads as 0.
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
-    ProcUsage {
-        user_s: secs(ru.ru_utime),
-        sys_s: secs(ru.ru_stime),
-        // Minor + major, the same count Windows' PageFaultCount reports.
-        page_faults: (ru.ru_minflt as u64).saturating_add(ru.ru_majflt as u64),
-    }
-}
-
-#[cfg(windows)]
-fn proc_usage() -> ProcUsage {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    // FILETIME durations are 100 ns units.
-    let secs = |f: FILETIME| ((u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)) as f64 / 1e7;
-    // SAFETY: plain Win32 queries on the current-process pseudo handle (never
-    // closed) into zeroed out-structs sized as the API requires.
-    unsafe {
-        let me = GetCurrentProcess();
-        let (mut created, mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
-            (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
-        let times = GetProcessTimes(me, &mut created, &mut exited, &mut kernel, &mut user) != 0;
-        let mut mem: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-        mem.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        let faults = if GetProcessMemoryInfo(me, &mut mem, mem.cb) != 0 { u64::from(mem.PageFaultCount) } else { 0 };
-        ProcUsage {
-            user_s: if times { secs(user) } else { 0.0 },
-            sys_s: if times { secs(kernel) } else { 0.0 },
-            page_faults: faults,
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn proc_usage() -> ProcUsage {
-    ProcUsage { user_s: 0.0, sys_s: 0.0, page_faults: 0 }
-}
-
-/// The process diagnostic line (stdout; changelog 31/37, not parsed):
-/// `[Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>, blocked ~<s>s`.
+/// The process diagnostic line (stdout; changelog 31/37/50, not parsed):
+/// `[Rust] run: wall <s>s, cpu user <s>s sys <s>s, page faults <n>, threads <n>, blocked ~<s>s, peak rss <mb> MB`.
 /// `page faults` counts minor and major faults (Windows: `PageFaultCount`);
 /// `threads` is the batch's rayon pool size ([`note_batch_threads`]) and is
 /// omitted, with its comma, when no batch ran; `blocked` = wall × threads −
-/// (user + sys), floored at 0 (a single job counts rayon's global pool).
+/// (user + sys), floored at 0 (a single job counts rayon's global pool);
+/// `peak rss` is the process's peak resident memory ([`crate::proc_usage`]),
+/// omitted, with its comma, when the OS did not give it.
 pub fn print_run_stats(wall_s: f64) {
-    let u = proc_usage();
     let batch = BATCH_THREADS.load(Ordering::Relaxed);
+    // A single job's parallel loops run on rayon's global pool.
+    let pool = match batch {
+        0 => compute_threads(),
+        n => n,
+    };
+    println!("{}", run_line(wall_s, &crate::proc_usage::read(), batch, pool));
+    let _ = std::io::stdout().flush();
+}
+
+/// The `[Rust] run:` line of a run of `wall_s` seconds that used `u`:
+/// `batch` = the batch's pool size (0 = no batch ran), `pool` = the threads
+/// the `blocked` estimate counts.
+fn run_line(wall_s: f64, u: &crate::proc_usage::ProcUsage, batch: usize, pool: usize) -> String {
     let threads = match batch {
         0 => String::new(),
         n => format!(", threads {n}"),
     };
     // Thread time not spent on a CPU (changelog 37): what the compute
-    // threads waited for — the file system, a free writer, each other. A
-    // single job's parallel loops run on rayon's global pool.
-    let pool = match batch {
-        0 => compute_threads(),
-        n => n,
-    };
+    // threads waited for — the file system, a free writer, each other.
     let blocked = (wall_s * pool as f64 - (u.user_s + u.sys_s)).max(0.0);
-    println!(
-        "[Rust] run: wall {:.1}s, cpu user {:.1}s sys {:.1}s, page faults {}{}, blocked ~{:.1}s",
-        wall_s, u.user_s, u.sys_s, u.page_faults, threads, blocked
-    );
-    let _ = std::io::stdout().flush();
+    // Last (changelog 50), so every earlier field keeps its place.
+    let peak = match u.peak_rss {
+        Some(bytes) => format!(", peak rss {} MB", crate::proc_usage::mb(bytes)),
+        None => String::new(),
+    };
+    format!(
+        "[Rust] run: wall {:.1}s, cpu user {:.1}s sys {:.1}s, page faults {}{}, blocked ~{:.1}s{}",
+        wall_s, u.user_s, u.sys_s, u.page_faults, threads, blocked, peak
+    )
 }
 
 /// Threads of rayon's global pool (1 without the `native` feature).
@@ -565,19 +526,33 @@ pub struct IngestJob {
     /// ([`process_tile_with_cache`]).
     #[serde(default)]
     pub buildings_pbf_ready: Option<String>,
-    /// How long a batch waits for `buildings_pbf_ready`, in seconds counted
-    /// from its first look at launch (changelog 48). Absent → 1800
+    /// How long a batch waits for `buildings_pbf_ready` (or for the
+    /// `buildings_pbf_list` file, changelog 51), in seconds counted from its
+    /// first look at launch (changelog 48). Absent → 1800
     /// ([`crate::download::BUILDINGS_WAIT_DEFAULT_S`]). Read only together
-    /// with `buildings_pbf_ready`.
+    /// with one of those two.
     #[serde(default)]
     pub buildings_pbf_wait_s: Option<f64>,
     /// The memory, in MB (MiB), a batch may hold in finished tiles while it
-    /// waits for `buildings_pbf_ready` (changelog 48); a tile that does not
-    /// fit waits on its worker thread. Absent → the default rule of
-    /// `buildings_ready::default_hold_bytes`. Read only together with
-    /// `buildings_pbf_ready`.
+    /// waits for `buildings_pbf_ready` (changelog 48) or `buildings_pbf_list`
+    /// (changelog 51); a tile that does not fit waits on its worker thread.
+    /// Absent → the default rule of `buildings_ready::default_hold_bytes`.
+    /// Read only together with one of those two.
     #[serde(default)]
     pub buildings_hold_mb: Option<f64>,
+    /// Absolute path of a UTF-8 text file naming, one per line, the building
+    /// tile files (`{z}_{x}_{y}.pbf`) of `buildings_pbf_dir` this job burns
+    /// (additive, CONTRACT §9a, changelog 51; `aether_converter` 0.2.14):
+    /// only those are read — the directory itself is never listed, so it may
+    /// be a store of far more tiles. The file is also the ready signal, as
+    /// `buildings_pbf_ready`'s marker is: missing at launch, the batch starts
+    /// its terrain and decodes the listed tiles once the file appears
+    /// ([`buildings_ready`]); `buildings_pbf_wait_s` and `buildings_hold_mb`
+    /// apply as to the marker. Requires `buildings_pbf_dir`; excludes
+    /// `buildings_pbf_ready`. Batch only: a single job refuses it
+    /// ([`process_tile_with_cache`]).
+    #[serde(default)]
+    pub buildings_pbf_list: Option<PathBuf>,
 }
 
 impl IngestJob {
@@ -611,6 +586,18 @@ impl IngestJob {
             out.push(SourceSpec { path: base.clone(), crs: Some("EPSG:4326".into()), nodata: None });
         }
         Ok(out)
+    }
+
+    /// Where the job's vector-tile buildings come from, `None` without a
+    /// `buildings_pbf_dir`: the whole directory, or the tiles its
+    /// `buildings_pbf_list` names there (changelog 51). A batch decodes each
+    /// distinct one once.
+    pub fn pbf_source(&self) -> Option<PbfSource> {
+        let dir = self.buildings_pbf_dir.clone()?;
+        Some(match &self.buildings_pbf_list {
+            Some(list) => PbfSource::List { list: list.clone(), dir },
+            None => PbfSource::Dir(dir),
+        })
     }
 }
 
@@ -3032,13 +3019,22 @@ fn band_row_geoms(
 /// anything is read: the hand-over is a batch's (it starts the terrain while
 /// the directory fills), and this form reads `buildings_pbf_dir` first, as
 /// it finds it — honouring the marker by ignoring it would burn a directory
-/// that is still being fetched.
+/// that is still being fetched. So is one carrying `buildings_pbf_list`
+/// (changelog 51): ignoring the list would burn the whole directory — the
+/// caller's store — instead of the listed tiles.
 pub fn process_tile_with_cache(job: IngestJob, cache_arc: ImageCache) -> Result<TileStats> {
     if let Some(name) = &job.buildings_pbf_ready {
         anyhow::bail!(
             "buildings_pbf_ready {name:?} is read by a batch ingest only (a JSON array of jobs): a \
              single job decodes its buildings_pbf_dir before its tile, as it finds it — complete the \
              directory before launching the job, or pass the job as a one-job array"
+        );
+    }
+    if let Some(list) = &job.buildings_pbf_list {
+        anyhow::bail!(
+            "buildings_pbf_list {list:?} is read by a batch ingest only (a JSON array of jobs): a \
+             single job decodes its whole buildings_pbf_dir before its tile, as it finds it, and \
+             would ignore the list — pass the job as a one-job array"
         );
     }
     let pbf_buildings = match &job.buildings_pbf_dir {
@@ -5494,6 +5490,7 @@ mod tests {
             buildings_pbf_ready: None,
             buildings_pbf_wait_s: None,
             buildings_hold_mb: None,
+            buildings_pbf_list: None,
         }
     }
 
@@ -5760,5 +5757,41 @@ mod tests {
         assert_eq!(shadowed_sources(&[r, r], &[None, stack[1]], band), [false, false]);
         // A box that misses the band entirely is deferred.
         assert_eq!(shadowed_sources(&[r], &[Some([9.0, 46.0, 9.5, 47.0])], band), [true]);
+    }
+
+    // ── The `[Rust] run:` line (changelog 31, 37, 50) ──────────────────────
+
+    #[test]
+    fn the_run_line_ends_with_the_peak_rss_and_omits_an_unknown_one() {
+        use crate::proc_usage::ProcUsage;
+        let u = ProcUsage { user_s: 1.3, sys_s: 0.4, page_faults: 1234, peak_rss: Some(4_323_803_136) };
+        assert_eq!(
+            run_line(2.0, &u, 16, 16),
+            "[Rust] run: wall 2.0s, cpu user 1.3s sys 0.4s, page faults 1234, threads 16, blocked ~30.3s, \
+             peak rss 4123.5 MB"
+        );
+        assert_eq!(
+            run_line(2.0, &u, 0, 4),
+            "[Rust] run: wall 2.0s, cpu user 1.3s sys 0.4s, page faults 1234, blocked ~6.3s, peak rss 4123.5 MB"
+        );
+        // Unknown: the field and its comma are omitted, never `peak rss 0`.
+        let unknown = ProcUsage { peak_rss: None, ..u };
+        assert_eq!(
+            run_line(2.0, &unknown, 16, 16),
+            "[Rust] run: wall 2.0s, cpu user 1.3s sys 0.4s, page faults 1234, threads 16, blocked ~30.3s"
+        );
+    }
+
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    #[test]
+    fn the_run_line_of_this_process_carries_a_plausible_peak_rss() {
+        let line = run_line(1.0, &crate::proc_usage::read(), 0, 1);
+        let mb: f64 = line
+            .rsplit_once(", peak rss ")
+            .and_then(|(_, v)| v.strip_suffix(" MB"))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("no `, peak rss <n> MB` at the end of {line:?}"));
+        let ram_mb = crate::proc_usage::total_ram() as f64 / (1u64 << 20) as f64;
+        assert!(mb > 1.0 && mb < ram_mb, "peak rss {mb} MB is not between 1 MB and the RAM ({ram_mb} MB): {line}");
     }
 }
