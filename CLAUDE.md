@@ -67,7 +67,7 @@ dependency that assumes otherwise.
 
 ```sh
 cargo build --release          # binaries → target/release/{aether_converter,aether_export,aether_aggregate}
-cargo test --workspace         # 8 test files under crates/*/tests/ + in-module tests
+cargo test --workspace         # the test files under crates/*/tests/ + in-module tests
 python3 tools/validate_fixtures.py   # golden fixtures must stay valid
 ```
 

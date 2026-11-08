@@ -1614,12 +1614,23 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    links to those 20, `.abt` `cmp`-identical; the list renamed into place
 >    4 s after launch: the wait line, `[Buildings] building tiles ready
 >    after 3.8 s`, the same bytes; an empty list: the empty-directory line,
->    the terrain-only bytes. The owner's machine is not measured. **Gate**
->    on `aether_converter` 0.2.14 (§1.5): an older build ignores the field —
->    it decodes the whole `buildings_pbf_dir` (the store: every file) without
->    waiting for the list, a batch at launch and a download after its
->    terrain; slow, burning the store's every building, and failing on a
->    store of two zooms or with an unreadable file.
+>    the terrain-only bytes. A repair of the z14 source tile under them
+>    (over a terrain-only first pass; a store of the 20 listed tiles, 2,000
+>    undecodable and five z15 files): `[Buildings] repair: 9400 building(s),
+>    1406 repaired px raised`, `[Download] repair: 68172 px rewritten in 1
+>    output tile(s)` — the lines and `cmp`-identical `.abt` of 0.2.13's and
+>    0.2.14's repair over a directory of links to the 20 —; `strace`: no
+>    `getdents64`, 20 `openat` in the store, the listed files; the list
+>    renamed into place 4 s in: the wait, `[Buildings] building tiles ready
+>    after 3.3 s`, the same bytes; a list that never comes: the error, the
+>    files unchanged; the same repair with the store as its directory and no
+>    list fails `buildings_pbf_dir mixes zoom levels (14 and 15)`. The
+>    owner's machine is not measured. **Gate** on `aether_converter` 0.2.14
+>    (§1.5): an older build ignores the field — it decodes the whole
+>    `buildings_pbf_dir` (the store: every file) without waiting for the
+>    list, a batch at launch, a download after its terrain and a repair
+>    before its burn; slow, burning the store's every building, and failing
+>    on a store of two zooms or with an unreadable file.
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -2106,8 +2117,8 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   timeout/reset/429/503 burst or a slow median body and collapsed a
   250 Mbit/s link to a trickle.)
 
-  Additive lines (CLI `download`, changelog 30, 39; informational, match
-  the prefix):
+  Additive lines (CLI `download`, changelog 30, 39; informational, match the
+  prefix):
 
   ```
   [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available at start; fixed for the run)
@@ -2562,7 +2573,7 @@ Known capability gates consumers rely on:
 | `AETHER_DIAG_FILE` also keeps the `[Tile] <name> voids=<n>` lines of `download` (stderr) and batch `ingest` (stdout), which stay on their streams (§1.2, changelog 48; older builds keep them on their streams only) | `aether_converter 0.2.12` |
 | `download` seam filter and its job field `seam_filter` — a Terrarium mosaic seam's samples become voids the parent fill fills (§9b, changelog 49; older builds ignore the field and write the seam into the `.abt` as terrain, e.g. −9,300 m at 10°E) — with the informational `[Stats] Backfill:` line and the per-tile `[Backfill]` lines in `AETHER_DIAG_FILE` (§1.2; older builds print neither) | `aether_converter 0.2.13` |
 | The converter's peak resident memory: `[Stats] Peak RSS: <mb> MB (RAM budget <m> MB)` once per CLI `download` pass (a repair's without the budget), in the `[Stats]` block before the cache lines and kept in `AETHER_DIAG_FILE` with it, and `, peak rss <mb> MB` at the end of `ingest`'s `[Rust] run:` line (§1.2, changelog 50; informational, not parsed — nothing to gate; older builds print neither) | `aether_converter 0.2.13` |
-| `download` and batch `ingest` job field `buildings_pbf_list` — only the building tiles a list file names are read from `buildings_pbf_dir` (the caller's store, never listed), and the list file is their ready signal (§9a, §9b, changelog 51; older builds ignore the field: they decode the whole `buildings_pbf_dir` — the store, every file — without waiting for the list: a batch at launch, a download after its terrain; slow, and a store holding two zooms or an unreadable file fails the run) | `aether_converter 0.2.14` |
+| `download` and batch `ingest` job field `buildings_pbf_list` — only the building tiles a list file names are read from `buildings_pbf_dir` (the caller's store, never listed), and the list file is their ready signal (§9a, §9b, changelog 51; older builds ignore the field: they decode the whole `buildings_pbf_dir` — the store, every file — without waiting for the list: a batch at launch, a download after its terrain, a repair before its burn; slow, and a store holding two zooms or an unreadable file fails the run) | `aether_converter 0.2.14` |
 
 ---
 

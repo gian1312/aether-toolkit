@@ -4,7 +4,7 @@
   "title": "aether_converter ingest job",
   "description": "Job consumed by `aether_converter ingest --job-file <json>`. The file may be a single job object OR a JSON array of job objects (batch). Authoritative source: crates/aether_converter/src/ingest.rs (IngestJob). Contract v2.0: terrain inputs are the `sources` array; `base_tif`/`swiss_tifs` are deprecated aliases.",
   "oneOf": [
-    { "allOf": [ { "$ref": "#/$defs/ingestJob" }, { "properties": { "buildings_pbf_list": { "type": "null", "description": "The single-job form refuses buildings_pbf_list (batch only, changelog 51)." } } } ] },
+    { "allOf": [ { "$ref": "#/$defs/ingestJob" }, { "properties": { "buildings_pbf_ready": { "type": "null", "description": "The single-job form refuses buildings_pbf_ready (batch only, changelog 48)." }, "buildings_pbf_list": { "type": "null", "description": "The single-job form refuses buildings_pbf_list (batch only, changelog 51)." } } } ] },
     { "type": "array", "items": { "$ref": "#/$defs/ingestJob" } }
   ],
   "$defs": {

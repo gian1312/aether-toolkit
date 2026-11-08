@@ -1,3 +1,7 @@
+// The corner asserts index as `row * 32 + col` on purpose, `0 * 32 + 0`
+// included: it spells out which pixel is meant.
+#![allow(clippy::erasing_op, clippy::identity_op)]
+
 use aether_aggregate::reader::InputRaster;
 use std::io::Write;
 use std::path::Path;
