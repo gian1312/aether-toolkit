@@ -108,11 +108,7 @@ fn two_far_corners_of_a_bbox_fetch_only_their_own_tiles_and_write_the_same_bytes
     // diagnostic: stderr here, as AETHER_DIAG_FILE is not set).
     let budget_lines: Vec<&str> = err.lines().filter(|l| l.starts_with("[Download] RAM budget: ")).collect();
     assert_eq!(budget_lines.len(), 1, "{err}");
-    // Changelog 52: the text unchanged, the whole process's breakdown
-    // appended in parentheses.
-    let (head, breakdown) = budget_lines[0].split_once(" GB available at start; fixed for the run) (").unwrap_or_else(|| panic!("{}", budget_lines[0]));
-    assert!(head.contains(" MB, strip rows: "), "{}", budget_lines[0]);
-    assert!(breakdown.starts_with("strips ") && breakdown.ends_with(" MB base)"), "{}", budget_lines[0]);
+    assert!(budget_lines[0].ends_with(" GB available at start; fixed for the run)"), "{}", budget_lines[0]);
     let gate = err.lines().find(|l| l.starts_with("[Download] launch gate closed for "))
         .unwrap_or_else(|| panic!("no launch-gate line; stderr:\n{err}"));
     let secs = gate.strip_prefix("[Download] launch gate closed for ")

@@ -36,21 +36,16 @@ fn version_flag_prints_name_and_semver() {
 /// and `[Rust] run: … peak rss` (changelog 50; informational, no gate of its
 /// own), 0.2.14 the job field `buildings_pbf_list` of `download` and batch
 /// `ingest` (changelog 51: only the listed building tiles are read from
-/// `buildings_pbf_dir`, and the list file is their ready signal), 0.2.15 the
-/// honest memory budgets of changelog 52 (the download's `RAM budget` covers
-/// the whole process and fewer connections run when the share cannot hold
-/// them — `[Download] connections <a> → <b>: …`; ingest counts the decoded
-/// building set — informational lines only, nothing to gate on). Bump the
+/// `buildings_pbf_dir`, and the list file is their ready signal). Bump the
 /// crate version — and the §1.5 table — with the next capability.
 #[test]
 fn version_covers_the_documented_capability_gates() {
     let v: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|p| p.parse().unwrap()).collect();
     assert_eq!(
         v,
-        [0, 2, 15],
-        "CONTRACT §1.5 notes the honest memory budgets (changelog 52) on \
-         aether_converter 0.2.15, gates `buildings_pbf_list` (download and batch ingest) on \
-         0.2.14 (changelog 51), the download seam filter (`seam_filter`) on \
+        [0, 2, 14],
+        "CONTRACT §1.5 gates `buildings_pbf_list` (download and batch ingest) on \
+         aether_converter 0.2.14 (changelog 51), the download seam filter (`seam_filter`) on \
          0.2.13 (changelog 49; the peak-RSS lines of changelog 50 came with it), \
          ingest `buildings_pbf_ready` on 0.2.12 \
          (changelog 48), the `[Tile] … voids=` lines on 0.2.11 (changelog 46), \

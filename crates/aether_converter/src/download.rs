@@ -53,11 +53,6 @@ mod seam;
 #[cfg(feature = "native")]
 use seam::SEAM_VOID_M;
 
-// The CLI `download`'s memory model (changelog 52): what a pass holds
-// besides its strips' tiles, so the RAM budget is what the process peaks at.
-#[cfg(feature = "native")]
-mod memory;
-
 #[derive(Deserialize, Debug, Clone)]
 pub struct DownloadJob {
     pub url_template: String,
@@ -772,9 +767,7 @@ struct AncestorCache {
     /// The run's decoder: an ancestor gets the seam filter like every tile
     /// of the run (changelog 49).
     decoder: TileDecoder,
-    /// Decoded bytes kept at most: [`ANCESTOR_CACHE_BUDGET`], lowered to a
-    /// quarter of the strips' budget once the run has one (changelog 52).
-    budget: AtomicUsize,
+    budget: usize,
     state: std::sync::Mutex<AncestorState>,
     /// The run's raw source-tile cache (changelog 38): an ancestor it holds
     /// is not requested, and one that is fetched is written into it.
@@ -814,22 +807,10 @@ impl AncestorCache {
             client,
             url_template: url_template.to_owned(),
             decoder,
-            budget: AtomicUsize::new(budget),
+            budget,
             state: std::sync::Mutex::new(AncestorState::default()),
             tile_cache,
         })
-    }
-
-    /// Keep at most *budget* decoded bytes from now on (changelog 52); the
-    /// oldest entries over it go with the next admission.
-    fn limit(&self, budget: usize) {
-        self.budget.fetch_min(budget, Ordering::Relaxed);
-    }
-
-    /// Decoded bytes the cache holds now: the launch gate counts them with
-    /// the strips' (changelog 52).
-    fn bytes(&self) -> usize {
-        self.state.lock().map(|s| s.bytes).unwrap_or(0)
     }
 
     /// One ancestor tile, decoded: from the raw source-tile cache when it
@@ -906,8 +887,7 @@ impl AncestorCache {
         let Ok(mut st) = self.state.lock() else { return };
         st.bytes += bytes;
         st.order.push_back((key, bytes));
-        let budget = self.budget.load(Ordering::Relaxed);
-        while st.bytes > budget && st.order.len() > 1 {
+        while st.bytes > self.budget && st.order.len() > 1 {
             let Some((old, b)) = st.order.pop_front() else { break };
             st.entries.remove(&old);
             st.bytes -= b;
@@ -2243,13 +2223,10 @@ fn throttle_step(window: usize, floor: usize, max: usize, throttled: usize) -> u
 /// and hands it back before the parent fill.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))] // the browser path has its own fetch pool
 struct ConnGate {
-    /// `max` permits as created, never resized: the FIFO queue of waiting
-    /// tiles (a [`Self::limit`] lowers `max` and the window, not these).
+    /// `max` permits, never resized: the FIFO queue of waiting tiles.
     sem: Semaphore,
-    /// The most requests at once: `max_connections`, or fewer for a pass
-    /// whose memory share cannot hold them (changelog 52).
-    max: AtomicUsize,
-    floor: AtomicUsize,
+    max: usize,
+    floor: usize,
     window: AtomicUsize,
     /// Slots admitted and not yet handed back.
     active: AtomicUsize,
@@ -2284,8 +2261,8 @@ impl ConnGate {
         let max = max.max(1);
         Self {
             sem: Semaphore::new(max),
-            max: AtomicUsize::new(max),
-            floor: AtomicUsize::new(throttle_floor(max)),
+            max,
+            floor: throttle_floor(max),
             window: AtomicUsize::new(max),
             active: AtomicUsize::new(0),
             admit: tokio::sync::Notify::new(),
@@ -2298,19 +2275,6 @@ impl ConnGate {
     }
 
     fn window(&self) -> usize { self.window.load(Ordering::Relaxed) }
-
-    /// Run at most *max* requests at once from now on (changelog 52: a pass
-    /// whose memory share cannot hold its connections), before the strips
-    /// start: the window, its ceiling and its floor follow, as if the gate
-    /// had been made with *max*; requests in flight keep their slots. The
-    /// adaptive window works as before, between the new floor and *max*.
-    fn limit(&self, max: usize) {
-        let max = max.max(1);
-        self.max.store(max, Ordering::Release);
-        self.floor.store(throttle_floor(max), Ordering::Release);
-        self.window.fetch_min(max, Ordering::AcqRel);
-        self.min_seen.fetch_min(max, Ordering::Relaxed);
-    }
 
     /// Slots currently admitted.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2363,12 +2327,7 @@ impl ConnGate {
     fn tick(&self) {
         let throttled = self.throttled.swap(0, Ordering::Relaxed);
         let old = self.window();
-        let new = throttle_step(
-            old,
-            self.floor.load(Ordering::Acquire),
-            self.max.load(Ordering::Acquire),
-            throttled,
-        );
+        let new = throttle_step(old, self.floor, self.max, throttled);
         if new == old {
             return;
         }
@@ -2388,8 +2347,8 @@ impl ConnGate {
     fn summary_line(&self) -> String {
         format!(
             "[Stats] Connection window: start {}, min {}, final {} (adaptive {}..={}, {} back-off(s))",
-            self.max.load(Ordering::Relaxed), self.min_seen.load(Ordering::Relaxed), self.window(),
-            self.floor.load(Ordering::Relaxed), self.max.load(Ordering::Relaxed), self.cuts.load(Ordering::Relaxed)
+            self.max, self.min_seen.load(Ordering::Relaxed), self.window(),
+            self.floor, self.max, self.cuts.load(Ordering::Relaxed)
         )
     }
 }
@@ -3674,27 +3633,12 @@ fn tiles_to_fetch(
 
 /// The download's RAM budget from the RAM available at the start of the run
 /// (changelog 30; read once and fixed for the run since changelog 39): a
-/// quarter of it, at most 2 GiB, at least 256 MiB. Since changelog 52 it is
-/// the share of the whole process — [`memory::plan`] pays the assembly,
-/// connections, cache writes, decoding, the allocator and the base from it
-/// and gives the strips the rest — no longer the strips' alone.
+/// quarter of it, at most 2 GiB, at least 256 MiB.
 #[cfg(feature = "native")]
 fn download_ram_budget(available: u64) -> usize {
     const CAP: u64 = 2 << 30;
     const FLOOR: u64 = 256 << 20;
     (available / 4).min(CAP).max(FLOOR) as usize
-}
-
-/// Whether a strip of *bytes* may launch (changelog 39, 52): when no strip
-/// holds anything — whatever its size, so a run never stalls — or when its
-/// bytes fit the strips' *budget* beside what launched strips still hold
-/// (*held*) and the parent fill's decoded tiles (*ancestors*), which share
-/// that budget since changelog 52: a run whose tiles have voids launches its
-/// next strip later. The cache's tiles leave only as others come in, so they
-/// alone never stop a strip.
-#[cfg(feature = "native")]
-fn strip_fits(held: usize, ancestors: usize, bytes: usize, budget: usize) -> bool {
-    held == 0 || held + ancestors + bytes <= budget
 }
 
 /// Tile-rows per strip: as many as let two strips of `nx` tiles of `edge`²
@@ -4226,11 +4170,6 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
             cache: c.clone(), index: Arc::new(index.hits), derivable: Arc::new(index.derivable), read: true,
         }
     });
-    // What the cache serves without a connection — its entries (bodies and
-    // 404s) and the tiles it derives — and so what the network does: the
-    // memory model's connections and cache writes (changelog 52).
-    let (cached, derivable) = cache_use.as_ref().map_or((0, 0), |c| (c.index.len(), c.derivable.len()));
-    let fetched = total.saturating_sub(cached + derivable);
 
     // 3. Single HTTP client — reqwest handles connection pooling internally.
     //    10 s connect timeout, 15 s read-idle timeout, no total timeout: see
@@ -4299,9 +4238,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     //    `tiles × edge² × 4 B` — proportional to the area's WIDTH: at 32
     //    tile-rows × full width a wide z15 pass held several GB per strip,
     //    three strips at once. The budget (`download_ram_budget`:
-    //    min(available / 4, 2 GiB), at least 256 MiB — since changelog 52 the
-    //    whole process's share, of which the strips get what `memory::plan`
-    //    leaves them) is read ONCE, after the
+    //    min(available / 4, 2 GiB), at least 256 MiB) is read ONCE, after the
     //    edge probe (5a), and fixed for the run (changelog 39): re-read before
     //    every launch, it sank with the RAM the run's own unflushed output
     //    writes took from "available" — on Windows strips shrank to one
@@ -4403,84 +4340,17 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     };
 
     // The RAM budget: read here, once, and fixed for the run (changelog 39;
-    // see 5.). Only the tile edge can still change the strip rows. Since
-    // changelog 52 it is the whole process's: the share — min(available / 4,
-    // 2 GiB), at least 256 MiB, as before — pays the assembly, connections,
-    // cache writes, decoding, the allocator's share and the base first
-    // (`memory::PassMemory`), the strips get the rest, and a share that
-    // cannot hold the strips' floor beside the connections runs fewer
-    // connections. A test may impose the available memory
-    // (`AETHER_TEST_AVAILABLE_MB`).
-    let avail0 = crate::proc_usage::test_available_override().unwrap_or_else(|| {
+    // see 5.). Only the tile edge can still change the strip rows.
+    let avail0 = {
         let mut sys = System::new();
         sys.refresh_memory();
         sys.available_memory()
-    });
-    let share = download_ram_budget(avail0) as u64;
-    let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as u64;
-    let out_rows = memory::output_rows_bytes(&job.tiles, zoom, y0, y1);
-    let pass_memory = |edge: usize, asm: u64| {
-        let tile = (edge * edge * 4) as u64;
-        memory::PassMemory {
-            tile,
-            grid: nx as u64 * tile,
-            rows: out_rows,
-            asm,
-            per_conn: memory::CONN_BYTES + (edge * edge * 2) as u64,
-            fetched: fetched as u64,
-            cache: if fetch.cache.is_some() && fetched + derivable > 0 { memory::CACHE_WRITE_BYTES } else { 0 },
-            // Each runtime worker decodes a tile at a time: the PNG's pixels
-            // and the parent fill's index; deriving one from finer cached
-            // tiles holds their samples too.
-            decode: cpus * tile * if derivable > 0 { 16 } else { 4 },
-            job: total as u64 * tile,
-            alloc_pct: memory::alloc_pct(fetch.cache.is_some()),
-        }
     };
-    let plan_for = |asm: u64| {
-        let m = pass_memory(edge_now(), asm);
-        let p = match tuning.ram_budget {
-            Some(strips) => memory::plan_fixed(strips as u64, conns, &m),
-            None => memory::plan(share, conns, &m),
-        };
-        (m, p)
-    };
-    // Two assemblies at once — one, when the strips' budget makes the whole
-    // job one strip.
-    let (mut mem, mut plan) = plan_for(MAX_CONCURRENT_ASM as u64);
-    let job_rows = (ny as u32).div_ceil(strip_rows_for(plan.strips as usize, nx, edge_now(), tuning.max_strip_rows));
-    if job_rows <= 1 {
-        (mem, plan) = plan_for(1);
-    }
-    if plan.conns < conns {
-        gate.limit(plan.conns);
-        eprintln!("{}", memory::shrink_line(conns, share, &mem, &plan));
-    }
-    // The buildings post-pass runs after the terrain: the budget is the
-    // larger phase. Its set is estimated from its tiles on disk when they
-    // are there now — not when its marker or list is still to come.
-    let post = match job.pbf_source() {
-        None => memory::PostPass::None,
-        Some(source) => {
-            let there = marker.as_ref().is_none_or(|(signal, _)| buildings_marker_present(signal.path()));
-            match there.then(|| crate::buildings::pbf_source_disk_bytes(&source)).flatten() {
-                Some((_, bytes)) => memory::PostPass::Counted {
-                    set: bytes.saturating_mul(crate::buildings::DECODED_PER_DISK_BYTE),
-                    tile: job.tiles.iter().map(|t| estimate_abt_bytes(std::slice::from_ref(t))).max().unwrap_or(0),
-                },
-                None => memory::PostPass::Later,
-            }
-        }
-    };
-    let plan = memory::with_post_pass(plan, &mem, post);
-    // The strips' budget, which the launch gate below holds the strips (and
-    // the parent fill's tiles) to; the parent fill keeps at most a quarter.
-    let budget = plan.strips as usize;
-    fetch.ancestors.limit(ANCESTOR_CACHE_BUDGET.min(budget / 4));
+    let budget = tuning.ram_budget.unwrap_or_else(|| download_ram_budget(avail0));
     let rows0 = strip_rows_for(budget, nx, edge_now(), tuning.max_strip_rows);
     eprintln!("[Download] RAM budget: {} MB, strip rows: {} ({:.1} GB available at start; \
-               fixed for the run) {}",
-        plan.total >> 20, rows0, avail0 as f64 / 1e9, memory::breakdown(&mem, &plan, post));
+               fixed for the run)",
+        budget >> 20, rows0, avail0 as f64 / 1e9);
     eprintln!("[Download] {} strips, {} tile-rows/strip, assembly {}/{} threads (max {} concurrent)",
         (ny as u32).div_ceil(rows0), rows0, asm_threads, num_cpus, MAX_CONCURRENT_ASM);
 
@@ -4535,7 +4405,8 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
                 edge_known = true;
                 eprintln!("[Download] source tiles are {known} px: prefetch depth {depth}");
             }
-            let fits = strip_fits(held.load(Ordering::Acquire), fetch.ancestors.bytes(), bytes, budget);
+            let outstanding = held.load(Ordering::Acquire);
+            let fits = outstanding == 0 || outstanding + bytes <= budget;
             let hungry = pipeline.is_empty()
                 || (pipeline.len() < depth && unstarted.load(Ordering::Relaxed) < gate.window());
             if !(fits && hungry) {
@@ -4547,7 +4418,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
             if rows != shown_rows {
                 shown_rows = rows;
                 eprintln!("[Download] RAM budget: {} MB, strip rows: {} (re-sized for {} px source tiles)",
-                    plan.total >> 20, rows, edge);
+                    budget >> 20, rows, edge);
             }
             let mut coords: Vec<(u32, u32)> = (sy0..=sy1)
                 .flat_map(|ty| row_tiles[(ty - y0) as usize].iter().map(move |&tx| (tx, ty)))
@@ -4849,7 +4720,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
         if let Ok(mut l) = stats.cache_lines.lock() { *l = lines; }
     }
     if fetch_failure_is_fatal(failed, attempted) {
-        stats.log_cli_summary(start.elapsed().as_secs_f64(), Some(plan.total as usize));
+        stats.log_cli_summary(start.elapsed().as_secs_f64(), Some(budget));
         let no_data = stats.no_data_count();
         let degraded = stats.degraded_count();
         anyhow::bail!(
@@ -4906,7 +4777,7 @@ async fn run_download_async(job: DownloadJob, tuning: DownloadTuning, hold_outpu
     // The wait for the building tiles is not download time: `[Stats]
     // Downloaded: … in <s>` leaves it out, `TOTAL` keeps it (0 without a
     // marker, so such a run prints exactly what it did before).
-    stats.log_cli_summary(elapsed - waited.as_secs_f64(), Some(plan.total as usize));
+    stats.log_cli_summary(elapsed - waited.as_secs_f64(), Some(budget));
     eprintln!("[Download] TOTAL: {:.1}s", elapsed);
     cleanup.keep();
     Ok(DownloadReport {
@@ -6733,7 +6604,7 @@ mod tests {
         let ms = std::time::Duration::from_millis;
         rt().block_on(async {
             let gate = ConnGate::new(64);
-            assert_eq!(gate.floor.load(Ordering::Relaxed), 16);
+            assert_eq!(gate.floor, 16);
             // 40 requests in flight when a 503 burst cuts the window to 48.
             let mut held = Vec::new();
             for _ in 0..40 { held.push(gate.acquire().await); }
@@ -6772,36 +6643,6 @@ mod tests {
             held.push(tokio::time::timeout(ms(500), &mut waiter).await.expect("growth admits"));
             assert_eq!(gate.active(), 37);
         });
-    }
-
-    #[test]
-    fn a_gate_limited_for_memory_admits_its_new_ceiling_and_still_adapts_below_it() {
-        // Changelog 52: a pass whose share cannot hold 256 connections runs
-        // 100 — the window, its ceiling and its floor as for a gate of 100.
-        let ms = std::time::Duration::from_millis;
-        rt().block_on(async {
-            let gate = ConnGate::new(256);
-            gate.limit(100);
-            assert_eq!(gate.window(), 100);
-            let mut held = Vec::new();
-            for _ in 0..100 { held.push(gate.acquire().await); }
-            assert!(tokio::time::timeout(ms(100), gate.acquire()).await.is_err(), "the 101st must wait");
-            held.pop();
-            assert!(tokio::time::timeout(ms(1000), gate.acquire()).await.is_ok(), "a slot came back");
-        });
-        let gate = ConnGate::new(256);
-        gate.limit(100);
-        // 503 bursts cut by 25 % a second, never below max(100 / 4, 16) = 25 …
-        for _ in 0..10 {
-            for _ in 0..3 { gate.observe(Some(FetchFailure::Http(503)), None); }
-            gate.tick();
-        }
-        assert_eq!(gate.window(), 25);
-        // … and clean seconds grow it back to the new ceiling, not to 256.
-        for _ in 0..40 { gate.tick(); }
-        assert_eq!(gate.window(), 100);
-        assert_eq!(gate.summary_line(), "[Stats] Connection window: start 100, min 25, final 100 \
-                                         (adaptive 25..=100, 5 back-off(s))");
     }
 
     #[test]
@@ -7088,43 +6929,6 @@ mod tests {
             assert!(cache.get(12, 1, 1).await.is_some(), "evicted, fetched again");
             assert_eq!(served.load(Ordering::SeqCst), 5);
         });
-    }
-
-    #[test]
-    fn a_limited_ancestor_cache_keeps_less_and_reports_what_it_holds() {
-        // Changelog 52: a run lowers the cache to a quarter of its strips'
-        // budget, and its launch gate counts the cache's bytes.
-        let (port, served) = counting_tile_server(0);
-        let tpl = format!("http://127.0.0.1:{port}/{{z}}/{{x}}/{{y}}.png");
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        let cache = AncestorCache::new(reqwest::Client::new(), &tpl, dec_terrarium);
-        let grid = 256 * 256 * 4;
-        rt.block_on(async {
-            for (x, y) in [(1, 1), (2, 2), (3, 3)] {
-                assert!(cache.get(12, x, y).await.is_some());
-            }
-            assert_eq!(cache.bytes(), 3 * grid);
-            // A limit only ever lowers the budget.
-            cache.limit(usize::MAX);
-            cache.limit(2 * grid);
-            cache.limit(usize::MAX);
-            // The next admission drops the oldest entries over it.
-            assert!(cache.get(12, 4, 4).await.is_some());
-            assert_eq!(cache.bytes(), 2 * grid);
-            assert_eq!(served.load(Ordering::SeqCst), 4);
-            assert!(cache.get(12, 1, 1).await.is_some(), "evicted, fetched again");
-            assert_eq!(served.load(Ordering::SeqCst), 5);
-            assert_eq!(cache.bytes(), 2 * grid);
-        });
-    }
-
-    #[test]
-    fn a_strip_waits_for_the_parent_fills_tiles_but_never_when_no_strip_holds_anything() {
-        assert!(strip_fits(0, 0, 100, 10), "nothing held: even an oversize strip launches");
-        assert!(strip_fits(0, 50, 100, 10), "the cache's tiles alone never stop a strip");
-        assert!(strip_fits(40, 0, 60, 100));
-        assert!(!strip_fits(40, 1, 60, 100), "the parent fill's tiles count");
-        assert!(!strip_fits(41, 0, 60, 100));
     }
 
     #[test]
