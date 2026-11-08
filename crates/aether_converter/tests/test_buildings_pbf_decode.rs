@@ -217,14 +217,17 @@ fn a_batch_decodes_its_building_tiles_with_progress_and_burns_the_decoded_set() 
     .expect("tile lines");
     assert!(start < progress[0].0 && progress[2].0 < done && done < first_tile, "{stdout}");
 
-    // `<M> tile(s), <B> building(s) in <S.S> s`: every tile file, the
-    // undecodable one included; every building decoded, before the
-    // duplicate filter.
+    // `<M> tile(s), <B> building(s) in <S.S> s, <MB> MB`: every tile file,
+    // the undecodable one included; every building decoded, before the
+    // duplicate filter; and (changelog 52) the decoded set's memory, MB
+    // with one decimal.
     let summary = lines[done];
     let head = format!("[Rust] Building tiles decoded: {TILES} tile(s), {buildings} building(s) in ");
-    let secs = summary.strip_prefix(&head).and_then(|r| r.strip_suffix(" s"));
-    let secs = secs.unwrap_or_else(|| panic!("{summary:?} is not {head:?}<S.S> s"));
-    assert!(secs.parse::<f64>().is_ok() && secs.split('.').nth(1).map(str::len) == Some(1), "{summary:?}");
+    let rest = summary.strip_prefix(&head).and_then(|r| r.strip_suffix(" MB")).and_then(|r| r.split_once(" s, "));
+    let (secs, mb) = rest.unwrap_or_else(|| panic!("{summary:?} is not {head:?}<S.S> s, <MB> MB"));
+    let one_decimal = |v: &str| v.parse::<f64>().is_ok() && v.split('.').nth(1).map(str::len) == Some(1);
+    assert!(one_decimal(secs), "{summary:?}");
+    assert!(one_decimal(mb) && mb.parse::<f64>().unwrap() > 0.0, "{summary:?}");
 
     // The undecodable tile: skipped with its warning, once, on stderr.
     let warns: Vec<&str> = stderr.lines().filter(|l| l.starts_with("[Warn] buildings ")).collect();

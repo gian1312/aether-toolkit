@@ -112,6 +112,27 @@ pub fn mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1u64 << 20) as f64)
 }
 
+/// The environment variable through which a **test** makes the converter
+/// believe the machine has this many MB (2^20 bytes) of available memory
+/// (changelog 52): the CLI `download`'s RAM budget and the batch `ingest`'s
+/// pool sizing read it in place of the OS's figure, so a test can run a
+/// memory-short pass on any machine. No consumer sets it; it is not part of
+/// the contract a consumer may rely on.
+pub const TEST_AVAILABLE_MB_VAR: &str = "AETHER_TEST_AVAILABLE_MB";
+
+/// The available memory a test imposes through [`TEST_AVAILABLE_MB_VAR`], in
+/// bytes; `None` when the variable is unset, or not a whole number of MB
+/// (the OS's figure is used then).
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+pub fn test_available_override() -> Option<u64> {
+    parse_available_mb(&std::env::var(TEST_AVAILABLE_MB_VAR).ok()?)
+}
+
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+fn parse_available_mb(v: &str) -> Option<u64> {
+    v.trim().parse::<u64>().ok()?.checked_mul(1 << 20)
+}
+
 /// The machine's RAM in bytes: the ceiling a plausible peak stays under
 /// (the unit tests here, in `ingest.rs` and in `download.rs`).
 #[cfg(all(test, feature = "native"))]
@@ -130,6 +151,16 @@ mod tests {
         assert_eq!(mb(4_323_803_136), "4123.5");
         assert_eq!(mb(2048 << 20), "2048.0");
         assert_eq!(mb(1 << 20), "1.0");
+    }
+
+    #[test]
+    fn the_test_override_of_available_memory_is_whole_megabytes_or_nothing() {
+        assert_eq!(parse_available_mb("1500"), Some(1500 << 20));
+        assert_eq!(parse_available_mb(" 64\n"), Some(64 << 20));
+        assert_eq!(parse_available_mb("0"), Some(0));
+        for not_mb in ["", "1.5", "-3", "2 GB", "lots"] {
+            assert_eq!(parse_available_mb(not_mb), None, "{not_mb:?}");
+        }
     }
 
     #[cfg(all(feature = "native", any(unix, windows)))]

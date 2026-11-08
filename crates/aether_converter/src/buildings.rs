@@ -838,6 +838,102 @@ impl PbfBuildingSet {
     pub fn duplicates_dropped(&self) -> usize {
         self.decoded - self.buildings.len()
     }
+
+    /// The memory the set holds while a run keeps it (CONTRACT changelog 52):
+    /// the building array — its capacity, which the duplicate filter does not
+    /// shrink — and every ring's vertices, each heap block as an allocator
+    /// hands it out ([`heap_block`]). The `, <mb> MB` of the `[Rust] Building
+    /// tiles decoded:` line.
+    pub fn heap_bytes(&self) -> u64 {
+        let ring = |cap: usize| heap_block(cap * std::mem::size_of::<(f64, f64)>());
+        let rings: u64 = self
+            .buildings
+            .iter()
+            .map(|b| {
+                ring(b.coords.capacity())
+                    + heap_block(b.holes.capacity() * std::mem::size_of::<Vec<(f64, f64)>>())
+                    + b.holes.iter().map(|h| ring(h.capacity())).sum::<u64>()
+            })
+            .sum();
+        heap_block(self.buildings.capacity() * std::mem::size_of::<Building>()) + rings
+    }
+}
+
+/// The bytes a heap block of *n* requested bytes occupies (changelog 52):
+/// nothing for an empty `Vec`, which allocates nothing; else glibc's chunk —
+/// the request plus its 8-byte size word, rounded up to 16, at least 32
+/// bytes. mimalloc's size classes come to the same within a few percent.
+pub fn heap_block(n: usize) -> u64 {
+    if n == 0 {
+        0
+    } else {
+        ((n as u64 + 8 + 15) & !15).max(32)
+    }
+}
+
+/// Decoded-set bytes per byte of building tiles on disk (changelog 52): what
+/// a batch `ingest` expects a building source to hold once decoded, before
+/// it decodes it. [`PbfBuildingSet::heap_bytes`] over the files' bytes,
+/// measured (`decoded_set_bytes_per_disk_byte` below) on OpenFreeMap z14
+/// tiles gzipped as the Waveshed plugin stores them: 2.58 over central
+/// Zürich (256 tiles, 190,014 buildings), 2.92 over Bern and its
+/// surroundings (576, 222,933), 0.41 over the Lower Engadin (256, 4,059 —
+/// mostly roads and land cover); the same tiles uncompressed 1.70, 2.05 and
+/// 0.31, the fixture tile (Zernez, uncompressed) 1.41. Taken at the densest
+/// figure, rounded up: the estimate must not fall short where buildings are
+/// dense; elsewhere it is high, and the decode's own figure follows.
+pub const DECODED_PER_DISK_BYTE: u64 = 3;
+
+/// The building tile files *source* would decode, as they are on disk now:
+/// `(files, bytes)` — a directory's `{z}_{x}_{y}.pbf`/`.mvt` files, or the
+/// files a `buildings_pbf_list` names in its directory (never listed; a
+/// listed name that is not there counts nothing — the decode reports it).
+/// `None` when the directory or the list is not there (or not readable):
+/// nothing to estimate yet. Only metadata is read, never a tile.
+pub fn pbf_source_disk_bytes(source: &PbfSource) -> Option<(usize, u64)> {
+    match source {
+        PbfSource::Dir(dir) => {
+            let mut files = 0usize;
+            let mut bytes = 0u64;
+            for entry in fs::read_dir(dir).ok()?.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if crate::ingest::parse_pbf_tile_name(name).is_none() {
+                    continue;
+                }
+                // On Windows the listing carries the size: no extra call.
+                if let Ok(m) = entry.metadata() {
+                    if m.is_file() {
+                        files += 1;
+                        bytes += m.len();
+                    }
+                }
+            }
+            Some((files, bytes))
+        }
+        PbfSource::List { list, dir } => {
+            let list = read_pbf_list(list).ok()?;
+            let names = list.names();
+            // One metadata call per listed file, on a few threads: the
+            // owner's lists name ~21,000 files.
+            let threads = names.len().div_ceil(2048).clamp(1, 8);
+            let chunk = names.len().div_ceil(threads).max(1);
+            let sizes: Vec<(usize, u64)> = std::thread::scope(|s| {
+                let parts: Vec<_> = names
+                    .chunks(chunk)
+                    .map(|part| {
+                        s.spawn(move || {
+                            part.iter()
+                                .filter_map(|n| fs::metadata(dir.join(n)).ok().filter(|m| m.is_file()))
+                                .fold((0usize, 0u64), |(f, b), m| (f + 1, b + m.len()))
+                        })
+                    })
+                    .collect();
+                parts.into_iter().map(|h| h.join().unwrap_or((0, 0))).collect()
+            });
+            Some(sizes.into_iter().fold((0, 0), |(f, b), (pf, pb)| (f + pf, b + pb)))
+        }
+    }
 }
 
 /// Where a job's vector-tile buildings come from: every tile file of its
@@ -2910,5 +3006,136 @@ pub(crate) mod tests {
         }
         let off = 44 + 2 * stride + 3 * 2;
         assert_eq!(i16::from_le_bytes([bytes[off], bytes[off + 1]]), 1234);
+    }
+
+    // ── The decoded set's memory (changelog 52) ────────────────────────────
+
+    #[test]
+    fn a_heap_block_is_glibcs_chunk_and_an_empty_vec_none() {
+        assert_eq!(heap_block(0), 0);
+        assert_eq!(heap_block(1), 32, "the smallest chunk");
+        assert_eq!(heap_block(24), 32);
+        assert_eq!(heap_block(25), 48, "the size word and 16-byte rounding");
+        assert_eq!(heap_block(80), 96);
+        assert_eq!(heap_block(1 << 20), (1 << 20) + 16);
+    }
+
+    #[test]
+    fn the_sets_heap_bytes_are_its_array_and_every_ring_as_allocated() {
+        let b = |exterior: usize, holes: &[usize]| Building {
+            coords: vec![(8.0, 47.0); exterior],
+            holes: holes.iter().map(|&n| vec![(8.0, 47.0); n]).collect(),
+            height: BuildingHeight::AboveGround(9.0),
+            source: HeightSource::ExplicitHeight,
+        };
+        let mut buildings = Vec::with_capacity(10);
+        buildings.extend([b(5, &[]), b(4, &[4, 6])]);
+        let set = PbfBuildingSet { buildings, decoded: 2, ..Default::default() };
+        let size = std::mem::size_of::<Building>();
+        // The array's capacity (10, not 2), 5 and 4 vertices, the hole list
+        // (2 × 24 bytes) and its two rings; the first building has no holes,
+        // so no hole list.
+        let want = heap_block(10 * size)
+            + heap_block(5 * 16)
+            + heap_block(4 * 16)
+            + heap_block(2 * 24)
+            + heap_block(4 * 16)
+            + heap_block(6 * 16);
+        assert_eq!(set.heap_bytes(), want);
+        assert_eq!(PbfBuildingSet::default().heap_bytes(), 0);
+        // A decoded directory: the duplicate filter keeps the array's
+        // capacity, which still counts.
+        let dir = many_tile_dir(40, &[]);
+        let set = load_pbf_building_dir(dir.path()).unwrap();
+        assert!(set.duplicates_dropped() > 0);
+        assert!(set.buildings.capacity() >= set.decoded);
+        assert!(set.heap_bytes() >= (set.decoded * size) as u64);
+    }
+
+    #[test]
+    fn the_disk_estimate_counts_the_tile_files_a_source_decodes_and_nothing_else() {
+        let dir = many_tile_dir(30, &[]);
+        // Every `{z}_{x}_{y}` file, by size; README.txt is no tile.
+        let want: u64 = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| crate::ingest::parse_pbf_tile_name(&e.file_name().to_string_lossy()).is_some())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(want > 0);
+        let whole = PbfSource::Dir(dir.path().to_path_buf());
+        assert_eq!(pbf_source_disk_bytes(&whole), Some((30, want)));
+        // A list: only the names it lists, a missing one counting nothing.
+        let names: Vec<String> = (0..3)
+            .map(|i| {
+                let (x, y) = many_tile_xy(i);
+                format!("14_{x}_{y}.pbf")
+            })
+            .collect();
+        let tmp = tempfile::tempdir().unwrap();
+        let list = tmp.path().join("l.txt");
+        std::fs::write(&list, format!("{}\n{}\n14_1_1.pbf\n{}\n", names[0], names[1], names[0])).unwrap();
+        let listed: u64 = names[..2].iter().map(|n| std::fs::metadata(dir.path().join(n)).unwrap().len()).sum();
+        let source = PbfSource::List { list: list.clone(), dir: dir.path().to_path_buf() };
+        assert_eq!(pbf_source_disk_bytes(&source), Some((2, listed)));
+        // On unix a FIFO named like a listed tile is never opened (a stat
+        // does not open it) and counts nothing.
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("14_1_1.pbf");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            assert_eq!(pbf_source_disk_bytes(&source), Some((2, listed)));
+            assert_eq!(pbf_source_disk_bytes(&whole), Some((30, want)), "nor in a directory");
+        }
+        // Not there: nothing to estimate.
+        assert_eq!(pbf_source_disk_bytes(&PbfSource::Dir(tmp.path().join("none"))), None);
+        let missing = PbfSource::List { list: tmp.path().join("none.txt"), dir: dir.path().to_path_buf() };
+        assert_eq!(pbf_source_disk_bytes(&missing), None);
+    }
+
+    /// The factor [`DECODED_PER_DISK_BYTE`] stands for, measured: for each
+    /// directory, the tile files' bytes, [`PbfBuildingSet::heap_bytes`] and
+    /// what glibc says the decode left allocated (`mallinfo2`). Run alone:
+    /// `AETHER_PBF_FACTOR_DIRS=<dir>[:<dir>…] cargo test --release -p
+    /// aether_converter --lib decoded_set_bytes_per_disk_byte -- --ignored
+    /// --nocapture --test-threads=1` (the fixture tile is always measured).
+    #[cfg(all(feature = "native", target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "measurement: AETHER_PBF_FACTOR_DIRS=<dir>[:<dir>…] cargo test --release -p aether_converter --lib decoded_set_bytes_per_disk_byte -- --ignored --nocapture --test-threads=1"]
+    fn decoded_set_bytes_per_disk_byte() {
+        let in_use = || {
+            // SAFETY: a plain glibc query.
+            let m = unsafe { libc::mallinfo2() };
+            (m.uordblks + m.hblkhd) as i64
+        };
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/ofm_z14_8651_5782.pbf"),
+            fixture.path().join("14_8651_5782.pbf"),
+        )
+        .unwrap();
+        let mut dirs = vec![fixture.path().to_path_buf()];
+        if let Some(v) = std::env::var_os("AETHER_PBF_FACTOR_DIRS") {
+            dirs.extend(std::env::split_paths(&v));
+        }
+        // Rayon's global pool and the decoder's first allocations, once.
+        drop(load_pbf_building_dir(fixture.path()).unwrap());
+        for dir in dirs {
+            let (files, disk) = pbf_source_disk_bytes(&PbfSource::Dir(dir.clone())).unwrap();
+            let before = in_use();
+            let set = load_pbf_building_dir(&dir).unwrap();
+            let held = in_use() - before;
+            let heap = set.heap_bytes();
+            println!(
+                "{}: {files} files, {disk} B on disk, {} buildings ({} kept), heap_bytes {heap} B = {:.2} × disk, \
+                 malloc'd {held} B = {:.3} × heap_bytes",
+                dir.display(),
+                set.decoded,
+                set.buildings.len(),
+                heap as f64 / disk as f64,
+                held as f64 / heap as f64
+            );
+        }
     }
 }

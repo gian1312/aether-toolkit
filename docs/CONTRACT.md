@@ -1631,6 +1631,170 @@ crates in this workspace (`aether_converter`, `aether_export`,
 >    list, a batch at launch, a download after its terrain and a repair
 >    before its burn; slow, burning the store's every building, and failing
 >    on a store of two zooms or with an unreadable file.
+> 52. **Honest memory budgets: a CLI `download` pass's `RAM budget` is the
+>    whole process's and a pass short of memory runs fewer connections; a
+>    batch `ingest` counts the building set it decodes (§1.2, §1.5, §2,
+>    §9a, §9b; additive, informational — nothing parsed; `aether_converter`
+>    0.2.15; 2026-11-07).** No job-JSON change; `.abt` bytes, exit codes and
+>    every parsed line are unchanged. Motivation: measured by the owner on
+>    2026-11-07 (Windows, 31 GB RAM, 16 threads, HDD) with the lines of item
+>    50, z15 download passes peaked at 1.9 – 2.4× their budget —
+>    `[Stats] Peak RSS: 2907.9 MB (RAM budget 1540 MB)`, `3567.4 MB (RAM
+>    budget 2048 MB)` — which priced the strips' decoded tiles alone, so two
+>    download lanes and an ingest left 3 GB available and the next ingest
+>    started on 12 threads instead of 16; batches peaked at up to 6,250.2 MB,
+>    their pool sized `~250 MB per tile` × threads without the decoded
+>    building set (5,134,165 buildings in one). Approved by the owner
+>    (2026-11-07): "honest memory budgets; shrink the connection window when
+>    memory is short".
+>    (a) **Where a download pass's memory goes** (measured in the container:
+>    Linux, 4 CPUs, release builds; peak RSS from `/proc` every 20 ms, the
+>    live heap by an `LD_PRELOAD` counter of every allocation by size).
+>    0.2.14, a z15 pass 456 tiles wide and 34 deep (15,504 tiles, five
+>    strips, 20 outputs of 5,556 px at 5 m, 256 connections) served by a
+>    local server from 7,752 real AWS Terrarium bodies: `[Stats] Peak RSS:
+>    2292.3 MB (RAM budget 2048 MB)`; at the live heap's peak (2,209.7 MB)
+>    7,595 decoded strip tiles (1,898.8 MB, 93 % of the budget), the two
+>    assemblies' grids (2 × 114.0 MB — a tile-row, 456 × 256 KiB), their
+>    output rows (35.4 MB), hyper's read buffers (254 × 128 KiB, 31.8 MB),
+>    15 MB else. Connections: 32 / 256 / 1,024 of them left 12.9 / 46.1 /
+>    153.8 MB beside tiles, grids and rows — 142 KB each (over AWS itself,
+>    256 slow bodies left ~33 MB). Every seventh tile a 404: 63 MB more of
+>    256 KiB tiles (the parent fill's), peak 2,365.8 MB. 2 m outputs (25 of
+>    5,556 px over 3,192 tiles): a tile-row's output rows 112 MB beside a
+>    57 MB grid (180.4 MB of rows at the live peak of 0.2.15, two
+>    assemblies). A raw tile cache that writes: 74 MB of queued bodies (57 –
+>    98 KB classes); deriving z14 from cached z15 (4,104 tiles): 35 MB of
+>    32 – 256 KB blocks (children, PNG buffers, queued bodies). The
+>    allocator's share, peak RSS over peak live heap: glibc 1.0 – 10.4 % on
+>    fetch-only passes with 5 m outputs, 14.0 – 18.8 % with 2 m ones (their
+>    thousands of 11 KB rows), 3.4 – 17.0 % with a cache (21.6 % on a
+>    681 MB pass); mimalloc — the Windows binary's allocator (item 37), the
+>    same 3.3.2 built on Linux, transparent huge pages off as on Windows —
+>    17.2 – 35.4 % fetch-only, 31.3 – 53.4 % with a cache (14 passes). Input
+>    slower than the assembly never fills the strips: a 228-wide pass over
+>    AWS itself (12.9 MB/s) peaked at 1,373.0 MB of its 2,048, the 456-wide
+>    one writing a raw tile cache to the slow mount at 1,609.0 MB.
+>    (b) **The budget is the process's.** The share is unchanged — min(
+>    available / 4, 2 GiB), at least 256 MiB, read once after the first
+>    tile — and pays, in live bytes (`download/memory.rs`): the assemblies
+>    (2, or 1 for a one-strip job) × (a tile-row of grid + the fullest
+>    tile-row's output rows + the column tables), the connections × (64 KiB
+>    + edge² × 2 B) — no more than tiles the network serves —, 96 MB for a
+>    raw tile cache that writes, the workers' decoding (4 tiles each, 16
+>    when deriving), then the allocator's share (12 %, 20 % with a cache;
+>    Windows 40 %, 55 %) and 24 MB base. The strips get the rest, never more
+>    than the job's tiles. The line keeps its text, its `<mb>` is that total
+>    and its breakdown follows in parentheses (§1.2); `[Stats] Peak RSS: …
+>    (RAM budget <m> MB)` names it. (c) **Fewer connections when memory is
+>    short.** Where the rest is less than two tile-rows of strips, the pass
+>    runs the most connections that leave them, at least 16, says so once —
+>    `[Download] connections <a> → <b>: …` — and its window runs between
+>    max(`<b>` / 4, 16) and `<b>`; where even 16 do not fit, the strips get
+>    their two rows all the same and the line says what that takes, over
+>    the share: never a failure. (d) **The parent fill shares the strips'
+>    budget**: a strip waits while the cached coarser tiles take its room
+>    (never when no strip holds any), and the cache keeps at most a quarter
+>    of it (was a fixed 256 MiB on top). The buildings post-pass, which
+>    runs after the terrain, is priced apart where its tiles are there when
+>    the budget is drawn — the set estimated as for ingest (below), held
+>    × 1.4 at the decode's peak, plus the largest output tile — and the
+>    budget is the larger phase; where its marker or list is still to come
+>    the line says it is not counted. (e) **Ingest.** Each building
+>    source there at launch is estimated from its tile files' bytes on disk
+>    (metadata only; a list's store never listed) × 3 —
+>    `buildings::DECODED_PER_DISK_BYTE`, measured as the decoded set's bytes
+>    over the files' on OpenFreeMap z14 tiles gzipped as the plugin stores
+>    them: 2.58 central Zürich (256 tiles, 190,014 buildings), 2.92 Bern
+>    (576, 222,933), 0.41 Lower Engadin (256, 4,059); uncompressed 1.70 /
+>    2.05 / 0.31; the fixture tile 1.41 — and taken off the memory the pool
+>    is sized from (and the default hold budget's); the `[Rust] Rayon Pool:`
+>    line appends it. `[Rust] Building tiles decoded: …` ends with the set's
+>    own size, `<mb> MB` (`PbfBuildingSet::heap_bytes`: within 0 – 5.3 % of
+>    what glibc's `mallinfo2` reports the decode left allocated, six real
+>    sets). Each decode replaces its source's estimate with that size, and
+>    where the sets then leave room for fewer tiles than run at once, fewer
+>    are sampled from there on — `[Rust] Tiles at once: …` — through one
+>    lane per worker that takes the jobs in order and runs each on the pool
+>    (a worker never waits for another tile; a batch without buildings runs
+>    as before). Both, because the Waveshed plugin launches a batch before
+>    its list exists (changelog 51): only the decode can count such a set,
+>    and only a cap can act on it then; the estimate sizes the pool where
+>    the source is there at launch. Not capped: the decode itself, which
+>    holds ~1.4× the set at its peak (below), and the tiles held (changelog
+>    48) when a late set arrives.
+>    (f) **Measured after** (same container and jobs, 0.2.15; peak RSS
+>    against the printed budget). Strips that fill (input faster than the
+>    assembly): the 456-wide pass `[Download] RAM budget: 2047 MB, strip
+>    rows: 6 (18.3 GB available at start; fixed for the run) (strips 1453 MB
+>    + assembly 2 × 150 MB + 256 connections 48 MB + decoding 4 MB, +12 %
+>    allocator, +24 MB base)`, peak 1,743.9 MB (85 %); with its 404s
+>    1,793.4 MB (88 %); the 2 m pass 1,204.5 of 1,354 MB (89 %); 2,640 MB
+>    available: `[Download] connections 256 → 184: 660 MB available for this
+>    pass; the assembly (2 × 150 MB), decoding (4 MB) and two tile-rows of
+>    strips (228 MB) leave room for 184 connections (0.19 MB each, +12 %
+>    allocator)`, peak 612.4 of 659 MB (93 %), 184 requests at once; 2,400
+>    MB: `… leave no room for connections: the pass runs 16 and takes 624
+>    MB, over its share`, peak 562.0 of 624 MB (90 %). Strips that cannot
+>    fill: over AWS 1,262.2 of 2,047 MB (62 %), from the raw tile cache
+>    1,235.8 (60 %), deriving z14 1,185.7 of 1,757 (67 %), writing a cache
+>    to the slow mount 1,059.6 of 2,047 (52 %). mimalloc with the Windows
+>    shares (the code built on Linux): 1,603.3 / 1,288.4 / 1,006.7 /
+>    1,312.9 MB against 2,047 / 1,687 / 2,047 / 2,047 (the 456-wide pass,
+>    the 2 m pass, cache writes, deriving) — under it in every pass. A
+>    one-tile terrain pass whose post-pass decodes the 13,824 tiles below:
+>    0.2.14 `RAM budget: 2048 MB`, peak 1,445.0 MB; 0.2.15 `RAM budget: 1499
+>    MB, … (strips 15 MB + assembly 1 × 2 MB + 63 connections 11 MB +
+>    decoding 4 MB, +12 % allocator, +24 MB base; buildings post-pass 1499
+>    MB)`, peak 1,444.5 MB (96 %).
+>    Ingest, 13,824 real OpenFreeMap tiles (327,270,016 bytes, 5,350,392
+>    buildings) listed in a batch of 16 tiles: `building set ~936 MB`,
+>    `[Rust] Building tiles decoded: 13824 tile(s), 5350392 building(s) in
+>    41.0 s, 912.4 MB`, the live heap 929 – 1,013 MB while the tiles ran
+>    (1,258 MB at the decode's peak, its arrays and duplicate filter on top),
+>    peak RSS 1,460.2 MB (0.2.14: 1,460.8, the same 4 threads); 2,000 MB
+>    available: `[Rust] Rayon Pool: 2 threads (…, building set ~936 MB)`
+>    (4 without it); the list written 20 s after launch: `building set: 1
+>    source(s) decoded later`, then `[Rust] Tiles at once: 2 of 4 threads
+>    from here on (building sets 912.4 MB; ~200 MB per tile, 1 GB available
+>    at start)`. The estimate's cost, a list there at launch: 13,824
+>    metadata reads on the container's 9p mount, 4.1 s (8 threads), the
+>    decode after them 3.1 s faster — `[Rust] run: wall` 25.7 s against
+>    24.1 s. The owner's machine is not measured.
+>    (g) **Tested**: `download/memory.rs` (the overhead's terms, the total's
+>    allocator share and base, a roomy share giving the strips the rest, a
+>    small job priced at what it holds, the shrink to the most connections
+>    that leave the strips' floor, the floor of 16 and over the share, a
+>    fixed strip budget, the output rows by brute force, the post-pass as
+>    the larger phase or not counted, the lines),
+>    `download.rs` (a gate limited for memory admits its new ceiling and
+>    adapts below it; the launch rule counts the parent fill's tiles but
+>    never stalls; the ancestor cache's lowered budget and bytes),
+>    `buildings.rs` (heap blocks; the set's heap bytes as allocated; the
+>    disk estimate counts exactly the tile files a directory or list
+>    decodes — a FIFO named like a listed tile never opened; the factor's
+>    measurement, ignored), `main.rs` (the decoded line, the threads, the
+>    pool line's suffix, the cap lowered and never raised, the lanes: every
+>    job once, at most the cap at once, a panic), `proc_usage.rs` (the test
+>    override) and `tests/test_memory_budget.rs` (the real CLI: a one-strip
+>    download of 2,000 tiles, 400 wide, over 256 loopback connections peaks within
+>    15 % of its budget and above its strips by more — 659.9 of 754 MB here,
+>    debug build, 500 MB of strips; a post-pass of 200 tiles there at launch
+>    priced as the larger phase, one whose list comes later named not
+>    counted; 1,000 MB
+>    available → `connections 256 → <b>`, the window at `<b>`, no more
+>    requests at once, the bytes of a run with the machine's memory; a
+>    batch's building set estimated, counted and its size printed — 1
+>    thread instead of 2; a list written late lowering the tiles at once,
+>    right after the decode's line). Every mechanism was broken once on
+>    purpose and a test failed for each (thirteen: the strips-only budget,
+>    no shrink, the shrink without the gate's limit, the estimate not
+>    counted, the cap never lowered, the decode line without its size, the
+>    array's length for its capacity, every file counted, lanes ignoring the
+>    cap, the parent fill not counted, two assemblies for one strip, the
+>    ancestor limit raising the budget; and the post-pass left out of the
+>    budget). **Gate:** none — informational
+>    lines, nothing to parse; `aether_converter` 0.2.15 (§1.5).
 
 > **Version note (verified against source):** the task that commissioned this
 > contract referred to "engine 0.4.x", but the engine's own
@@ -1784,7 +1948,8 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   `buildings_pbf_dir`; `aether_converter` ≥ 0.2.9, changelog 44), before the
   first tile: `[Rust] Decoding building tiles: <n>/<m>` every 1,000 building
   tiles and once at the end, then `[Rust] Building tiles decoded: <m>
-  tile(s), <b> building(s) in <s.s> s` — see §9a *Building-tile decode*.
+  tile(s), <b> building(s) in <s.s> s, <mb> MB` (`, <mb> MB` ≥ 0.2.15,
+  changelog 52) — see §9a *Building-tile decode*.
   Neither contains `Progress:`. A directory whose `buildings_pbf_ready`
   marker is missing at launch (≥ 0.2.12, changelog 48) prints the same lines
   when the marker appears, while tiles are being sampled — still before any
@@ -1886,6 +2051,37 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   Peak RSS:` line (≥ 0.2.13, changelog 50) is a line of the `[Stats]` block
   and is kept like the rest of it; `ingest`'s `[Rust] run:` line, its `peak
   rss` included, stays on stdout only.
+* **Batch pool lines** (stdout, batch `ingest`; informational, **not
+  parsed** — consumers must not match them):
+
+  ```
+  [Rust] Rayon Pool: <n> threads (System RAM: <t> GB, <a> GB available, ~<m> MB per tile[, building set ~<b> MB[ + <k> source(s) decoded later]])
+  [Rust] Rayon Pool: <n> threads (System RAM: <t> GB, <a> GB available, ~<m> MB per tile, building set: <k> source(s) decoded later)
+  [Rust] Tiles at once: <c> of <n> threads from here on (building sets <s.s> MB; ~<m> MB per tile, <a> GB available at start)
+  ```
+
+  The pool line comes once, before any building-tile decode: `<n>` =
+  clamp((80 % of the available RAM − the 192 MB chunk cache − the building
+  sets) / `<m>`, 1, CPUs), `<m>` the per-tile estimate (changelog 23, MB),
+  `<t>` and `<a>` whole GB. Since 0.2.15 (changelog 52) the building sets
+  count: each distinct building source there at launch — a
+  `buildings_pbf_dir` without a marker or with its marker in place, a
+  `buildings_pbf_list` that exists — is decoded before the first tile and
+  is estimated, before the pool is built, as its tile files' bytes on disk
+  × 3 (metadata only; a list's directory is never listed): `<b>`, whole
+  MB; a source whose marker or list is not there yet (`<k>`) counts once it
+  is decoded. A batch without a building source prints the line as before,
+  ending at `per tile)`. The default `buildings_hold_mb` budget takes the
+  sets decoded at launch off the available RAM too (§9a). After each
+  decode the set's own size (`<mb>` of the decode's summary line, §9a)
+  replaces its estimate; where the sets then leave room for fewer tiles
+  than run at once, the second line says so — once per lowering, right
+  after that summary line — and from then on at most `<c>` tiles are
+  sampled at once (lowered only, never raised; `<s.s>` = the sets counted,
+  MB with one decimal). With a building source a batch takes its tiles in
+  job order, each of `<n>` workers taking the next when its own is done
+  (without one, as before). Neither line contains `Progress:`. A test may
+  impose the available RAM (`AETHER_TEST_AVAILABLE_MB`, §2).
 * **Per-tile coverage line** (stdout, batch ingest only; `aether_converter`
   ≥ 0.2.7, changelog 33). After each tile that was written:
 
@@ -2117,13 +2313,58 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   timeout/reset/429/503 burst or a slow median body and collapsed a
   250 Mbit/s link to a trickle.)
 
-  Additive lines (CLI `download`, changelog 30, 39; informational, match the
-  prefix):
+  Additive lines (CLI `download`, changelog 30, 39, 52; informational, match
+  the prefix):
 
   ```
-  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available at start; fixed for the run)
+  [Download] RAM budget: <mb> MB, strip rows: <r> (<a> GB available at start; fixed for the run) (strips <s> MB + assembly <k> × <g> MB + <c> connections <n> MB[ + cache writes <w> MB] + decoding <d> MB, +<p> % allocator, +<b> MB base[; buildings post-pass <x> MB|; buildings post-pass not counted, its tiles are not in yet])
   [Download] RAM budget: <mb> MB, strip rows: <r> (re-sized for <e> px source tiles)
+  [Download] connections <want> → <c>: <share> MB available for this pass; the assembly (<k> × <g> MB), decoding (<d> MB)[, cache writes (<w> MB)] and two tile-rows of strips (<f> MB) leave room for <c> connections (<x.xx> MB each, +<p> % allocator)
+  [Download] connections <want> → <c>: <share> MB available for this pass; the assembly (…), decoding (…)[, cache writes (…)] and two tile-rows of strips (…) leave no room for connections: the pass runs <c> and takes <mb> MB, over its share
   ```
+
+  **Since 0.2.15 (changelog 52) `<mb>` is the whole process's budget** — what
+  the pass peaks at when its strips fill, not the strips' share alone, which
+  is all builds before 0.2.15 priced (their passes peaked at up to 2.4× the
+  printed figure). The share is unchanged — min(available RAM / 4, 2 GiB),
+  at least 256 MiB, taken once after the first tile — and pays first, in
+  live bytes: `<k>` assemblies at once (2, or 1 when the job is one strip),
+  each `<g>` = a tile-row of grid (`<nx>` × edge² × 4 B) plus the output rows
+  of the fullest tile-row (`size_px` × 2 B + 48 B each) and the outputs'
+  column tables; `<c>` connections × (64 KiB + edge² × 2 B) — only as many
+  as tiles the network serves (a raw-tile-cache hit or derived tile takes
+  none); `<w>` = 96 MB for a raw tile cache that writes (its 64 MiB queue
+  and a pack's buffer); `<d>` = the runtime's workers × edge² × 4 B × 4 (× 16
+  when the cache derives tiles); then `<p>` % of all that for the allocator
+  (12 without a raw tile cache, 20 with one; the Windows binary, whose
+  allocator is mimalloc, 40 and 55) and `<b>` = 24 MB base. The strips get
+  the rest (`<s>`, never more than the job's tiles; the parent fill's
+  decoded coarser tiles are counted in it — a strip waits while they take
+  its room — and keep at most a quarter of it); strip rows =
+  clamp(`<s>` / 2 / (`<nx>` × edge² × 4 B), 1, 32) as before. A pass whose
+  strips cannot fill — slower input than assembly: a slow link, a raw tile
+  cache on a slow disk — peaks below `<mb>`. A job with a building source
+  adds its buildings post-pass, which runs after the terrain: where its
+  tiles are there when the budget is drawn (a `buildings_pbf_dir` without
+  `buildings_pbf_ready`, or whose marker or `buildings_pbf_list` is in
+  place), `<x>` = its set estimated from the tiles' bytes on disk × 3
+  (metadata only, as for a batch, §1.2 *Batch pool lines*), held × 1.4 at
+  the decode's peak, plus the largest output tile, which it reads whole,
+  priced like the rest (`<p>` %, `<b>`); `<mb>` is then the larger of the
+  two phases. Where its marker or list is still to come, it is not
+  counted, and the line says so. Where the rest is less than two
+  tile-rows of strips (`<f>`, or the whole job when smaller), the pass runs
+  fewer connections, `<c>` = the most that leave `<f>`, at least 16 (fewer
+  only when the job asks for fewer), says so once in the third line —
+  before the budget line, which then prices `<c>` — and its connection
+  window runs between `max(<c> / 4, 16)` and `<c>` (the `[Stats] Connection
+  window:` line's start and ceiling are `<c>`); where even 16 leave no room,
+  the fourth line, and the strips get `<f>` all the same: a pass never fails
+  for memory, and `<mb>` then exceeds the share. Byte-identical either way.
+  A job's fixed strip budget for tests (`DownloadTuning::ram_budget`)
+  replaces `<s>` and never shrinks the connections. `<share>` is in MB;
+  `<x.xx>` the MB a connection takes, two decimals. A test may impose the
+  available RAM (`AETHER_TEST_AVAILABLE_MB`, §2).
 
   The first replaces `[Download] RAM: <a> GB available, ~<m> MB/strip,
   prefetch depth: <d>`; the second appears at most once, when the source
@@ -2134,13 +2375,15 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   strip)` and, on every change of the rows, `(<a> GB available)`. Decoded
   source tiles (`edge² × 4` bytes each) are held from arrival until the
   assembly has copied their tile-row into its grid, so the run budgets them:
-  budget = min(available RAM / 4, 2 GiB), at least 256 MiB, taken once —
+  the strips' budget — before 0.2.15 all of min(available RAM / 4, 2 GiB),
+  at least 256 MiB; since, `<s>` above — taken once —
   after the run's first tile, before any strip is sized — and fixed for the
   run; strip rows = clamp(budget / 2 / (`<nx>` × edge² × 4 B), 1, 32), so
   two strips fit (edge = that of the run's first tile, fetched alone before
   any strip is sized — changelog 36; 512 only while that tile has failed or
   is out for more than 5 s); a strip starts only when its bytes plus those
-  launched strips still hold fit the budget (or none is outstanding), and
+  launched strips still hold (since 0.2.15 plus the parent fill's decoded
+  tiles) fit the budget (or no strip holds any), and
   only once the strips in flight have fewer unstarted tiles than the
   connection window. A strip's bytes leave the count tile-row by tile-row as
   its assembly drops each row's tiles (shares by tile count, changelog 39).
@@ -2202,7 +2445,9 @@ aether_converter probe (--list <file> | --stdin) [--jobs N]    # §1.2a, ≥ 0.2
   50) —, on macOS `getrusage` `ru_maxrss`, on Windows
   `GetProcessMemoryInfo` `PeakWorkingSetSize`. `<m>` = the run's RAM
   budget exactly as its `[Download] RAM budget: <m> MB` line printed it; a
-  repair job, which has no budget, prints the second form. No line where
+  repair job, which has no budget, prints the second form. Since 0.2.15
+  (changelog 52) that budget is the whole process's, so the two figures
+  compare like for like. No line where
   the OS does not give the peak — never `0`. Like the whole block, it is
   kept in `AETHER_DIAG_FILE` too. The in-memory and browser downloaders
   print none (they run inside another program's process). The same peak
@@ -2574,6 +2819,7 @@ Known capability gates consumers rely on:
 | `download` seam filter and its job field `seam_filter` — a Terrarium mosaic seam's samples become voids the parent fill fills (§9b, changelog 49; older builds ignore the field and write the seam into the `.abt` as terrain, e.g. −9,300 m at 10°E) — with the informational `[Stats] Backfill:` line and the per-tile `[Backfill]` lines in `AETHER_DIAG_FILE` (§1.2; older builds print neither) | `aether_converter 0.2.13` |
 | The converter's peak resident memory: `[Stats] Peak RSS: <mb> MB (RAM budget <m> MB)` once per CLI `download` pass (a repair's without the budget), in the `[Stats]` block before the cache lines and kept in `AETHER_DIAG_FILE` with it, and `, peak rss <mb> MB` at the end of `ingest`'s `[Rust] run:` line (§1.2, changelog 50; informational, not parsed — nothing to gate; older builds print neither) | `aether_converter 0.2.13` |
 | `download` and batch `ingest` job field `buildings_pbf_list` — only the building tiles a list file names are read from `buildings_pbf_dir` (the caller's store, never listed), and the list file is their ready signal (§9a, §9b, changelog 51; older builds ignore the field: they decode the whole `buildings_pbf_dir` — the store, every file — without waiting for the list: a batch at launch, a download after its terrain, a repair before its burn; slow, and a store holding two zooms or an unreadable file fails the run) | `aether_converter 0.2.14` |
+| Honest memory budgets: the CLI `download`'s `[Download] RAM budget: <mb> MB` is the whole process's (its strips, assembly, connections, cache writes, decoding, the allocator's share and the base — or its buildings post-pass where that is larger and its tiles are there; a breakdown in parentheses at the end), a pass whose share cannot hold its connections runs fewer and says so (`[Download] connections <a> → <b>: …`), and a batch `ingest` counts its building sets — the `[Rust] Rayon Pool:` line's `building set ~<b> MB`, `, <mb> MB` at the end of `[Rust] Building tiles decoded:`, `[Rust] Tiles at once: …` (§1.2, §9a, §9b, changelog 52; informational, nothing parsed — nothing to gate; older builds price the strips alone and print none of the additions) | `aether_converter 0.2.15` |
 
 ---
 
@@ -2584,6 +2830,7 @@ Known capability gates consumers rely on:
 | `AETHER_LICENSE` | `aether_core` (proprietary build) | Base58 license/API key — **v1 or v2** (§10). Proprietary builds **refuse to run without a valid, unexpired key**. If unset, the engine falls back to reading a `license.key` file (see below). |
 | `RUST_LOG` | `aether_core`, toolkit CLIs | `env_logger` level filter. **Must be `info` (or lower)** for the log-line progress diagnostics of §1.1(b) to appear. Markers in §1.1(a) do not depend on it. |
 | `AETHER_DIAG_FILE` | `aether_converter` (`ingest`, `download`) | Path of a file the per-tile `[Rust] tile …` and per-strip `[Strip …]`/`[StripMem …]` diagnostic lines (and, ≥ 0.2.9, `download`'s once-per-run `[Download] launch gate closed for …`, changelog 39) are appended to instead of the console (§1.2, changelog 37; `aether_converter` ≥ 0.2.8, older builds ignore it). Unset or empty = console as before. Parsed lines and `[Rust] run:` never move; since 0.2.11 (changelog 46) `download`'s `[Download] <pct>%`, `STALL`, `first …`, `[Degraded]` and `[Stats]` lines are copied into the file as well, staying on stderr unchanged. Since 0.2.13 (changelog 49) a download also writes one `[Backfill] …` line per source tile whose void samples the parent fill filled to the file **only** (never to the console); the block's `[Stats] Peak RSS:` line (≥ 0.2.13, changelog 50) is copied like every `[Stats]` line. |
+| `AETHER_TEST_AVAILABLE_MB` | `aether_converter` (`download`, batch `ingest`) | **Tests only** — no consumer sets it, and it may change or go without notice (changelog 52, ≥ 0.2.15): a whole number of MB (2^20 bytes) used in place of the OS's available-memory figure by the CLI `download`'s RAM budget and the batch `ingest`'s pool sizing, so a test can run a memory-short pass on any machine. Unset, empty or not a whole number: the OS's figure, as before. |
 | `AETHER_BIN_DIR` | consumers only | Convention for locating the engine binaries. **Not read by any engine/toolkit code** — it is purely a consumer-side discovery hint. Do not add engine logic that depends on it. |
 | `PYTHONUNBUFFERED` | consumers only | Set by Python consumers so a child process's stdout markers/log lines arrive line-by-line rather than block-buffered. Not read by Rust code. |
 
@@ -3216,7 +3463,7 @@ a **single object** or a **JSON array** of such objects (batch).
 | `buildings_pbf_dir` | string? | optional | Directory of Mapbox-Vector-Tile building tiles named `{z}_{x}_{y}.pbf` (gzip or plain), e.g. an OpenFreeMap planet fetch. Vector tiles carry no geometry Z, so height starts at the ladder's attribute rungs and is always **above-ground**, resolved against the terrain under each footprint. All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels` (same rule and same message as §9b — see the note below). A directory that cannot be read fails the run rather than silently producing building-less tiles. |
 | `buildings_pbf_ready` | string? | optional | Additive, changelog 48, `aether_converter` ≥ 0.2.12 (older builds ignore it: gate on §1.5). **Batch only.** One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the batch samples its terrain — the download job's hand-over (§9b, changelog 45), same name rules and messages. There at launch: the directory is decoded at once, exactly as without the field. Missing at launch: see *Building tiles fetched during the batch* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the batch before any tile; so do jobs naming one directory with different `buildings_pbf_ready` / `buildings_pbf_wait_s`. The single-job form (a JSON object) refuses it. Absent or `null`: unchanged. |
 | `buildings_pbf_wait_s` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Seconds a batch waits for `buildings_pbf_ready` — or, ≥ 0.2.14, for the `buildings_pbf_list` file (changelog 51) — counted from its first look, at launch; absent or `null` → **1800**. Must be 0 … 86400, else the batch fails before any tile: `ingest job for "<output_path>": buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` or `buildings_pbf_list` (alone it is not even checked). |
-| `buildings_hold_mb` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Megabytes (MiB) of finished tiles a batch may hold in memory while it waits for `buildings_pbf_ready` — a held tile costs `size_px² × 2` bytes; a tile that does not fit waits on its worker thread. The batch's budget is the smallest value its watched jobs give, taken as given (`0` holds nothing); absent on all of them: half of the available memory the batch measures for its pool once the pool's reservation is taken off (threads × the per-tile estimate of the `[Rust] Rayon Pool:` line, plus the 192 MB chunk cache), at most 4096 MB, never below one tile (the largest watched tile). Must be 0 … 1048576, else the batch fails before any tile: `ingest job for "<output_path>": buildings_hold_mb must be a number of megabytes from 0 to 1048576, got <v>`. Read only together with `buildings_pbf_ready` or (≥ 0.2.14, changelog 51) `buildings_pbf_list`, whose wait it budgets the same way. |
+| `buildings_hold_mb` | number? | optional | Additive, changelog 48, ≥ 0.2.12. Megabytes (MiB) of finished tiles a batch may hold in memory while it waits for `buildings_pbf_ready` — a held tile costs `size_px² × 2` bytes; a tile that does not fit waits on its worker thread. The batch's budget is the smallest value its watched jobs give, taken as given (`0` holds nothing); absent on all of them: half of the available memory the batch measures for its pool once the pool's reservation is taken off (threads × the per-tile estimate of the `[Rust] Rayon Pool:` line, plus the 192 MB chunk cache, and — ≥ 0.2.15, changelog 52 — the building sets decoded at launch), at most 4096 MB, never below one tile (the largest watched tile). Must be 0 … 1048576, else the batch fails before any tile: `ingest job for "<output_path>": buildings_hold_mb must be a number of megabytes from 0 to 1048576, got <v>`. Read only together with `buildings_pbf_ready` or (≥ 0.2.14, changelog 51) `buildings_pbf_list`, whose wait it budgets the same way. |
 | `buildings_pbf_list` | string? | optional | Additive, changelog 51, `aether_converter` ≥ 0.2.14 (older builds ignore it and decode the whole `buildings_pbf_dir` at launch, without waiting: gate on §1.5). **Batch only.** The **absolute** path of a UTF-8 text file naming, one per line, the building tile files of `buildings_pbf_dir` the job burns (`{z}_{x}_{y}.pbf`, no directory part): only those files are read — the directory is never listed, so it may be a store of far more tiles (the Waveshed plugin's `<cache>/pool/<md5>/`). The file is also the **ready signal**: missing when the batch looks, it is waited for exactly as `buildings_pbf_ready`'s marker (same watcher, `buildings_pbf_wait_s`, `buildings_hold_mb`, lines and timeout). Requires `buildings_pbf_dir`, which must **exist when the batch starts**; excludes `buildings_pbf_ready`; jobs naming one list must give the same `buildings_pbf_dir` and `buildings_pbf_wait_s`. Every rule, line and message: *Building tiles named by a list* below. The single-job form (a JSON object) refuses it. Absent or `null`: unchanged. |
 
 Both building fields are optional and additive; a job that omits them behaves
@@ -3414,7 +3661,7 @@ order, the one-thread filter kept. On stdout, the stream of `[Rust] Progress:`:
 
 ```
 [Rust] Decoding building tiles: <n>/<m>
-[Rust] Building tiles decoded: <m> tile(s), <b> building(s) in <s.s> s
+[Rust] Building tiles decoded: <m> tile(s), <b> building(s) in <s.s> s, <mb> MB
 ```
 
 * `<m>` is the directory's tile files, decoded or not; `<n>` those finished
@@ -3425,7 +3672,14 @@ order, the one-thread filter kept. On stdout, the stream of `[Rust] Progress:`:
 * The summary line follows when the decode and the duplicate filter are
   done: `<b>` = buildings decoded **before** the duplicate filter (the
   `<n> building(s)` of the per-tile `[Info] buildings_pbf_dir:` line),
-  `<s.s>` = wall seconds of the whole load, one decimal. It is the line
+  `<s.s>` = wall seconds of the whole load, one decimal, and — since
+  0.2.15 (changelog 52) — `<mb>` = the memory the decoded set holds for the
+  rest of the run, MB (2^20 bytes) with one decimal: its building array (as
+  allocated, before the duplicate filter shrank it) and every ring's
+  vertices, each heap block as glibc hands it out (request + 8, rounded up
+  to 16, at least 32 bytes; within 0 – 5.3 % of what glibc reports
+  allocated on six real sets, changelog 52). An older plugin's pattern, which ends at
+  `in <s.s> s`, still matches. It is the line
   after the decode's last line (a progress line, or the warnings below) and
   comes before any tile is sampled (a directory decoded when its marker
   appears: before any tile that burns it is written).
@@ -3681,7 +3935,7 @@ Authority: `crates/aether_converter/src/download.rs` (`DownloadJob` / `SubTileSp
 | `encoding` | string | **required** | `"terrarium"` or `"mapbox"` (case-insensitive). Any other value fails: `Unknown encoding '<x>'`. |
 | `output_dir` | string (path) | **required** | Directory for the produced `.abt` tiles. |
 | `zoom` | u32 | **required** | XYZ zoom level. |
-| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). A full run (not a repair) also keeps its output files open for the run, so the raise asks for one descriptor per output tile on top; where they do not fit beside the connections' descriptors, the connections keep theirs and each write opens its file instead, printing `[Download] open-file limit <l>: <n> output tiles are opened for each write instead of held open (<d> descriptors would not fit)` (changelog 39). |
+| `max_connections` | usize? | optional | Concurrent HTTP connections. Default **256** when absent. The CLI `download` runs a fixed pool of this many requests (changelog 30); its window is cut by 25 % in a second only when ≥ 3 responses in that second were HTTP 429 or 503 (floor `max(max_connections / 4, 16)`, at most `max_connections`), and grows by 10 % per second without such a burst back to `max_connections`. Timeouts, connection resets and slow bodies never move it, and a cut only gates new requests. A clean link therefore runs at exactly `max_connections`. Reported by `[Stats] Connection window:` and the progress line's `window` field (§1.2). On unix the CLI `download` first makes room for `2 × max_connections + 96` open descriptors by raising its soft open-file limit (best effort); only where even the raised limit is lower does it run `(limit − 96) / 2` connections instead, printing `[Download] open-file limit …` (changelog 36). A full run (not a repair) also keeps its output files open for the run, so the raise asks for one descriptor per output tile on top; where they do not fit beside the connections' descriptors, the connections keep theirs and each write opens its file instead, printing `[Download] open-file limit <l>: <n> output tiles are opened for each write instead of held open (<d> descriptors would not fit)` (changelog 39). Since 0.2.15 (changelog 52) a full run whose memory share (min(available RAM / 4, 2 GiB), at least 256 MiB) cannot hold this many connections beside its assembly, decoding, cache writes and two tile-rows of strips runs fewer — the most that fit, at least 16 — and says so once: `[Download] connections <a> → <b>: …` (§1.2); its window then runs between `max(<b> / 4, 16)` and `<b>`. Bytes never depend on it. |
 | `buildings_pbf_dir` | string? | optional | Directory of `{z}_{x}_{y}.pbf` vector tiles, same encoding and same **building height ladder** (§9a) as §9a's `buildings_pbf_dir`. When present, buildings are fused onto the finished `.abt` tiles as a post-pass once the download completes (with `buildings_pbf_ready`, once its marker exists; with `buildings_pbf_list`, ≥ 0.2.14, only the listed tiles, once the list exists). All tiles in the directory must share **one** zoom; a mixed-zoom directory fails with `buildings_pbf_dir mixes zoom levels`. Absent means terrain only. |
 | `buildings_pbf_ready` | string? | optional | Additive, changelog 45, `aether_converter` ≥ 0.2.10 (older builds ignore it: gate on §1.5). One plain file name inside `buildings_pbf_dir` (e.g. `"_ready"`) whose existence declares the directory complete, so the building tiles can be fetched **while** the job downloads the terrain: nothing reads the directory before the buildings post-pass (it need not exist at launch), and the post-pass first waits for the file — see *Building tiles fetched during the download* below. Requires `buildings_pbf_dir`; empty, `.`, `..`, a name containing `/` or `\`, or a `{z}_{x}_{y}.pbf`/`.mvt` tile name fails the job before any request. Absent or `null`: the post-pass reads the directory as it finds it, as before. CLI `download` full runs only; repair jobs and the in-memory/WASM downloaders ignore it. A batch `ingest` takes the same field, with the same meaning, since 0.2.12 (§9a, changelog 48). |
 | `buildings_pbf_wait_s` | number? | optional | Additive, changelog 45, ≥ 0.2.10. Seconds the post-pass waits for `buildings_pbf_ready` — or, ≥ 0.2.14, for the `buildings_pbf_list` file (changelog 51) — counted from its first look; absent or `null` → **1800**. Must be 0 … 86400, else the job fails before any request: `buildings_pbf_wait_s must be a number of seconds from 0 to 86400, got <v>`. Read only together with `buildings_pbf_ready` or `buildings_pbf_list` (alone it changes nothing). |
@@ -3718,9 +3972,10 @@ tiles, Mapterhorn and MapTiler's `terrain-rgb` serve **512 px** ones (MapTiler's
 taken from the first tile that decodes and held for the rest of the run; the
 assembly grid, its row stride and the per-tile-row sample count all follow it.
 The CLI `download` fetches its first tile before it sizes any strip, so the
-strips' share of the RAM budget is reckoned with the real edge; 512 px is
-assumed only while that tile has failed or is out for more than 5 s
-(changelog 36).
+strips' share of the RAM budget is reckoned with the real edge (since 0.2.15
+the budget's assembly, connection and decoding terms too, changelog 52);
+512 px is assumed only while that tile has failed or is out for more than
+5 s (changelog 36).
 
 This does **not** change the ground resolution: `zoom` is the caller's choice
 and is untouched. A 512 px z12 tile covers exactly the ground a 256 px z12 tile
